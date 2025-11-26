@@ -25,4 +25,25 @@ def train_val_test_split(
             "test":  np.ndarray[int],
         }
     """
-    raise NotImplementedError
+    if not (0 < train_ratio < 1) or not (0 < val_ratio < 1):
+        raise ValueError("train_ratio and val_ratio must be in (0,1).")
+    if train_ratio + val_ratio >= 1.0:
+        raise ValueError("train_ratio + val_ratio must be < 1.")
+
+    rng = np.random.RandomState(seed)
+    indices = np.arange(num_samples)
+    rng.shuffle(indices)
+
+    n_train = int(num_samples * train_ratio)
+    n_val = int(num_samples * val_ratio)
+    n_test = num_samples - n_train - n_val
+
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
+
+    return {
+        "train": train_idx,
+        "val": val_idx,
+        "test": test_idx,
+    }
