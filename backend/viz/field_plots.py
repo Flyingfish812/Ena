@@ -1,11 +1,20 @@
 # backend/viz/field_plots.py
 
-"""
-单个样本的场可视化：真值 / 重建 / 误差图。
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+def _to_2d(field: np.ndarray) -> np.ndarray:
+    """
+    将 [H,W] 或 [H,W,C] 的场裁剪为 [H,W]，默认取第 0 个通道。
+    """
+    f = np.asarray(field)
+    if f.ndim == 2:
+        return f
+    elif f.ndim == 3:
+        return f[..., 0]
+    else:
+        raise ValueError(f"Expected [H,W] or [H,W,C], got {f.shape}")
 
 
 def plot_field_comparison(
@@ -13,17 +22,49 @@ def plot_field_comparison(
     x_lin_hw: np.ndarray | None = None,
     x_nn_hw: np.ndarray | None = None,
     title_prefix: str = "",
+    names: tuple[str, ...] | None = None,
 ) -> plt.Figure:
     """
     对比单个样本的空间场：
 
     - x_true
-    - x_lin 线性基线
-    - x_nn  MLP
+    - x_lin 线性基线（可选）
+    - x_nn  MLP（可选）
 
-    返回包含多个子图的 Figure，方便直接保存为论文插图。
+    names:
+        可选，覆盖默认标签的名字元组，例如：
+        ("True", "POD (r=64)", "Linear baseline")
     """
-    raise NotImplementedError
+    fields = [("True", _to_2d(x_true_hw))]
+    if x_lin_hw is not None:
+        fields.append(("Linear", _to_2d(x_lin_hw)))
+    if x_nn_hw is not None:
+        fields.append(("MLP", _to_2d(x_nn_hw)))
+
+    # 如果提供了 names，用它覆盖默认名字
+    if names is not None:
+        if len(names) != len(fields):
+            raise ValueError(f"names 有 {len(names)} 个，但实际字段有 {len(fields)} 个")
+        fields = list(zip(names, [f for _, f in fields], strict=False))
+
+    n = len(fields)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 3))
+    if n == 1:
+        axes = [axes]
+
+    # 统一色标
+    vmin = min(f.min() for _, f in fields)
+    vmax = max(f.max() for _, f in fields)
+
+    for ax, (name, f) in zip(axes, fields):
+        im = ax.imshow(f, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+        ax.set_title(f"{title_prefix}{name}")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    return fig
 
 
 def plot_error_map(
@@ -34,4 +75,15 @@ def plot_error_map(
     """
     绘制误差热力图 |x_hat - x_true|。
     """
-    raise NotImplementedError
+    t = _to_2d(x_true_hw)
+    h = _to_2d(x_hat_hw)
+    err = np.abs(h - t)
+
+    fig, ax = plt.subplots(1, 1, figsize=(4, 3))
+    im = ax.imshow(err, origin="lower", cmap="viridis")
+    ax.set_title(title or "Absolute error")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig

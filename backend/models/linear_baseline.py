@@ -32,4 +32,26 @@ def solve_pod_coeffs_least_squares(
     a_lin:
         线性估计的 POD 系数，形状为 [r] 或 [N,r]。
     """
-    raise NotImplementedError
+    Y = np.asarray(y, dtype=np.float64)
+    A = np.asarray(Ur_masked, dtype=np.float64)  # [M,r]
+
+    if A.ndim != 2:
+        raise ValueError(f"Ur_masked must be 2D [M,r], got {A.shape}")
+
+    if Y.ndim == 1:
+        if Y.shape[0] != A.shape[0]:
+            raise ValueError(f"Dimension mismatch: y[{Y.shape}] vs Ur_masked[{A.shape}]")
+        coeffs, *_ = np.linalg.lstsq(A, Y, rcond=None)  # [r]
+        return coeffs.astype(np.float32)
+    elif Y.ndim == 2:
+        if Y.shape[1] != A.shape[0]:
+            raise ValueError(f"Dimension mismatch: y[{Y.shape}] vs Ur_masked[{A.shape}]")
+        N = Y.shape[0]
+        r = A.shape[1]
+        out = np.empty((N, r), dtype=np.float32)
+        for i in range(N):
+            coeffs, *_ = np.linalg.lstsq(A, Y[i], rcond=None)
+            out[i] = coeffs.astype(np.float32)
+        return out
+    else:
+        raise ValueError(f"y must be 1D or 2D, got {Y.shape}")

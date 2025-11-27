@@ -9,6 +9,19 @@ from typing import Tuple
 import numpy as np
 
 
+def _as_2d(x: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """
+    将输入转为 [N, D] 形式，记录是否为单样本。
+    """
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x[None, :], True
+    elif x.ndim == 2:
+        return x, False
+    else:
+        raise ValueError(f"Expected 1D or 2D array, got shape {x.shape}")
+
+
 def project_to_pod(
     x_flat: np.ndarray,
     Ur: np.ndarray,
@@ -20,9 +33,9 @@ def project_to_pod(
     参数
     ----
     x_flat:
-        形状为 [N, D] 或 [D] 的数组。
+        形状为 [N, D] 或 [D] 的数组（展平后的场）。
     Ur:
-        POD 基底矩阵，形状为 [D, r]。
+        POD 基底矩阵，形状为 [D, r]，列为正交基。
     mean_flat:
         可选的均值场展平向量，若给定则先做 x_flat - mean_flat。
 
@@ -31,7 +44,18 @@ def project_to_pod(
     a:
         POD 系数，形状为 [N, r] 或 [r]。
     """
-    raise NotImplementedError
+    X, is_single = _as_2d(x_flat)
+    Ur = np.asarray(Ur)
+    if mean_flat is not None:
+        m = np.asarray(mean_flat).reshape(1, -1)
+        Xc = X - m
+    else:
+        Xc = X
+
+    # 正交基下的投影： a = Xc @ Ur
+    a = Xc @ Ur  # [N,D] @ [D,r] -> [N,r]
+
+    return a[0] if is_single else a
 
 
 def reconstruct_from_pod(
@@ -56,4 +80,15 @@ def reconstruct_from_pod(
     x_flat:
         形状为 [N, D] 或 [D] 的重建向量。
     """
-    raise NotImplementedError
+    A, is_single = _as_2d(a)
+    Ur = np.asarray(Ur)
+
+    Xc = A @ Ur.T  # [N,r] @ [r,D] -> [N,D]
+
+    if mean_flat is not None:
+        m = np.asarray(mean_flat).reshape(1, -1)
+        X = Xc + m
+    else:
+        X = Xc
+
+    return X[0] if is_single else X

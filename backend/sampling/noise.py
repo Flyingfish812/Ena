@@ -20,7 +20,7 @@ def add_gaussian_noise(
     y:
         原始观测值，形状 [M] 或 [N,M]。
     sigma:
-        噪声标准差。
+        噪声标准差。若 sigma <= 0，则直接返回原值。
     seed:
         随机种子，便于复现。
 
@@ -29,4 +29,11 @@ def add_gaussian_noise(
     y_noisy:
         加噪后的观测向量，形状与 y 相同。
     """
-    raise NotImplementedError
+    y = np.asarray(y, dtype=np.float32)
+
+    if sigma <= 0:
+        return y
+
+    rng = np.random.RandomState(seed)
+    noise = rng.normal(loc=0.0, scale=sigma, size=y.shape).astype(np.float32)
+    return y + noise
