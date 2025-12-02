@@ -201,6 +201,8 @@ def generate_experiment_report_md(
     saved_paths: Dict[str, Any] = all_result.get("saved_paths", {}) or {}
     fig_nmse_vs_mask = saved_paths.get("fig_nmse_vs_mask", None)
     fig_nmse_vs_noise = saved_paths.get("fig_nmse_vs_noise", None)
+    fig_example_linear = saved_paths.get("fig_example_linear", None)
+    fig_example_mlp = saved_paths.get("fig_example_mlp", None)
 
     # 1) 一些 summary 统计：最好 / 最差 NMSE
     best_lin = df_lin.loc[df_lin["nmse_mean"].idxmin()]
@@ -293,6 +295,47 @@ def generate_experiment_report_md(
                         f"- Band {band_name}: Linear={val_lin:.4e}, MLP={val_mlp:.4e}"
                     )
 
+    # 2') 有效模态等级统计（基于 effective_r_cut）
+    effective_lines: list[str] = []
+    if df_mlp is not None and len(df_mlp) > 0 and "effective_r_cut" in df_mlp.columns:
+        df_eff = df_mlp.dropna(subset=["effective_r_cut"]).copy()
+        if len(df_eff) > 0:
+            # 先看噪声较小的一条曲线下，随着 mask_rate 变化，有效模态数如何变化
+            s_min = df_eff["noise_sigma"].min()
+            sub_smin = df_eff[df_eff["noise_sigma"] == s_min].sort_values("mask_rate")
+            if len(sub_smin) > 0:
+                effective_lines.append(
+                    f"在噪声较小 (σ≈{s_min:.3g}) 的情况下，不同观测率下 MLP 的有效模态等级为："
+                )
+                for _, row in sub_smin.iterrows():
+                    effective_lines.append(
+                        f"- p={row['mask_rate']:.3g} 时，有效模态截止约为 r≈{int(row['effective_r_cut'])} "
+                        f"(effective_band='{row.get('effective_band', 'N/A')}')"
+                    )
+
+            # 再比较噪声最小 / 最大时的平均有效模态数
+            s_max = df_eff["noise_sigma"].max()
+            r_min = float(df_eff[df_eff["noise_sigma"] == s_min]["effective_r_cut"].mean())
+            r_max = float(df_eff[df_eff["noise_sigma"] == s_max]["effective_r_cut"].mean())
+
+            effective_lines.append("")
+            effective_lines.append(
+                f"在噪声最小 σ≈{s_min:.3g} 与最大 σ≈{s_max:.3g} 的对比下："
+            )
+            effective_lines.append(
+                f"- 低噪声下平均有效模态数约为 r≈{r_min:.1f}；高噪声下约为 r≈{r_max:.1f}。"
+            )
+
+            if r_max < 0.8 * r_min:
+                effective_lines.append(
+                    "- 随着噪声水平升高，有效可恢复模态数显著下降，高频模态更容易被噪声主导，"
+                    "在实际应用中可考虑在 r≈高噪声下的有效截止附近进行自适应截断。"
+                )
+            else:
+                effective_lines.append(
+                    "- 在所考察的噪声范围内，有效恢复模态数变化相对缓和，模型对噪声具备一定的尺度鲁棒性。"
+                )
+
     # 3) 拼 Markdown 文本
     lines: list[str] = []
 
@@ -349,6 +392,17 @@ def generate_experiment_report_md(
         )
         lines.append("")
 
+    # 若存在典型重建场图，也在此列出
+    if (fig_example_linear is not None) or (fig_example_mlp is not None):
+        lines.append("### 2.4 典型重建场图（文件路径）")
+        lines.append("")
+        lines.append("用于直观展示在典型 (p,σ) 条件下的重建效果：")
+        if fig_example_linear is not None:
+            lines.append(f"- Linear baseline 示例场图: `{Path(fig_example_linear)}`")
+        if fig_example_mlp is not None:
+            lines.append(f"- MLP baseline 示例场图: `{Path(fig_example_mlp)}`")
+        lines.append("")
+
     # 3. 量化结果(全部行)
     lines.append("## 3. 量化结果一览（全部组合）")
     lines.append("")
@@ -364,8 +418,11 @@ def generate_experiment_report_md(
     lines.append("```")
     lines.append("")
 
-    # 4. 多尺度分析
-    lines.append("## 4. 多尺度（POD band）恢复性能分析")
+    # 4. 多尺度分析 + 有效模态等级
+    lines.append("## 4. 多尺度（POD band）恢复性能与有效模态等级分析")
+    lines.append("")
+
+    lines.append("### 4.1 band-wise 系数误差对比")
     lines.append("")
     if multiscale_lines:
         lines.extend(multiscale_lines)
@@ -378,12 +435,24 @@ def generate_experiment_report_md(
     )
     lines.append("")
 
-    # 5. 结果讨论与展望（依然是模板，后续可做 Batch D 的自动话术增强）
+    lines.append("### 4.2 有效模态等级与自适应截断")
+    lines.append("")
+    if effective_lines:
+        lines.extend(effective_lines)
+    else:
+        lines.append("当前结果中未显式提供 effective_r_cut 信息，无法自动推断有效模态等级。")
+    lines.append("")
+
+    # 5. 结果讨论与展望（依然是模板，可基于上方结论做微调）
     lines.append("## 5. 结果讨论与展望（模板）")
     lines.append("")
     lines.append("- 当观测率较低时，线性基线在高频 band 上的误差通常更大，表明高频结构对稀疏观测更敏感；")
     lines.append("- MLP baseline 在中高频 POD band 上往往优于线性基线，特别是在中等噪声水平下更能保持结构细节；")
     lines.append("- 随着观测率提升，两者的性能差距可能逐渐缩小，说明在高采样场景中线性方法已经接近饱和；")
+    lines.append(
+        "- 结合 4.2 节的有效模态等级分析，可以在 r≈有效截止附近进行自适应截断，"
+        "在保证主要流动结构重建质量的前提下，显著压缩模型复杂度与推理成本；"
+    )
     lines.append("- 后续可以尝试引入卷积/注意力结构，或在损失中加入物理约束，以进一步改善高频恢复表现与泛化能力。")
     lines.append("")
     lines.append(

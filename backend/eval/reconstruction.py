@@ -122,10 +122,21 @@ def run_linear_baseline_experiment(
                     "nmae_std": float,
                     "psnr_mean": float,
                     "psnr_std": float,
-                    "band_errors": { band_name: float, ... }  # 系数 RMSE
+                    "band_errors": { band_name: float, ... },  # 系数 RMSE
+                    "effective_band": str | None,              # 新增：有效 band 名称
+                    "effective_r_cut": int | None,             # 新增：有效模态截止数
+                    "n_frames": int,
+                    "n_obs": int,
                 },
                 ...
-            ]
+            ],
+            "example_recon": {
+                "frame_idx": int,
+                "mask_rate": float,
+                "noise_sigma": float,
+                "x_true": [...],   # [H,W,C] list
+                "x_lin":  [...],   # [H,W,C] list
+            } | None
         }
     """
     if verbose:
@@ -144,6 +155,12 @@ def run_linear_baseline_experiment(
 
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
+
+    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0
+    p_ref = float(min(eval_cfg.mask_rates))
+    s_ref = float(min(eval_cfg.noise_sigmas))
+    t_ref = 0
+    example_recon: Dict[str, Any] | None = None
 
     # 3) 遍历 (mask_rate, noise_sigma)
     entries: List[Dict[str, Any]] = []
@@ -176,7 +193,7 @@ def run_linear_baseline_experiment(
             for t in range(T):
                 x = X_thwc[t]                 # [H,W,C]
                 x_flat = x.reshape(-1)        # [D]
-                a_true_t = A_true[t]          # [r_eff]
+                a_true_t = A_true[t]          # [r_eff]  # noqa: F841  (目前未显式使用)
 
                 # mask + 噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
@@ -194,6 +211,21 @@ def run_linear_baseline_experiment(
                 nmae_list.append(nmae(x_lin, x))
                 psnr_list.append(psnr(x_lin, x))
 
+                # 记录一个典型样本，用于后续全实验可视化
+                if (
+                    example_recon is None
+                    and float(mask_rate) == p_ref
+                    and float(noise_sigma) == s_ref
+                    and t == t_ref
+                ):
+                    example_recon = {
+                        "frame_idx": int(t),
+                        "mask_rate": float(mask_rate),
+                        "noise_sigma": float(noise_sigma),
+                        "x_true": x.tolist(),
+                        "x_lin": x_lin.tolist(),
+                    }
+
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
@@ -204,6 +236,38 @@ def run_linear_baseline_experiment(
                 a_true=A_true,
                 bands=eval_cfg.pod_bands,
             )
+            band_errors = {k: float(v) for k, v in band_errors.items()}
+
+            # 从 band_errors 推断“有效模态等级”
+            effective_band = None
+            effective_r_cut = None
+            if band_errors and eval_cfg.pod_bands:
+                # 按 band 起始索引排序，确保从低频到高频
+                band_items = sorted(
+                    eval_cfg.pod_bands.items(),
+                    key=lambda kv: kv[1][0],
+                )
+                names = [name for name, _ in band_items]
+                errs = []
+                for name in names:
+                    v = band_errors.get(name, float("nan"))
+                    errs.append(v)
+
+                errs = np.asarray(errs, dtype=float)
+                # 若全是 NaN，就放弃推断
+                if np.isfinite(errs).any():
+                    # 用一个简单的“跳变阈值”来判断从哪一层开始误差显著增大
+                    jump_ratio = 3.0
+                    eff_idx = len(names) - 1
+                    for i in range(len(names) - 1):
+                        if not np.isfinite(errs[i]) or not np.isfinite(errs[i + 1]):
+                            continue
+                        if errs[i + 1] > jump_ratio * errs[i]:
+                            eff_idx = i
+                            break
+
+                    effective_band = names[eff_idx]
+                    effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
             entry = {
                 "mask_rate": float(mask_rate),
@@ -214,7 +278,9 @@ def run_linear_baseline_experiment(
                 "nmae_std": float(nmae_arr.std()),
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
-                "band_errors": {k: float(v) for k, v in band_errors.items()},
+                "band_errors": band_errors,
+                "effective_band": effective_band,
+                "effective_r_cut": effective_r_cut,
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
             }
@@ -223,7 +289,8 @@ def run_linear_baseline_experiment(
             if verbose:
                 print(
                     f"    -> NMSE(mean±std) = {entry['nmse_mean']:.4e} ± {entry['nmse_std']:.4e}, "
-                    f"NMAE = {entry['nmae_mean']:.4e}, PSNR = {entry['psnr_mean']:.2f} dB"
+                    f"NMAE = {entry['nmae_mean']:.4e}, PSNR = {entry['psnr_mean']:.2f} dB, "
+                    f"effective_band={effective_band}, r_cut={effective_r_cut}"
                 )
 
     result: Dict[str, Any] = {
@@ -240,6 +307,7 @@ def run_linear_baseline_experiment(
             "center": meta.get("center", True),
         },
         "entries": entries,
+        "example_recon": example_recon,
     }
 
     if verbose:
@@ -262,10 +330,10 @@ def run_mlp_experiment(
     设计选择：
     - 对于每个 mask_rate，训练一个对应的 MLP（训练噪声强度由 train_cfg.noise_sigma 决定）；
     - 对该 mask_rate 下的多个 noise_sigma（测试噪声）进行评估；
-    - 每个组合输出全场误差 + POD band 系数 RMSE。
+    - 每个组合输出全场误差 + POD band 系数 RMSE + 有效模态等级。
 
-    返回结构与 run_linear_baseline_experiment 相同，只是 model_type="mlp"，
-    meta 中会额外记录部分训练超参数。
+    返回结构与 run_linear_baseline_experiment 相同，只是 model_type="mlp"，并且
+    额外包含一个 "example_recon" 字段方便全实验可视化。
     """
     if verbose:
         print("=== [eval-mlp] Start MLP baseline experiment ===")
@@ -287,6 +355,12 @@ def run_mlp_experiment(
     X_flat_all = X_thwc.reshape(T, D)
 
     entries: List[Dict[str, Any]] = []
+
+    # 典型样本选择
+    p_ref = float(min(eval_cfg.mask_rates))
+    s_ref = float(min(eval_cfg.noise_sigmas))
+    t_ref = 0
+    example_recon: Dict[str, Any] | None = None
 
     for mask_rate in eval_cfg.mask_rates:
         if verbose:
@@ -337,7 +411,7 @@ def run_mlp_experiment(
             for t in range(T):
                 x = X_thwc[t]
                 x_flat = x.reshape(-1)
-                a_true_t = A_true[t]
+                a_true_t = A_true[t]  # noqa: F841
 
                 # 观测 + 测试噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
@@ -358,6 +432,21 @@ def run_mlp_experiment(
                 nmae_list.append(nmae(x_mlp, x))
                 psnr_list.append(psnr(x_mlp, x))
 
+                # 记录一个典型样本，用于后续全实验可视化
+                if (
+                    example_recon is None
+                    and float(mask_rate) == p_ref
+                    and float(noise_sigma) == s_ref
+                    and t == t_ref
+                ):
+                    example_recon = {
+                        "frame_idx": int(t),
+                        "mask_rate": float(mask_rate),
+                        "noise_sigma": float(noise_sigma),
+                        "x_true": x.tolist(),
+                        "x_mlp": x_mlp.tolist(),
+                    }
+
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
@@ -367,6 +456,35 @@ def run_mlp_experiment(
                 a_true=A_true,
                 bands=eval_cfg.pod_bands,
             )
+            band_errors = {k: float(v) for k, v in band_errors.items()}
+
+            # 从 band_errors 推断“有效模态等级”
+            effective_band = None
+            effective_r_cut = None
+            if band_errors and eval_cfg.pod_bands:
+                band_items = sorted(
+                    eval_cfg.pod_bands.items(),
+                    key=lambda kv: kv[1][0],
+                )
+                names = [name for name, _ in band_items]
+                errs = []
+                for name in names:
+                    v = band_errors.get(name, float("nan"))
+                    errs.append(v)
+
+                errs = np.asarray(errs, dtype=float)
+                if np.isfinite(errs).any():
+                    jump_ratio = 3.0
+                    eff_idx = len(names) - 1
+                    for i in range(len(names) - 1):
+                        if not np.isfinite(errs[i]) or not np.isfinite(errs[i + 1]):
+                            continue
+                        if errs[i + 1] > jump_ratio * errs[i]:
+                            eff_idx = i
+                            break
+
+                    effective_band = names[eff_idx]
+                    effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
             entry = {
                 "mask_rate": float(mask_rate),
@@ -377,17 +495,20 @@ def run_mlp_experiment(
                 "nmae_std": float(nmae_arr.std()),
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
-                "band_errors": {k: float(v) for k, v in band_errors.items()},
+                "band_errors": band_errors,
+                "effective_band": effective_band,
+                "effective_r_cut": effective_r_cut,
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
-                "train_info": train_info,  # 可以方便你调参，后续也可以去掉
+                "train_info": train_info,
             }
             entries.append(entry)
 
             if verbose:
                 print(
                     f"    -> NMSE(mean±std) = {entry['nmse_mean']:.4e} ± {entry['nmse_std']:.4e}, "
-                    f"NMAE = {entry['nmae_mean']:.4e}, PSNR = {entry['psnr_mean']:.2f} dB"
+                    f"NMAE = {entry['nmae_mean']:.4e}, PSNR = {entry['psnr_mean']:.2f} dB, "
+                    f"effective_band={effective_band}, r_cut={effective_r_cut}"
                 )
 
     result: Dict[str, Any] = {
@@ -413,6 +534,7 @@ def run_mlp_experiment(
             },
         },
         "entries": entries,
+        "example_recon": example_recon,
     }
 
     if verbose:

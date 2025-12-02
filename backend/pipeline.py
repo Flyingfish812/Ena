@@ -240,6 +240,8 @@ def run_full_eval_pipeline(
     - "df_mlp":    MLP 结果转成的 DataFrame（或 None）
     - "fig_nmse_vs_mask": 叠加 linear / mlp 的 mask_rate 曲线图（或 None）
     - "fig_nmse_vs_noise": 叠加 linear / mlp 的 noise_sigma 曲线图（或 None）
+    - "fig_example_linear": 典型 (p,σ,t) 下 True/Linear/|Linear-True| 的场图（或 None）
+    - "fig_example_mlp":    典型 (p,σ,t) 下 True/MLP/|MLP-True| 的场图（或 None）
     """
     if verbose:
         print("=== [full-eval] Start full evaluation pipeline ===")
@@ -292,6 +294,90 @@ def run_full_eval_pipeline(
         ax_noise.legend()
         ax_noise.set_title("NMSE vs noise_sigma (linear vs mlp)")
 
+    # 3) 从 example_recon 生成典型场图
+    fig_example_linear = None
+    fig_example_mlp = None
+
+    # 3.1 Linear example
+    ex_lin = linear_results.get("example_recon", None)
+    if ex_lin is not None:
+        x_true = np.asarray(ex_lin["x_true"])
+        x_lin = np.asarray(ex_lin["x_lin"])
+        # 简单展示第 0 个通道
+        x_true_ch = x_true[..., 0]
+        x_lin_ch = x_lin[..., 0]
+        err_lin = np.abs(x_lin_ch - x_true_ch)
+
+        vmin = min(x_true_ch.min(), x_lin_ch.min())
+        vmax = max(x_true_ch.max(), x_lin_ch.max())
+
+        fig_example_linear, axes = plt.subplots(1, 3, figsize=(9, 3))
+        im0 = axes[0].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+        axes[0].set_title("True (ch=0)")
+        axes[0].set_xticks([])
+        axes[0].set_yticks([])
+
+        im1 = axes[1].imshow(x_lin_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+        axes[1].set_title("Linear baseline (ch=0)")
+        axes[1].set_xticks([])
+        axes[1].set_yticks([])
+
+        im2 = axes[2].imshow(err_lin, origin="lower", cmap="viridis")
+        axes[2].set_title("|Linear - True| (ch=0)")
+        axes[2].set_xticks([])
+        axes[2].set_yticks([])
+
+        fig_example_linear.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        fig_example_linear.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        fig_example_linear.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+        fig_example_linear.suptitle(
+            f"Linear example (frame={ex_lin['frame_idx']}, "
+            f"p={ex_lin['mask_rate']:.3g}, σ={ex_lin['noise_sigma']:.3g})",
+            fontsize=11,
+        )
+        fig_example_linear.tight_layout(rect=[0, 0, 1, 0.92])
+
+    # 3.2 MLP example
+    if mlp_results is not None:
+        ex_mlp = mlp_results.get("example_recon", None)
+        if ex_mlp is not None:
+            x_true = np.asarray(ex_mlp["x_true"])
+            x_mlp = np.asarray(ex_mlp["x_mlp"])
+            x_true_ch = x_true[..., 0]
+            x_mlp_ch = x_mlp[..., 0]
+            err_mlp = np.abs(x_mlp_ch - x_true_ch)
+
+            vmin = min(x_true_ch.min(), x_mlp_ch.min())
+            vmax = max(x_true_ch.max(), x_mlp_ch.max())
+
+            fig_example_mlp, axes = plt.subplots(1, 3, figsize=(9, 3))
+            im0 = axes[0].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+            axes[0].set_title("True (ch=0)")
+            axes[0].set_xticks([])
+            axes[0].set_yticks([])
+
+            im1 = axes[1].imshow(x_mlp_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+            axes[1].set_title("MLP baseline (ch=0)")
+            axes[1].set_xticks([])
+            axes[1].set_yticks([])
+
+            im2 = axes[2].imshow(err_mlp, origin="lower", cmap="viridis")
+            axes[2].set_title("|MLP - True| (ch=0)")
+            axes[2].set_xticks([])
+            axes[2].set_yticks([])
+
+            fig_example_mlp.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            fig_example_mlp.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+            fig_example_mlp.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            fig_example_mlp.suptitle(
+                f"MLP example (frame={ex_mlp['frame_idx']}, "
+                f"p={ex_mlp['mask_rate']:.3g}, σ={ex_mlp['noise_sigma']:.3g})",
+                fontsize=11,
+            )
+            fig_example_mlp.tight_layout(rect=[0, 0, 1, 0.92])
+
     if verbose:
         print("[full-eval] Done.")
 
@@ -302,6 +388,8 @@ def run_full_eval_pipeline(
         "df_mlp": df_mlp,
         "fig_nmse_vs_mask": fig_mask,
         "fig_nmse_vs_noise": fig_noise,
+        "fig_example_linear": fig_example_linear,
+        "fig_example_mlp": fig_example_mlp,
     }
 
 def quick_build_pod(
@@ -1144,6 +1232,23 @@ def run_experiment_from_yaml(
         p = figs_dir / "nmse_vs_noise.png"
         fig_noise.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_noise"] = p
+        if verbose:
+            print(f"[yaml-experiment] Saved figure: {p}")
+
+    # 新增：保存典型场图（Linear / MLP）
+    fig_example_linear = all_result.get("fig_example_linear", None)
+    if fig_example_linear is not None:
+        p = figs_dir / "example_linear.png"
+        fig_example_linear.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_example_linear"] = p
+        if verbose:
+            print(f"[yaml-experiment] Saved figure: {p}")
+
+    fig_example_mlp = all_result.get("fig_example_mlp", None)
+    if fig_example_mlp is not None:
+        p = figs_dir / "example_mlp.png"
+        fig_example_mlp.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_example_mlp"] = p
         if verbose:
             print(f"[yaml-experiment] Saved figure: {p}")
 
