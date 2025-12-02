@@ -23,6 +23,14 @@ from .models.train_mlp import train_mlp_on_observations
 from .viz.pod_plots import plot_pod_mode_groups
 import numpy as np
 import json
+import matplotlib.pyplot as plt
+
+from .eval.reconstruction import (
+    run_linear_baseline_experiment,
+    run_mlp_experiment,
+)
+from .eval.reports import results_to_dataframe
+from .viz.curves import plot_nmse_vs_mask_rate, plot_nmse_vs_noise
 
 
 def run_build_pod_pipeline(
@@ -55,13 +63,142 @@ def run_train_mlp_pipeline(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
     train_cfg: TrainConfig,
+    *,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     顶层 MLP 训练入口。
 
-    这一批暂不实现，占位。
+    流程：
+    1. 若 pod_cfg.save_dir 下没有 POD 结果，则先调用 build_pod 构建；
+    2. 加载 Ur / mean / meta；
+    3. 加载全量场数据 X_thwc，并展平成 [T,D]；
+    4. 生成与 train_cfg.mask_rate 对应的固定空间 mask；
+    5. 在该 mask + 噪声强度 train_cfg.noise_sigma 下调用 train_mlp_on_observations 训练；
+    6. 返回 model 与训练信息、mask 以及部分元信息，供 notebook / GUI 使用。
+
+    注意：
+    - 这里只负责“训练一个 MLP”，不做大规模 sweep；
+    - eval sweep 在 run_full_eval_pipeline 里处理。
     """
-    raise NotImplementedError
+    # 1) 确保 POD 已经存在
+    pod_dir = pod_cfg.save_dir
+    Ur_path = pod_dir / "Ur.npy"
+    mean_path = pod_dir / "mean_flat.npy"
+    meta_path = pod_dir / "pod_meta.json"
+
+    if not (Ur_path.exists() and mean_path.exists() and meta_path.exists()):
+        if verbose:
+            print(f"[train-pipeline] POD not found in {pod_dir}, building POD first...")
+        ensure_dir(pod_dir)
+        build_pod(data_cfg, pod_cfg, verbose=verbose, plot=False)
+    else:
+        if verbose:
+            print(f"[train-pipeline] Found existing POD in {pod_dir}, skip rebuilding.")
+
+    # 2) 加载 POD 结果
+    Ur = load_numpy(Ur_path)           # [D,r0]
+    mean_flat = load_numpy(mean_path)  # [D]
+    meta = load_json(meta_path)
+    H, W, C = meta["H"], meta["W"], meta["C"]
+    T = meta["T"]
+    r_used = meta["r_used"]
+
+    # 真正使用的模态数 r_eff
+    r_eff = min(pod_cfg.r, r_used)
+    Ur_eff = Ur[:, :r_eff]
+
+    if verbose:
+        print(
+            f"[train-pipeline] meta: T={T}, H={H}, W={W}, C={C}, "
+            f"r_used={r_used}, r_eff={r_eff}"
+        )
+
+    # 3) 加载全量数据，展平
+    if verbose:
+        print(f"[train-pipeline] Loading full raw data from {data_cfg.nc_path} ...")
+    X_thwc = load_raw_nc(data_cfg)  # [T,H,W,C]
+    T2, H2, W2, C2 = X_thwc.shape
+    if (T2, H2, W2, C2) != (T, H, W, C):
+        raise ValueError(
+            f"Data shape {X_thwc.shape} mismatch meta (T={T},H={H},W={W},C={C})"
+        )
+
+    D = H * W * C
+    X_flat_all = X_thwc.reshape(T, D)
+
+    if verbose:
+        print(f"[train-pipeline] X_thwc shape = {X_thwc.shape}, flattened = [{T}, {D}]")
+
+    # 4) 生成固定 mask
+    if verbose:
+        print(
+            f"[train-pipeline] Generating spatial mask with mask_rate={train_cfg.mask_rate:.4f} ..."
+        )
+
+    mask_hw = generate_random_mask_hw(H, W, mask_rate=train_cfg.mask_rate, seed=0)
+    mask_flat = flatten_mask(mask_hw, C=C)
+    n_obs = int(mask_flat.sum())
+
+    if verbose:
+        print(
+            f"[train-pipeline] total observed entries (with {C} channels) = {n_obs}, "
+            f"effective mask_rate ≈ {n_obs / (H * W * C):.4f}"
+        )
+
+    # 5) 训练 MLP
+    if verbose:
+        print(
+            f"[train-pipeline] Training MLP with noise_sigma={train_cfg.noise_sigma:.4e}, "
+            f"batch_size={train_cfg.batch_size}, max_epochs={train_cfg.max_epochs}, "
+            f"lr={train_cfg.lr}"
+        )
+
+    model, train_info = train_mlp_on_observations(
+        X_flat_all=X_flat_all,
+        Ur_eff=Ur_eff,
+        mean_flat=mean_flat,
+        mask_flat=mask_flat,
+        noise_sigma=train_cfg.noise_sigma,
+        batch_size=train_cfg.batch_size,
+        num_epochs=train_cfg.max_epochs,
+        lr=train_cfg.lr,
+        device=train_cfg.device,
+        verbose=verbose,
+    )
+
+    result: Dict[str, Any] = {
+        "model": model,
+        "train_info": train_info,
+        "mask_rate": float(train_cfg.mask_rate),
+        "noise_sigma": float(train_cfg.noise_sigma),
+        "mask_flat": mask_flat,
+        "pod": {
+            "Ur_eff": Ur_eff,
+            "mean_flat": mean_flat,
+            "r_eff": r_eff,
+            "meta": meta,
+        },
+        "data_cfg": {
+            "nc_path": str(data_cfg.nc_path),
+            "var_keys": data_cfg.var_keys,
+        },
+        "train_cfg": {
+            "mask_rate": train_cfg.mask_rate,
+            "noise_sigma": train_cfg.noise_sigma,
+            "hidden_dims": train_cfg.hidden_dims,
+            "lr": train_cfg.lr,
+            "batch_size": train_cfg.batch_size,
+            "max_epochs": train_cfg.max_epochs,
+            "device": train_cfg.device,
+            "save_dir": str(train_cfg.save_dir),
+        },
+    }
+
+    if verbose:
+        print("[train-pipeline] Training finished.")
+
+    return result
 
 
 def run_full_eval_pipeline(
@@ -69,13 +206,90 @@ def run_full_eval_pipeline(
     pod_cfg: PodConfig,
     eval_cfg: EvalConfig,
     train_cfg: TrainConfig | None = None,
+    *,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    顶层评估入口。
+    顶层评估入口：一行代码跑完整的小论文实验 sweep。
 
-    这一批暂不实现，占位。
+    流程：
+    1. 线性基线 sweep：run_linear_baseline_experiment
+    2. 若提供了 train_cfg：
+        - 在 eval_cfg.mask_rates / noise_sigmas 上跑 MLP sweep：run_mlp_experiment
+        - 自动生成两类典型曲线：
+            - NMSE vs mask_rate（固定最小 noise_sigma）
+            - NMSE vs noise_sigma（固定最小 mask_rate）
+
+    返回 result 字典包含：
+    - "linear": 线性基线的原始结果
+    - "mlp":    MLP 的原始结果（若 train_cfg 为 None 则为 None）
+    - "df_linear": 线性结果转成的 DataFrame
+    - "df_mlp":    MLP 结果转成的 DataFrame（或 None）
+    - "fig_nmse_vs_mask": 叠加 linear / mlp 的 mask_rate 曲线图（或 None）
+    - "fig_nmse_vs_noise": 叠加 linear / mlp 的 noise_sigma 曲线图（或 None）
     """
-    raise NotImplementedError
+    if verbose:
+        print("=== [full-eval] Start full evaluation pipeline ===")
+
+    # 1) 线性基线 sweep
+    if verbose:
+        print("[full-eval] Running linear baseline sweep ...")
+    linear_results = run_linear_baseline_experiment(
+        data_cfg=data_cfg,
+        pod_cfg=pod_cfg,
+        eval_cfg=eval_cfg,
+        verbose=verbose,
+    )
+    df_linear = results_to_dataframe(linear_results)
+
+    mlp_results = None
+    df_mlp = None
+    fig_mask = None
+    fig_noise = None
+
+    # 2) 若有 train_cfg，则跑 MLP sweep
+    if train_cfg is not None:
+        if verbose:
+            print("[full-eval] Running MLP sweep ...")
+
+        mlp_results = run_mlp_experiment(
+            data_cfg=data_cfg,
+            pod_cfg=pod_cfg,
+            eval_cfg=eval_cfg,
+            train_cfg=train_cfg,
+            verbose=verbose,
+        )
+        df_mlp = results_to_dataframe(mlp_results)
+
+        # 3) 生成两张最典型的曲线图
+        if verbose:
+            print("[full-eval] Plotting NMSE curves ...")
+
+        fig_mask, ax_mask = plt.subplots(1, 1, figsize=(4, 3))
+        plot_nmse_vs_mask_rate(linear_results, ax=ax_mask, label="linear")
+        if mlp_results is not None:
+            plot_nmse_vs_mask_rate(mlp_results, ax=ax_mask, label="mlp")
+        ax_mask.legend()
+        ax_mask.set_title("NMSE vs mask_rate (linear vs mlp)")
+
+        fig_noise, ax_noise = plt.subplots(1, 1, figsize=(4, 3))
+        plot_nmse_vs_noise(linear_results, ax=ax_noise, label="linear")
+        if mlp_results is not None:
+            plot_nmse_vs_noise(mlp_results, ax=ax_noise, label="mlp")
+        ax_noise.legend()
+        ax_noise.set_title("NMSE vs noise_sigma (linear vs mlp)")
+
+    if verbose:
+        print("[full-eval] Done.")
+
+    return {
+        "linear": linear_results,
+        "mlp": mlp_results,
+        "df_linear": df_linear,
+        "df_mlp": df_mlp,
+        "fig_nmse_vs_mask": fig_mask,
+        "fig_nmse_vs_noise": fig_noise,
+    }
 
 
 def quick_build_pod(
