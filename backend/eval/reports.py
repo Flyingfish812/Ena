@@ -142,7 +142,6 @@ def save_full_experiment_results(
 # 2. Markdown 实验报告生成
 # ----------------------------------------------------------------------
 
-
 def generate_experiment_report_md(
     all_result: Dict[str, Any],
     out_path: Path | str,
@@ -156,6 +155,10 @@ def generate_experiment_report_md(
     ----
     all_result:
         run_full_eval_pipeline / quick_full_experiment 的返回值。
+        建议包含:
+          - "linear", "mlp" (可选)
+          - "df_linear", "df_mlp" (可选)
+          - "saved_paths" (可选, 内含 CSV / JSON / 图像文件路径)
     out_path:
         输出的 markdown 路径。
     experiment_name:
@@ -176,11 +179,13 @@ def generate_experiment_report_md(
     if linear_res is None:
         raise ValueError("all_result['linear'] is required to generate report.")
 
+    # DataFrame: 优先使用已缓存版本, 否则从原始结果构造
     df_lin = all_result.get("df_linear", results_to_dataframe(linear_res))
     df_mlp = None
     if mlp_res is not None:
         df_mlp = all_result.get("df_mlp", results_to_dataframe(mlp_res))
 
+    # 元信息
     meta = linear_res.get("meta", {})
     H = meta.get("H", "?")
     W = meta.get("W", "?")
@@ -192,11 +197,16 @@ def generate_experiment_report_md(
     mask_rates = linear_res.get("mask_rates", [])
     noise_sigmas = linear_res.get("noise_sigmas", [])
 
+    # 从 all_result 中读取已保存的文件路径(若存在)
+    saved_paths: Dict[str, Any] = all_result.get("saved_paths", {}) or {}
+    fig_nmse_vs_mask = saved_paths.get("fig_nmse_vs_mask", None)
+    fig_nmse_vs_noise = saved_paths.get("fig_nmse_vs_noise", None)
+
     # 1) 一些 summary 统计：最好 / 最差 NMSE
     best_lin = df_lin.loc[df_lin["nmse_mean"].idxmin()]
     worst_lin = df_lin.loc[df_lin["nmse_mean"].idxmax()]
 
-    summary_lines = []
+    summary_lines: list[str] = []
 
     summary_lines.append(
         f"- Linear baseline 最佳 NMSE = {best_lin['nmse_mean']:.4e} "
@@ -221,7 +231,6 @@ def generate_experiment_report_md(
         )
 
         # 尝试比较同一 (p,σ) 下的提升
-        # 选取 mask_rate 最小 & noise_sigma 最小 的组合
         try:
             p_ref = sorted(set(df_lin["mask_rate"]))[0]
             s_ref = sorted(set(df_lin["noise_sigma"]))[0]
@@ -240,12 +249,12 @@ def generate_experiment_report_md(
                     f"相对改善约 {rel_improve:.2f}%"
                 )
         except Exception:
+            # 配置不完整或筛选失败时，默默跳过即可
             pass
 
     # 2) 多尺度 band-wise 对比（选取一组典型 (p,σ)，优先训练配置）
-    multiscale_lines = []
+    multiscale_lines: list[str] = []
     if df_mlp is not None and len(df_mlp) > 0:
-        # 优先尝试训练配置点
         train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) if mlp_res else {}
         p_train = train_meta.get("mask_rate", None)
         s_train = train_meta.get("noise_sigma", None)
@@ -287,8 +296,11 @@ def generate_experiment_report_md(
     # 3) 拼 Markdown 文本
     lines: list[str] = []
 
+    # 标题
     lines.append(f"# 实验报告：{experiment_name}")
     lines.append("")
+
+    # 1. 配置概述
     lines.append("## 1. 实验配置概述")
     lines.append("")
     lines.append(f"- 数据集路径: `{meta.get('nc_path', 'N/A')}`")
@@ -302,25 +314,58 @@ def generate_experiment_report_md(
         lines.append(f"- 配置文件: `{Path(config_yaml)}`")
     lines.append("")
 
-    lines.append("## 2. 全局重建性能摘要")
+    # 2. 指标说明 + 全局摘要
+    lines.append("## 2. 指标说明与全局重建性能摘要")
+    lines.append("")
+    lines.append("### 2.1 指标说明")
+    lines.append("")
+    lines.append("- **NMSE** (Normalized MSE)：对整体能量归一化后的均方误差，越小表示整体重建越准确。")
+    lines.append("- **NMAE** (Normalized MAE)：归一化后的平均绝对误差，相比 NMSE 对少量极端异常值不那么敏感。")
+    lines.append("- **PSNR** (Peak Signal-to-Noise Ratio)：以 dB 表示的峰值信噪比，越高表示重建场与真值之间的对比度越好。")
+    lines.append(
+        "- **band_***：在 POD 系数空间中，对低频/中频/高频等 band 的系数 RMSE，"
+        "用于刻画不同尺度结构（大尺度流型 vs 细节涡量）的恢复能力。"
+    )
+    lines.append("")
+
+    lines.append("### 2.2 全局重建性能摘要")
     lines.append("")
     lines.append("主要结论要点：")
     lines.extend(summary_lines)
     lines.append("")
 
-    lines.append("部分结果示例（前若干行）：")
+    # 若存在已保存的典型误差曲线图，则在此列出文件路径
+    if (fig_nmse_vs_mask is not None) or (fig_nmse_vs_noise is not None):
+        lines.append("### 2.3 典型误差曲线（文件路径）")
+        lines.append("")
+        lines.append("本次实验中，典型的全局误差曲线已保存为：")
+        if fig_nmse_vs_mask is not None:
+            lines.append(f"- NMSE vs 观测率: `{Path(fig_nmse_vs_mask)}`")
+        if fig_nmse_vs_noise is not None:
+            lines.append(f"- NMSE vs 噪声强度: `{Path(fig_nmse_vs_noise)}`")
+        lines.append(
+            "在撰写论文或正式报告时，可以将上述图像直接嵌入对应章节，"
+            "作为整体误差随观测率/噪声变化的可视化证据。"
+        )
+        lines.append("")
+
+    # 3. 量化结果(全部行)
+    lines.append("## 3. 量化结果一览（全部组合）")
+    lines.append("")
+    lines.append("下面给出所有 (mask_rate, noise_sigma) 组合下的统计量，便于逐行查阅和后处理。")
     lines.append("")
     lines.append("```text")
     lines.append("Linear baseline:")
-    lines.append(df_lin.head().to_string(index=False))
+    lines.append(df_lin.to_string(index=False))
     if df_mlp is not None:
         lines.append("")
         lines.append("MLP baseline:")
-        lines.append(df_mlp.head().to_string(index=False))
+        lines.append(df_mlp.to_string(index=False))
     lines.append("```")
     lines.append("")
 
-    lines.append("## 3. 多尺度（POD band）恢复性能分析")
+    # 4. 多尺度分析
+    lines.append("## 4. 多尺度（POD band）恢复性能分析")
     lines.append("")
     if multiscale_lines:
         lines.extend(multiscale_lines)
@@ -333,12 +378,13 @@ def generate_experiment_report_md(
     )
     lines.append("")
 
-    lines.append("## 4. 结果讨论与展望（模板）")
+    # 5. 结果讨论与展望（依然是模板，后续可做 Batch D 的自动话术增强）
+    lines.append("## 5. 结果讨论与展望（模板）")
     lines.append("")
-    lines.append("- 当观测率较低时，线性基线在高频 band 上的误差明显增大；")
-    lines.append("- MLP baseline 在中高频 POD band 上整体优于线性基线，特别是在中等噪声水平下；")
-    lines.append("- 随着观测率提升，两者的性能差距逐渐缩小，说明在高采样场景中线性方法已经足够；")
-    lines.append("- 后续可以扩展为卷积/注意力结构，或引入物理约束进一步提升高频恢复表现。")
+    lines.append("- 当观测率较低时，线性基线在高频 band 上的误差通常更大，表明高频结构对稀疏观测更敏感；")
+    lines.append("- MLP baseline 在中高频 POD band 上往往优于线性基线，特别是在中等噪声水平下更能保持结构细节；")
+    lines.append("- 随着观测率提升，两者的性能差距可能逐渐缩小，说明在高采样场景中线性方法已经接近饱和；")
+    lines.append("- 后续可以尝试引入卷积/注意力结构，或在损失中加入物理约束，以进一步改善高频恢复表现与泛化能力。")
     lines.append("")
     lines.append(
         "> 注：以上条目为模板化描述，可根据实际数值结果进行适当修改和细化。"

@@ -16,7 +16,16 @@ from .pod.project import project_to_pod, reconstruct_from_pod
 from .sampling.masks import generate_random_mask_hw, flatten_mask, apply_mask_flat
 from .sampling.noise import add_gaussian_noise
 from .models.linear_baseline import solve_pod_coeffs_least_squares
-from .metrics.errors import nmse
+from .metrics.errors import (
+    nmse,
+    nmae,
+    mse,
+    mae,
+    rmse,
+    linf,
+    psnr,
+    compute_basic_errors,
+)
 from .viz.field_plots import plot_field_comparison, plot_error_map
 from .viz.pod_plots import plot_pod_mode_groups
 from .models.train_mlp import train_mlp_on_observations
@@ -364,6 +373,9 @@ def quick_test_linear_baseline(
     max_modes: int = 64,
     modes_per_fig: int = 16,  # 现在理解为"group_size"
     channel: int = 0,
+    save_dir: str | Path | None = None,
+    fig_prefix: str = "quick_linear",
+    save_dpi: int = 300,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -372,13 +384,15 @@ def quick_test_linear_baseline(
     - 若 pod_dir 下不存在 POD 结果，则自动构建 POD。
     - 加载 Ur / mean / meta。
     - 从 nc_path 中取一帧 snapshot。
-    - 做 POD 截断自重建，计算 NMSE_pod，并打印“使用 r_eff 个模态”。
+    - 做 POD 截断自重建，计算一组误差指标 (MSE/MAE/RMSE/L∞/NMSE/NMAE/PSNR)。
     - 生成随机 mask + 加噪观测。
-    - 线性最小二乘解 POD 系数，重建场，计算 NMSE_linear。
+    - 线性最小二乘解 POD 系数，重建场，计算同一组误差指标。
     - 可视化：
         - Figure 1: [0]=True, [1]=POD truncation, [2]=Linear baseline
         - Figure 2: Linear 误差图
         - Figure 3: POD 模态分组叠加（每 group_size=modes_per_fig 个模态一组）
+
+    若 save_dir 不为 None，则自动将上述 Figure 保存到该目录。
 
     返回 result 中会包含以上误差与 Figure。
     """
@@ -449,7 +463,7 @@ def quick_test_linear_baseline(
     r_eff = min(r, Ur.shape[1])
     Ur_eff = Ur[:, :r_eff]
 
-    # 4) POD 截断自重建
+    # 4) POD 截断自重建 + 误差
     if verbose:
         print("[quick_test] POD truncation self-reconstruction...")
         print(f"  -> 使用 r_eff = {r_eff} 个模态，对该帧 snapshot 投影后叠加重构")
@@ -458,9 +472,16 @@ def quick_test_linear_baseline(
     x_pod_flat = reconstruct_from_pod(a_true, Ur_eff, mean_flat)
     x_pod = x_pod_flat.reshape(H, W, C)
 
-    nmse_pod = nmse(x_pod, x)
+    metrics_pod = compute_basic_errors(x_pod, x, data_range=None)
+    nmse_pod = metrics_pod["nmse"]
     if verbose:
-        print(f"  -> NMSE(POD truncation, r_eff={r_eff}) = {nmse_pod:.4e}")
+        print(
+            "  -> POD truncation errors: "
+            f"NMSE={metrics_pod['nmse']:.4e}, "
+            f"NMAE={metrics_pod['nmae']:.4e}, "
+            f"MAE={metrics_pod['mae']:.4e}, "
+            f"L∞={metrics_pod['linf']:.4e}"
+        )
 
     # 5) mask + 噪声
     if verbose:
@@ -477,7 +498,7 @@ def quick_test_linear_baseline(
     y = apply_mask_flat(x_flat, mask_flat)
     y_noisy = add_gaussian_noise(y, sigma=noise_sigma, seed=0)
 
-    # 6) 线性最小二乘重建
+    # 6) 线性最小二乘重建 + 误差
     if verbose:
         print("[quick_test] Linear least-squares reconstruction in POD space...")
 
@@ -486,9 +507,16 @@ def quick_test_linear_baseline(
     x_lin_flat = reconstruct_from_pod(a_lin, Ur_eff, mean_flat)
     x_lin = x_lin_flat.reshape(H, W, C)
 
-    nmse_linear = nmse(x_lin, x)
+    metrics_linear = compute_basic_errors(x_lin, x, data_range=None)
+    nmse_linear = metrics_linear["nmse"]
     if verbose:
-        print(f"  -> NMSE(Linear baseline, r_eff={r_eff}) = {nmse_linear:.4e}")
+        print(
+            "  -> Linear baseline errors: "
+            f"NMSE={metrics_linear['nmse']:.4e}, "
+            f"NMAE={metrics_linear['nmae']:.4e}, "
+            f"MAE={metrics_linear['mae']:.4e}, "
+            f"L∞={metrics_linear['linf']:.4e}"
+        )
 
     # 7) 场对比图
     if verbose:
@@ -513,7 +541,7 @@ def quick_test_linear_baseline(
         title="|Linear baseline - True|",
     )
 
-    # 8) POD 模态“低/中/高频分组唬人图”
+    # 8) POD 模态分组图
     if verbose:
         print("[quick_test] Plotting POD mode groups (partial sums)...")
         print(f"  -> 可视化前 {min(max_modes, r_eff)} 个模态，每组 {modes_per_fig} 个相加为一幅图")
@@ -528,12 +556,40 @@ def quick_test_linear_baseline(
         channel=channel,
     )
 
+    # 9) 如需，将 Figure 保存到磁盘
+    if save_dir is not None:
+        save_path = Path(save_dir)
+        ensure_dir(save_path)
+        base = (
+            f"{fig_prefix}_frame{frame_idx}_p{mask_rate:.4f}_sigma{noise_sigma:.3g}"
+            .replace(".", "p")
+        )
+        fig_fields.savefig(
+            save_path / f"{base}_fields.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        fig_error.savefig(
+            save_path / f"{base}_error.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        fig_modes.savefig(
+            save_path / f"{base}_modes.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        if verbose:
+            print(f"[quick_test] Figures saved to {save_path}")
+
     if verbose:
         print("[quick_test] Done.")
 
     result: Dict[str, Any] = {
         "nmse_pod": nmse_pod,
         "nmse_linear": nmse_linear,
+        "metrics_pod": metrics_pod,
+        "metrics_linear": metrics_linear,
         "frame_idx": frame_idx,
         "mask_rate": mask_rate,
         "noise_sigma": noise_sigma,
@@ -562,6 +618,9 @@ def quick_test_mlp_baseline(
     max_modes: int = 64,
     modes_per_fig: int = 16,
     channel: int = 0,
+    save_dir: str | Path | None = None,
+    fig_prefix: str = "quick_mlp",
+    save_dpi: int = 300,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -571,13 +630,15 @@ def quick_test_mlp_baseline(
     - 基于整段时间序列构建 ObservationDataset，训练 MLP：
           y (masked noisy obs) -> a_true (POD coeffs)
     - 在指定 frame_idx 上计算：
-          - POD 截断自身误差 NMSE_pod
-          - 线性 least-squares baseline NMSE_linear
-          - MLP baseline NMSE_mlp
+          - POD 截断自身误差（全家桶: MSE/MAE/RMSE/L∞/NMSE/NMAE/PSNR）
+          - 线性 least-squares baseline 误差
+          - MLP baseline 误差
     - 可视化：
-          Figure 1: [0]=True, [1]=POD truncation, [2]=Linear baseline, [3]=MLP
+          Figure 1: True / POD / Linear / MLP 四列对比
           Figure 2: MLP 误差图 |MLP - True|
           Figure 3: POD 模态分组叠加（每组 modes_per_fig 个模态求和）
+
+    若 save_dir 不为 None，则自动将上述 Figure 保存到该目录。
 
     返回 result 字典。
     """
@@ -660,7 +721,7 @@ def quick_test_mlp_baseline(
         print(f"  - mask_rate target = {mask_rate:.4f}, actual ≈ {n_obs / (H*W*C):.4f} over H×W×C")
         print(f"  - total observed entries (with {C} channels) = {n_obs}")
 
-    # 5) POD 截断自重建（在目标 frame_idx 上）
+    # 5) POD 截断自重建（在目标 frame_idx 上）+ 误差
     if frame_idx < 0 or frame_idx >= T:
         raise IndexError(f"frame_idx {frame_idx} out of range [0, {T-1}]")
 
@@ -675,11 +736,18 @@ def quick_test_mlp_baseline(
     x_pod_flat = reconstruct_from_pod(a_true_frame, Ur_eff, mean_flat)
     x_pod = x_pod_flat.reshape(H, W, C)
 
-    nmse_pod = nmse(x_pod, x)
+    metrics_pod = compute_basic_errors(x_pod, x, data_range=None)
+    nmse_pod = metrics_pod["nmse"]
     if verbose:
-        print(f"  -> NMSE(POD truncation, r_eff={r_eff}) = {nmse_pod:.4e}")
+        print(
+            "  -> POD truncation errors: "
+            f"NMSE={metrics_pod['nmse']:.4e}, "
+            f"NMAE={metrics_pod['nmae']:.4e}, "
+            f"MAE={metrics_pod['mae']:.4e}, "
+            f"L∞={metrics_pod['linf']:.4e}"
+        )
 
-    # 6) 线性 least-squares baseline（同一 mask）
+    # 6) 线性 least-squares baseline（同一 mask）+ 误差
     if verbose:
         print("[quick_test_mlp] Linear least-squares baseline on target frame...")
 
@@ -691,9 +759,16 @@ def quick_test_mlp_baseline(
     x_lin_flat = reconstruct_from_pod(a_lin, Ur_eff, mean_flat)
     x_lin = x_lin_flat.reshape(H, W, C)
 
-    nmse_linear = nmse(x_lin, x)
+    metrics_linear = compute_basic_errors(x_lin, x, data_range=None)
+    nmse_linear = metrics_linear["nmse"]
     if verbose:
-        print(f"  -> NMSE(Linear baseline, r_eff={r_eff}) = {nmse_linear:.4e}")
+        print(
+            "  -> Linear baseline errors: "
+            f"NMSE={metrics_linear['nmse']:.4e}, "
+            f"NMAE={metrics_linear['nmae']:.4e}, "
+            f"MAE={metrics_linear['mae']:.4e}, "
+            f"L∞={metrics_linear['linf']:.4e}"
+        )
 
     # 7) 训练 MLP
     if mlp_noise_sigma is None:
@@ -716,7 +791,7 @@ def quick_test_mlp_baseline(
         verbose=verbose,
     )
 
-    # 8) 用 MLP 在目标帧上推断
+    # 8) 用 MLP 在目标帧上推断 + 误差
     if verbose:
         print("[quick_test_mlp] Inference with trained MLP on target frame...")
         print("  -> 注意: 使用与训练相同的固定掩膜 mask_flat")
@@ -736,9 +811,16 @@ def quick_test_mlp_baseline(
     x_mlp_flat = reconstruct_from_pod(a_mlp, Ur_eff, mean_flat)
     x_mlp = x_mlp_flat.reshape(H, W, C)
 
-    nmse_mlp = nmse(x_mlp, x)
+    metrics_mlp = compute_basic_errors(x_mlp, x, data_range=None)
+    nmse_mlp = metrics_mlp["nmse"]
     if verbose:
-        print(f"  -> NMSE(MLP baseline, r_eff={r_eff}) = {nmse_mlp:.4e}")
+        print(
+            "  -> MLP baseline errors: "
+            f"NMSE={metrics_mlp['nmse']:.4e}, "
+            f"NMAE={metrics_mlp['nmae']:.4e}, "
+            f"MAE={metrics_mlp['mae']:.4e}, "
+            f"L∞={metrics_mlp['linf']:.4e}"
+        )
 
     # 9) 场对比 + 误差可视化
     if verbose:
@@ -746,14 +828,6 @@ def quick_test_mlp_baseline(
         print("  -> Figure layout: [0]=True, [1]=POD truncation, "
               "[2]=Linear baseline, [3]=MLP baseline")
 
-    fig_fields = plot_field_comparison(
-        x_true_hw=x,
-        x_lin_hw=x_pod,
-        x_nn_hw=None,   # 先用两个额外通道来装 linear 和 mlp，我们会手动调用 imshow
-    )
-
-    # 为了控制顺序，这里重画一张 4 列版：
-    import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 4, figsize=(16, 3))
 
     fields = [
@@ -798,6 +872,32 @@ def quick_test_mlp_baseline(
         channel=channel,
     )
 
+    # 11) 如需，将 Figure 保存到磁盘
+    if save_dir is not None:
+        save_path = Path(save_dir)
+        ensure_dir(save_path)
+        base = (
+            f"{fig_prefix}_frame{frame_idx}_p{mask_rate:.4f}_sigma{noise_sigma:.3g}"
+            .replace(".", "p")
+        )
+        fig_fields_all.savefig(
+            save_path / f"{base}_fields.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        fig_error_mlp.savefig(
+            save_path / f"{base}_error_mlp.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        fig_modes.savefig(
+            save_path / f"{base}_modes.png",
+            dpi=save_dpi,
+            bbox_inches="tight",
+        )
+        if verbose:
+            print(f"[quick_test_mlp] Figures saved to {save_path}")
+
     if verbose:
         print("[quick_test_mlp] Done.")
 
@@ -805,6 +905,9 @@ def quick_test_mlp_baseline(
         "nmse_pod": nmse_pod,
         "nmse_linear": nmse_linear,
         "nmse_mlp": nmse_mlp,
+        "metrics_pod": metrics_pod,
+        "metrics_linear": metrics_linear,
+        "metrics_mlp": metrics_mlp,
         "frame_idx": frame_idx,
         "mask_rate": mask_rate,
         "noise_sigma": noise_sigma,
@@ -1019,13 +1122,40 @@ def run_experiment_from_yaml(
         verbose=verbose,
     )
 
-    # 保存 JSON / CSV
+    # 先确定实验目录与 figs 子目录
     save_root = Path(save_root)
+    exp_dir = save_root / experiment_name
+    figs_dir = exp_dir / "figs"
+    ensure_dir(figs_dir)
+
+    # 将 full-eval 返回的典型曲线图（若存在）保存下来
+    fig_paths: Dict[str, Path] = {}
+
+    fig_mask = all_result.get("fig_nmse_vs_mask", None)
+    if fig_mask is not None:
+        p = figs_dir / "nmse_vs_mask.png"
+        fig_mask.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_nmse_vs_mask"] = p
+        if verbose:
+            print(f"[yaml-experiment] Saved figure: {p}")
+
+    fig_noise = all_result.get("fig_nmse_vs_noise", None)
+    if fig_noise is not None:
+        p = figs_dir / "nmse_vs_noise.png"
+        fig_noise.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_nmse_vs_noise"] = p
+        if verbose:
+            print(f"[yaml-experiment] Saved figure: {p}")
+
+    # 保存 JSON / CSV
     saved_paths = save_full_experiment_results(
         all_result,
         base_dir=save_root,
         experiment_name=experiment_name,
     )
+
+    # 把图像路径也并入 saved_paths，方便后续查阅
+    saved_paths.update(fig_paths)
     all_result["saved_paths"] = saved_paths
 
     # 生成 report.md
@@ -1033,13 +1163,13 @@ def run_experiment_from_yaml(
     if generate_report:
         report_path = generate_experiment_report_md(
             all_result,
-            out_path=save_root / experiment_name / "report.md",
+            out_path=exp_dir / "report.md",
             experiment_name=experiment_name,
             config_yaml=yaml_path,
         )
     all_result["report_path"] = report_path
 
     if verbose:
-        print(f"[yaml-experiment] Done. Results saved under {save_root / experiment_name}")
+        print(f"[yaml-experiment] Done. Results saved under {exp_dir}")
 
     return all_result
