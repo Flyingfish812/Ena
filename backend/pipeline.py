@@ -5,7 +5,7 @@
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Sequence
 
 from .config.schemas import DataConfig, PodConfig, TrainConfig, EvalConfig
 from .pod.compute import build_pod
@@ -20,7 +20,6 @@ from .metrics.errors import nmse
 from .viz.field_plots import plot_field_comparison, plot_error_map
 from .viz.pod_plots import plot_pod_mode_groups
 from .models.train_mlp import train_mlp_on_observations
-from .viz.pod_plots import plot_pod_mode_groups
 import numpy as np
 import json
 import matplotlib.pyplot as plt
@@ -31,6 +30,13 @@ from .eval.reconstruction import (
 )
 from .eval.reports import results_to_dataframe
 from .viz.curves import plot_nmse_vs_mask_rate, plot_nmse_vs_noise
+from .viz.multiscale_plots import plot_multiscale_bar
+from .config.yaml_io import load_experiment_yaml, save_experiment_yaml  # 可选用
+from .eval.reports import (
+    results_to_dataframe,
+    save_full_experiment_results,
+    generate_experiment_report_md,
+)
 
 
 def run_build_pod_pipeline(
@@ -57,7 +63,6 @@ def run_build_pod_pipeline(
     """
     result = build_pod(data_cfg, pod_cfg, verbose=verbose, plot=plot)
     return result
-
 
 def run_train_mlp_pipeline(
     data_cfg: DataConfig,
@@ -200,7 +205,6 @@ def run_train_mlp_pipeline(
 
     return result
 
-
 def run_full_eval_pipeline(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
@@ -290,7 +294,6 @@ def run_full_eval_pipeline(
         "fig_nmse_vs_mask": fig_mask,
         "fig_nmse_vs_noise": fig_noise,
     }
-
 
 def quick_build_pod(
     nc_path: str | Path,
@@ -813,3 +816,230 @@ def quick_test_mlp_baseline(
         "meta": meta,
     }
     return result
+
+def quick_full_experiment(
+    nc_path: str | Path = "data/cylinder2d.nc",
+    *,
+    var_keys: tuple[str, ...] = ("u", "v"),
+    r: int = 128,
+    center: bool = True,
+    mask_rates: Sequence[float] | None = None,
+    noise_sigmas: Sequence[float] | None = None,
+    pod_bands: Dict[str, tuple[int, int]] | None = None,
+    train_mask_rate: float = 0.02,
+    train_noise_sigma: float = 0.01,
+    hidden_dims: tuple[int, ...] = (256, 256),
+    lr: float = 1e-3,
+    batch_size: int = 64,
+    max_epochs: int = 50,
+    device: str = "cuda",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    一行跑完“小论文主实验”的高层接口：
+
+    - 自动构建 DataConfig / PodConfig / EvalConfig / TrainConfig；
+    - 调用 run_full_eval_pipeline 进行线性基线 + MLP 的 p-σ sweep；
+    - 自动生成：
+        * NMSE vs mask_rate 曲线（linear + mlp）
+        * NMSE vs noise_sigma 曲线（linear + mlp）
+        * 某个 (mask_rate, noise_sigma) 组合的 POD band 误差柱状图
+
+    参数
+    ----
+    nc_path:
+        NetCDF 数据集路径。
+    var_keys:
+        要读取的变量名元组，例如 ("u", "v")。
+    r:
+        POD 截断模态数。
+    center:
+        是否进行去均值。
+    mask_rates:
+        评估时的一组观测率；若为 None，默认 [0.01, 0.02, 0.05, 0.10]。
+    noise_sigmas:
+        评估时的一组噪声强度；若为 None，默认 [0.0, 0.01, 0.02]。
+    pod_bands:
+        POD 多尺度 band 定义，例如 {"L": (0,16), "M": (16,64), "H": (64,128)}；
+        若为 None，则按 r 切出三段默认 band。
+    train_mask_rate:
+        训练 MLP 时使用的 mask_rate（通常可选用 mask_rates 中的某一个）。
+    train_noise_sigma:
+        训练 MLP 时使用的噪声强度。
+    hidden_dims, lr, batch_size, max_epochs, device:
+        MLP 的训练超参数。
+    verbose:
+        是否打印中间过程信息。
+
+    返回
+    ----
+    result:
+        在 run_full_eval_pipeline 返回基础上，增加：
+        - "fig_multiscale_example": 某个组合的 POD band 误差柱状图 Figure
+    """
+    nc_path = Path(nc_path)
+
+    # ---- 1) 默认 mask_rates / noise_sigmas / pod_bands ----
+    if mask_rates is None:
+        mask_rates = [0.01, 0.02, 0.05, 0.10]
+    if noise_sigmas is None:
+        noise_sigmas = [0.0, 0.01, 0.02]
+
+    # 如果没给 band，就按 r 划一个简单的 L/M/H
+    if pod_bands is None:
+        # 尽量用 0-16, 16-64, 64-r 的形式；若 r < 64 则自动压缩
+        r_L = min(16, r)
+        r_M = min(64, r)
+        pod_bands = {
+            "L": (0, r_L),
+            "M": (r_L, r_M),
+            "H": (r_M, r),
+        }
+
+    # ---- 2) 构造四个配置 dataclass ----
+    data_cfg = DataConfig(
+        nc_path=nc_path,
+        var_keys=var_keys,
+        cache_dir=None,
+    )
+
+    pod_cfg = PodConfig(
+        r=r,
+        center=center,
+        save_dir=Path(f"artifacts/pod_r{r}"),
+    )
+
+    eval_cfg = EvalConfig(
+        mask_rates=list(mask_rates),
+        noise_sigmas=list(noise_sigmas),
+        pod_bands=pod_bands,
+        save_dir=Path("artifacts/eval"),
+    )
+
+    train_cfg = TrainConfig(
+        mask_rate=float(train_mask_rate),
+        noise_sigma=float(train_noise_sigma),
+        hidden_dims=hidden_dims,
+        lr=lr,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        device=device,
+        save_dir=Path("artifacts/nn")
+        / f"p{train_mask_rate:.4f}_sigma{train_noise_sigma:.3g}".replace(".", "p"),
+    )
+
+    # ---- 3) 调用已有的 full-eval pipeline ----
+    result = run_full_eval_pipeline(
+        data_cfg=data_cfg,
+        pod_cfg=pod_cfg,
+        eval_cfg=eval_cfg,
+        train_cfg=train_cfg,
+        verbose=verbose,
+    )
+
+    # run_full_eval_pipeline 已经在 result 里塞了：
+    # - "linear" / "mlp" 原始结果
+    # - "df_linear" / "df_mlp" DataFrame
+    # - "fig_nmse_vs_mask" / "fig_nmse_vs_noise" 两张曲线图
+
+    # ---- 4) 顺手再画一张多尺度 band 柱状图（从 MLP 结果里挑一条）----
+    fig_multiscale = None
+    mlp_results = result.get("mlp", None)
+    if mlp_results is not None:
+        entries = mlp_results.get("entries", [])
+        if entries:
+            some_entry = entries[0]
+            band_errors = some_entry.get("band_errors", {})
+            fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
+            title = (
+                f"MLP bands (p={some_entry['mask_rate']}, "
+                f"σ={some_entry['noise_sigma']})"
+            )
+            plot_multiscale_bar(band_errors, ax=ax, title=title)
+            fig_multiscale.tight_layout()
+
+    result["fig_multiscale_example"] = fig_multiscale
+    result["configs"] = {
+        "data_cfg": data_cfg,
+        "pod_cfg": pod_cfg,
+        "eval_cfg": eval_cfg,
+        "train_cfg": train_cfg,
+    }
+
+    return result
+
+def run_experiment_from_yaml(
+    yaml_path: str | Path,
+    *,
+    experiment_name: str | None = None,
+    save_root: str | Path = "artifacts/experiments",
+    generate_report: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    从 YAML 配置文件一键运行完整实验（POD 构建 + 线性 sweep + MLP sweep），
+    并将结果与报告落盘。
+
+    参数
+    ----
+    yaml_path:
+        实验配置 YAML 文件路径。
+    experiment_name:
+        实验名称。若为 None，则使用 YAML 文件名（去掉扩展名）。
+    save_root:
+        所有结果与 report.md 存放的根目录。
+    generate_report:
+        是否根据结果生成 report.md。
+    verbose:
+        是否打印中间日志。
+
+    返回
+    ----
+    all_result:
+        run_full_eval_pipeline 的返回结果，
+        并额外包含 "saved_paths" 与 "report_path" (若生成)。
+    """
+    yaml_path = Path(yaml_path)
+    if experiment_name is None:
+        experiment_name = yaml_path.stem
+
+    if verbose:
+        print(f"[yaml-experiment] Loading configs from {yaml_path} ...")
+
+    data_cfg, pod_cfg, eval_cfg, train_cfg = load_experiment_yaml(yaml_path)
+
+    if verbose:
+        print("[yaml-experiment] Running full evaluation pipeline ...")
+
+    all_result = run_full_eval_pipeline(
+        data_cfg=data_cfg,
+        pod_cfg=pod_cfg,
+        eval_cfg=eval_cfg,
+        train_cfg=train_cfg,
+        verbose=verbose,
+    )
+
+    # 保存 JSON / CSV
+    save_root = Path(save_root)
+    saved_paths = save_full_experiment_results(
+        all_result,
+        base_dir=save_root,
+        experiment_name=experiment_name,
+    )
+    all_result["saved_paths"] = saved_paths
+
+    # 生成 report.md
+    report_path = None
+    if generate_report:
+        report_path = generate_experiment_report_md(
+            all_result,
+            out_path=save_root / experiment_name / "report.md",
+            experiment_name=experiment_name,
+            config_yaml=yaml_path,
+        )
+    all_result["report_path"] = report_path
+
+    if verbose:
+        print(f"[yaml-experiment] Done. Results saved under {save_root / experiment_name}")
+
+    return all_result
