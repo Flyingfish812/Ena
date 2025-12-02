@@ -1,59 +1,48 @@
 # backend/models/mlp.py
 
 """
-用于预测 POD 系数的简单 MLP 模型。
+POD 系数回归用的简单 MLP 模型。
 """
 
-from typing import Sequence
+from typing import Iterable, List
 
 import torch
 import torch.nn as nn
 
 
-class MLP(nn.Module):
+class PodMLP(nn.Module):
     """
-    多层感知机，用于从观测向量预测 POD 系数。
+    一个简单的全连接 MLP，用于从观测向量 y ∈ R^M 预测 POD 系数 a ∈ R^r。
 
-    结构：
-        input_dim -> hidden_dims[0] -> ... -> hidden_dims[-1] -> output_dim
+    结构示例:
+        M -> 256 -> 256 -> r
     """
 
     def __init__(
         self,
-        input_dim: int,
-        output_dim: int,
-        hidden_dims: Sequence[int],
-        activation: str = "relu",
+        in_dim: int,
+        out_dim: int,
+        hidden_dims: Iterable[int] = (256, 256),
+        activation: nn.Module | None = None,
     ) -> None:
         super().__init__()
-        raise NotImplementedError
+        if activation is None:
+            activation = nn.ReLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims: List[int] = [in_dim] + list(hidden_dims) + [out_dim]
+        layers: List[nn.Module] = []
+
+        for i in range(len(dims) - 1):
+            in_d, out_d = dims[i], dims[i + 1]
+            layers.append(nn.Linear(in_d, out_d))
+            if i < len(dims) - 2:
+                layers.append(activation)
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
-        前向传播。
-
-        参数
-        ----
-        x:
-            形状为 [N, input_dim] 的张量。
-
-        返回
-        ----
-        out:
-            形状为 [N, output_dim] 的预测 POD 系数。
+        y: [batch, in_dim]
+        返回: [batch, out_dim]
         """
-        raise NotImplementedError
-
-
-def build_mlp(
-    input_dim: int,
-    output_dim: int,
-    hidden_dims: Sequence[int],
-    activation: str = "relu",
-) -> MLP:
-    """
-    构建一个 MLP 模型实例。
-
-    封装一层，便于在其它模块中统一创建模型。
-    """
-    raise NotImplementedError
+        return self.net(y)
