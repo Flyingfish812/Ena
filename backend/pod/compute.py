@@ -13,6 +13,33 @@ from ..dataio.nc_loader import load_raw_nc
 from ..dataio.io_utils import ensure_dir, save_numpy, save_json
 
 
+def _build_phi_groups(r_used: int, group_size: int = 16):
+    """
+    将前 r_used 个模态按 group_size 分组，返回一个列表：
+    [
+        {"group_index": 1, "name": "S1", "k_start": 1,  "k_end": min(16, r_used)},
+        {"group_index": 2, "name": "S2", "k_start": 17, "k_end": min(32, r_used)},
+        ...
+    ]
+    """
+    groups = []
+    k_start = 1  # 1-based index
+    g_idx = 1
+    while k_start <= r_used:
+        k_end = min(k_start + group_size - 1, r_used)
+        groups.append(
+            {
+                "group_index": g_idx,
+                "name": f"S{g_idx}",
+                "k_start": k_start,
+                "k_end": k_end,
+            }
+        )
+        g_idx += 1
+        k_start = k_end + 1
+    return groups
+
+
 def build_pod(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
@@ -28,7 +55,8 @@ def build_pod(
     2. 将数据 reshape 为 [N, D]，其中 N = T，D = H*W*C。
     3. 对每个空间点做去均值（若 pod_cfg.center 为 True）。
     4. 对 X 做 SVD，得到空间 POD 基底。
-    5. 截断到前 r 个模态，保存 U_r、均值场、奇异值与基础元数据。
+    5. 截断到前 r 个模态，保存 U_r、均值场、奇异值、真实 POD 系数 A_true、
+       POD 特征值 eigenvalues 以及基础元数据与模态分组信息。
     6. 返回包含能量谱等信息的字典。
 
     可视化：
@@ -53,6 +81,7 @@ def build_pod(
 
     # 2) reshape 为 [N,D]
     X_flat = X_thwc.reshape(N, D).astype(np.float64)  # 用 float64 算 SVD 稳一些
+    del X_thwc  # 及时释放内存
 
     # 3) 去均值
     if verbose:
@@ -89,17 +118,24 @@ def build_pod(
         print(f"  -> 奇异值 S: max={S.max():.4e}, min={S.min():.4e}")
         print("  -> 前几阶奇异值:", ", ".join(f"{v:.3e}" for v in S[:5]))
 
-    # 5) 截断
+    # 5) 截断，并计算能量谱 / POD 特征值 / 真实系数
     r = min(pod_cfg.r, r0)
     if verbose:
-        print("=== [POD] Step 4: 截断并计算能量谱 ===")
+        print("=== [POD] Step 4: 截断并计算能量谱 / POD 特征值 / 系数矩阵 ===")
         print(f"  - 请求 r = {pod_cfg.r}, 实际可用 r0 = {r0}, 使用 r = {r}")
 
-    Vr = Vh[:r, :].T.astype(np.float32, copy=False)          # [D,r]
-    mean_flat32 = mean_flat.astype(np.float32, copy=False).reshape(-1)  # [D]
+    # 注意：此处 S 仍是长度 r0 的一维数组，我们只对前 r 阶做系数和特征值
     S = S.astype(np.float32, copy=False)
+    S_r = S[:r]  # [r]
 
-    energy = (S ** 2)
+    # POD 基底（空间模态）：Vr[D,r]
+    Vr = Vh[:r, :].T.astype(np.float32, copy=False)   # [D,r]
+
+    # 去均值场（展平）
+    mean_flat32 = mean_flat.astype(np.float32, copy=False).reshape(-1)  # [D]
+
+    # 能量谱（基于全部 r0 阶奇异值）
+    energy = (S ** 2)        # [r0]
     total_energy = float(energy.sum()) if energy.size > 0 else 1.0
     energy_frac = energy / total_energy
     cum_energy = np.cumsum(energy_frac)
@@ -118,6 +154,33 @@ def build_pod(
         print(f"  -> 达到 95% 能量需要的模态数约: {r95}")
         print(f"  -> 达到 99% 能量需要的模态数约: {r99}")
 
+    # === 新增：计算真实 POD 系数 A_true 与 POD 特征值 eigenvalues ===
+    # 对于中心化后的数据 Xc = U S V^T，前 r 阶的时间系数 a_true(t,k) = U[:,k] * S[k]
+    # 这里只保留前 r 个模态的系数，形状 [N, r]
+    U_r = U_svd[:, :r].astype(np.float32, copy=False)    # [N,r]
+    A_true = U_r * S_r.reshape(1, r)                     # [N,r]，广播乘
+
+    # POD 特征值 λ_k = S_k^2 / (N - 1)，仅前 r 阶
+    # 若 N=1（极端情况），避免除零，直接使用 S_k^2
+    if N > 1:
+        eigenvalues = (S_r.astype(np.float64) ** 2) / float(N - 1)
+    else:
+        eigenvalues = (S_r.astype(np.float64) ** 2)
+    eigenvalues = eigenvalues.astype(np.float32, copy=False)  # [r]
+
+    if verbose:
+        print("  -> 已计算 A_true (真实 POD 系数) 和 eigenvalues (POD 特征值)")
+        print(f"     A_true shape      : {A_true.shape}")
+        print(f"     eigenvalues shape : {eigenvalues.shape}")
+
+    # === 新增：构建按 16 模态一组的 φ 分组信息 ===
+    phi_groups = _build_phi_groups(r_used=r, group_size=16)
+    if verbose:
+        print(f"  -> φ 被分成 {len(phi_groups)} 组，每组最多 16 个模态")
+
+    # 释放大数组（除了 Vr / mean_flat32 / A_true 这些后续要用的）
+    del U_svd, Vh, X_flat, Xc
+
     # 6) 保存
     save_dir = pod_cfg.save_dir
     ensure_dir(save_dir)
@@ -125,14 +188,21 @@ def build_pod(
     if verbose:
         print("=== [POD] Step 5: 保存结果 ===")
         print(f"  -> save_dir = {save_dir}")
-        print("  -> 保存 Ur.npy, mean_flat.npy, singular_values.npy, pod_meta.json")
+        print("  -> 保存 Ur.npy, mean_flat.npy, singular_values.npy,")
+        print("          A_true.npy, eigenvalues.npy, pod_meta.json, phi_groups.json")
 
-    from ..dataio.io_utils import save_numpy, save_json  # 已在顶部导入，这里只是提醒
-
+    # 空间基底与均值场
     save_numpy(save_dir / "Ur.npy", Vr)                   # [D,r]
     save_numpy(save_dir / "mean_flat.npy", mean_flat32)   # [D]
+    # 全部奇异值（r0 阶）
     save_numpy(save_dir / "singular_values.npy", S)       # [r0]
 
+    # 新增：真实 POD 系数矩阵（仅前 r_used 阶）
+    save_numpy(save_dir / "A_true.npy", A_true)           # [N,r]
+    # 新增：POD 特征值（仅前 r_used 阶）
+    save_numpy(save_dir / "eigenvalues.npy", eigenvalues) # [r]
+
+    # 元数据与分组信息
     meta = {
         "T": T,
         "H": H,
@@ -144,15 +214,24 @@ def build_pod(
         "r_used": r,
         "center": pod_cfg.center,
         "total_energy": float(total_energy),
+        "phi_group_size": 16,
+        "phi_group_count": len(phi_groups),
     }
     save_json(save_dir / "pod_meta.json", meta)
 
+    # 新增：φ 分组信息单独保存，便于多尺度分析直接读取
+    save_json(save_dir / "phi_groups.json", {"groups": phi_groups})
+
     result: Dict[str, Any] = {
-        "singular_values": S,
-        "energy": energy_frac,
-        "cum_energy": cum_energy,
+        "singular_values": S,          # [r0]
+        "energy": energy_frac,         # [r0]
+        "cum_energy": cum_energy,      # [r0]
         "r_used": r,
-        "mean_field": mean_flat32,
+        "mean_field": mean_flat32,     # [D]
+        "Ur": Vr,                      # [D,r]
+        "A_true": A_true,              # [N,r]
+        "eigenvalues": eigenvalues,    # [r]
+        "phi_groups": phi_groups,      # list of dicts
         "meta": meta,
         "save_dir": str(save_dir),
     }

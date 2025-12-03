@@ -24,6 +24,90 @@ from ..models.linear_baseline import solve_pod_coeffs_least_squares
 from ..models.train_mlp import train_mlp_on_observations
 from ..metrics.errors import nmse, nmae, psnr
 from ..metrics.multiscale import compute_pod_band_errors
+from ..metrics.metrics import (
+    rmse_per_mode,
+    nrmse_per_mode,
+    nrmse_per_band,
+    partial_recon_nmse,
+)
+
+def _load_pod_aux_info(
+    pod_cfg: PodConfig,
+    r_eff: int,
+    *,
+    verbose: bool = True,
+) -> Tuple[np.ndarray | None, list[dict]]:
+    """
+    从 POD 目录中加载：
+    - eigenvalues.npy（若存在）
+    - phi_groups.json（若存在）
+
+    若某个文件不存在，则做合理降级：
+    - eigenvalues 为空则在 nrmse_per_mode 中退化为用 std 做归一化；
+    - phi_groups 为空则根据 r_eff 和 group_size=16 现场构造 S1, S2, ...。
+    """
+    save_dir = pod_cfg.save_dir
+    eigen_path = save_dir / "eigenvalues.npy"
+    phi_path = save_dir / "phi_groups.json"
+
+    eigenvalues: np.ndarray | None
+    if eigen_path.exists():
+        eigenvalues = load_numpy(eigen_path).astype(np.float64)
+        if eigenvalues.shape[0] < r_eff:
+            # 容错：老版本可能只存了更少的特征值
+            eigenvalues = eigenvalues
+        else:
+            eigenvalues = eigenvalues[:r_eff]
+        if verbose:
+            print(f"[eval] Loaded eigenvalues from {eigen_path}, shape={eigenvalues.shape}")
+    else:
+        eigenvalues = None
+        if verbose:
+            print(f"[eval] eigenvalues.npy not found in {save_dir}, NRMSE_per_mode will use std-based normalization.")
+
+    phi_groups: list[dict] = []
+    if phi_path.exists():
+        phi_json = load_json(phi_path)
+        phi_groups = list(phi_json.get("groups", []))
+        if verbose:
+            print(f"[eval] Loaded phi_groups from {phi_path}, count={len(phi_groups)}")
+    else:
+        # 回退：按 16 模态一组构造
+        from ..pod.compute import _build_phi_groups  # 局部导入避免循环
+        phi_groups = _build_phi_groups(r_used=r_eff, group_size=16)
+        if verbose:
+            print(f"[eval] phi_groups.json not found, fallback to 16-modes groups, count={len(phi_groups)}")
+
+    return eigenvalues, phi_groups
+
+def _compute_interp_baseline(
+    x: np.ndarray,      # [H,W,C]
+    mask_hw: np.ndarray # [H,W]，True 表示该空间格点被观测到（对所有通道）
+) -> np.ndarray:
+    """
+    非物理但简单可重复的插值 baseline：
+
+    - 在未观测格点使用“该帧中观测点的通道均值”填充；
+    - 在观测点直接使用真值 x（不考虑噪声）。
+    """
+    if x.ndim != 3:
+        raise ValueError(f"x must be [H,W,C], got {x.shape}")
+    H, W, C = x.shape
+    if mask_hw.shape != (H, W):
+        raise ValueError(f"mask_hw shape {mask_hw.shape} != (H,W)=({H},{W})")
+
+    x_interp = np.empty_like(x)
+    for c in range(C):
+        obs_vals = x[..., c][mask_hw]
+        if obs_vals.size == 0:
+            mean_val = 0.0
+        else:
+            mean_val = float(obs_vals.mean())
+        # 未观测位置用均值填，观测位置用真值
+        x_interp[..., c].fill(mean_val)
+        x_interp[..., c][mask_hw] = x[..., c][mask_hw]
+
+    return x_interp
 
 
 def _load_or_build_pod(
@@ -93,7 +177,6 @@ def _prepare_snapshots(
 
     return X_thwc, A_true
 
-
 def run_linear_baseline_experiment(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
@@ -116,15 +199,28 @@ def run_linear_baseline_experiment(
                 {
                     "mask_rate": float,
                     "noise_sigma": float,
+                    # 全场误差统计
                     "nmse_mean": float,
                     "nmse_std": float,
                     "nmae_mean": float,
                     "nmae_std": float,
                     "psnr_mean": float,
                     "psnr_std": float,
-                    "band_errors": { band_name: float, ... },  # 系数 RMSE
-                    "effective_band": str | None,              # 新增：有效 band 名称
-                    "effective_r_cut": int | None,             # 新增：有效模态截止数
+
+                    # POD 系数级别
+                    "band_errors": { band_name: float, ... },     # 旧字段：band-wise RMSE
+                    "band_nrmse": { band_name: float, ... },      # 新字段：band-wise NRMSE
+                    "coeff_rmse_per_mode": [float, ...],          # [r_eff]
+                    "coeff_nrmse_per_mode": [float, ...],         # [r_eff]
+
+                    # 场级多尺度误差（基于 φ 分组）
+                    "field_nmse_per_group": { "S1": float, ... },     # 单组重建 NMSE
+                    "field_nmse_partial": { "S1": float, "S2": ..., },# 累积 S1, S1+S2, ...
+
+                    # 有效模态等级（沿用原有逻辑）
+                    "effective_band": str | None,
+                    "effective_r_cut": int | None,
+
                     "n_frames": int,
                     "n_obs": int,
                 },
@@ -134,8 +230,9 @@ def run_linear_baseline_experiment(
                 "frame_idx": int,
                 "mask_rate": float,
                 "noise_sigma": float,
-                "x_true": [...],   # [H,W,C] list
-                "x_lin":  [...],   # [H,W,C] list
+                "x_true": [...],     # [H,W,C] list
+                "x_lin":  [...],     # [H,W,C] list
+                "x_interp": [...],   # [H,W,C] list，插值 baseline
             } | None
         }
     """
@@ -152,6 +249,13 @@ def run_linear_baseline_experiment(
 
     if verbose:
         print(f"  - meta: T={T}, H={H}, W={W}, C={C}, r_used={r_used}, r_eff={r_eff}")
+
+    # 1.1 载入 POD 辅助信息（特征值 + φ 分组）
+    eigenvalues, phi_groups = _load_pod_aux_info(
+        pod_cfg=pod_cfg,
+        r_eff=r_eff,
+        verbose=verbose,
+    )
 
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
@@ -187,13 +291,13 @@ def run_linear_baseline_experiment(
             nmae_list: List[float] = []
             psnr_list: List[float] = []
 
-            # 收集该组合下所有帧的线性系数，便于后面做 band-wise 误差
+            # 收集该组合下所有帧的线性系数，便于后面做 band-wise / per-mode / partial 误差
             A_lin_all = np.empty_like(A_true)  # [T,r_eff]
 
             for t in range(T):
                 x = X_thwc[t]                 # [H,W,C]
                 x_flat = x.reshape(-1)        # [D]
-                a_true_t = A_true[t]          # [r_eff]  # noqa: F841  (目前未显式使用)
+                a_true_t = A_true[t]          # [r_eff]  # noqa: F841
 
                 # mask + 噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
@@ -218,19 +322,23 @@ def run_linear_baseline_experiment(
                     and float(noise_sigma) == s_ref
                     and t == t_ref
                 ):
+                    x_interp = _compute_interp_baseline(x, mask_hw)
                     example_recon = {
                         "frame_idx": int(t),
                         "mask_rate": float(mask_rate),
                         "noise_sigma": float(noise_sigma),
                         "x_true": x.tolist(),
                         "x_lin": x_lin.tolist(),
+                        "x_interp": x_interp.tolist(),
                     }
 
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
 
-            # POD 系数 band-wise 误差（系数 RMSE）
+            # === 3.1 POD 系数多尺度误差 ===
+
+            # (a) band-wise 系数 RMSE（沿用旧接口）
             band_errors = compute_pod_band_errors(
                 a_hat=A_lin_all,
                 a_true=A_true,
@@ -238,7 +346,41 @@ def run_linear_baseline_experiment(
             )
             band_errors = {k: float(v) for k, v in band_errors.items()}
 
-            # 从 band_errors 推断“有效模态等级”
+            # (b) band-wise 系数 NRMSE（相对误差）
+            band_nrmse = nrmse_per_band(
+                a_hat=A_lin_all,
+                a_true=A_true,
+                bands=eval_cfg.pod_bands,
+            )
+            band_nrmse = {k: float(v) for k, v in band_nrmse.items()}
+
+            # (c) per-mode RMSE / NRMSE 谱线
+            coeff_rmse = rmse_per_mode(A_lin_all, A_true)                      # [r_eff]
+            coeff_nrmse = nrmse_per_mode(A_lin_all, A_true, eigenvalues=eigenvalues)  # [r_eff]
+
+            # === 3.2 基于 φ 分组的场级 partial 重建 NMSE ===
+
+            partial_info = partial_recon_nmse(
+                a_hat=A_lin_all,
+                a_true=A_true,
+                Ur=Ur_eff,
+                groups=phi_groups,
+                mean_flat=mean_flat,
+                sample_indices=None,     # 使用全部时间帧
+                reduction="mean",        # 每个组 / 累积一个标量
+            )
+
+            field_nmse_per_group = {
+                name: float(val)
+                for name, val in partial_info["group_nmse"].items()
+            }
+            field_nmse_partial = {
+                name: float(val)
+                for name, val in partial_info["cumulative_nmse"].items()
+            }
+
+            # === 3.3 从 band_errors 推断“有效模态等级”（保持原有行为） ===
+
             effective_band = None
             effective_r_cut = None
             if band_errors and eval_cfg.pod_bands:
@@ -272,15 +414,29 @@ def run_linear_baseline_experiment(
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
+
+                # 全场误差统计
                 "nmse_mean": float(nmse_arr.mean()),
                 "nmse_std": float(nmse_arr.std()),
                 "nmae_mean": float(nmae_arr.mean()),
                 "nmae_std": float(nmae_arr.std()),
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
-                "band_errors": band_errors,
+
+                # POD 系数级误差
+                "band_errors": band_errors,                         # RMSE
+                "band_nrmse": band_nrmse,                           # NRMSE
+                "coeff_rmse_per_mode": coeff_rmse.tolist(),         # [r_eff]
+                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),       # [r_eff]
+
+                # 场级多尺度误差（φ 分组）
+                "field_nmse_per_group": field_nmse_per_group,       # S1, S2, ...
+                "field_nmse_partial": field_nmse_partial,           # S1, S1+S2, ...
+
+                # 有效模态等级
                 "effective_band": effective_band,
                 "effective_r_cut": effective_r_cut,
+
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
             }
@@ -330,13 +486,16 @@ def run_mlp_experiment(
     设计选择：
     - 对于每个 mask_rate，训练一个对应的 MLP（训练噪声强度由 train_cfg.noise_sigma 决定）；
     - 对该 mask_rate 下的多个 noise_sigma（测试噪声）进行评估；
-    - 每个组合输出全场误差 + POD band 系数 RMSE + 有效模态等级。
-
-    返回结构与 run_linear_baseline_experiment 相同，只是 model_type="mlp"，并且
-    额外包含一个 "example_recon" 字段方便全实验可视化。
+    - 每个组合输出：
+        * 全场误差统计（NMSE / NMAE / PSNR）
+        * POD 系数级谱线：coeff_rmse_per_mode / coeff_nrmse_per_mode
+        * POD band 级误差：band_errors (RMSE) / band_nrmse (NRMSE)
+        * 基于 φ 分组的场级多尺度误差：
+              field_nmse_per_group、field_nmse_partial
+        * 有效模态等级：effective_band / effective_r_cut
     """
     if verbose:
-        print("=== [eval-mlp] Start MLP baseline experiment ===")
+        print("=== [eval-mlp] Start MLP experiment ===")
 
     # 1) POD 基底
     Ur, mean_flat, meta = _load_or_build_pod(data_cfg, pod_cfg, verbose=verbose)
@@ -349,37 +508,46 @@ def run_mlp_experiment(
     if verbose:
         print(f"  - meta: T={T}, H={H}, W={W}, C={C}, r_used={r_used}, r_eff={r_eff}")
 
+    # 1.1 载入 POD 辅助信息（特征值 + φ 分组）
+    eigenvalues, phi_groups = _load_pod_aux_info(
+        pod_cfg=pod_cfg,
+        r_eff=r_eff,
+        verbose=verbose,
+    )
+
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
     D = H * W * C
     X_flat_all = X_thwc.reshape(T, D)
 
-    entries: List[Dict[str, Any]] = []
-
-    # 典型样本选择
+    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0
     p_ref = float(min(eval_cfg.mask_rates))
     s_ref = float(min(eval_cfg.noise_sigmas))
     t_ref = 0
     example_recon: Dict[str, Any] | None = None
 
+    entries: List[Dict[str, Any]] = []
+
+    # 3) 对每个 mask_rate：训练一个 MLP
     for mask_rate in eval_cfg.mask_rates:
         if verbose:
-            print(f"\n[eval-mlp] mask_rate = {mask_rate:.4f}")
+            print(f"\n[eval-mlp] mask_rate(train/test) = {mask_rate:.4f}")
 
-        # 固定 mask（与 linear experiment 保持同样风格：每个 mask_rate 一张掩膜）
+        # 3.1 构造观测掩码（训练和测试共用）
         mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate, seed=0)
         mask_flat = flatten_mask(mask_hw, C=C)
         n_obs = int(mask_flat.sum())
 
         if verbose:
             print(f"  -> total observed entries (with {C} channels) = {n_obs}")
+
             print(
                 f"  -> Training MLP with train_noise_sigma={train_cfg.noise_sigma:.4e}, "
                 f"batch_size={train_cfg.batch_size}, max_epochs={train_cfg.max_epochs}, "
                 f"hidden_dims={train_cfg.hidden_dims}"
             )
 
-        # 3) 训练 MLP（使用 train_cfg.noise_sigma 作为训练噪声）
+        # 3.2 训练 MLP（使用 train_cfg.noise_sigma 作为训练噪声）
         model_mlp, train_info = train_mlp_on_observations(
             X_flat_all=X_flat_all,
             Ur_eff=Ur_eff,
@@ -409,9 +577,9 @@ def run_mlp_experiment(
             A_mlp_all = np.empty_like(A_true)  # [T,r_eff]
 
             for t in range(T):
-                x = X_thwc[t]
-                x_flat = x.reshape(-1)
-                a_true_t = A_true[t]  # noqa: F841
+                x = X_thwc[t]            # [H,W,C]
+                x_flat = x.reshape(-1)   # [D]
+                a_true_t = A_true[t]     # [r_eff]  # noqa: F841
 
                 # 观测 + 测试噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
@@ -432,25 +600,30 @@ def run_mlp_experiment(
                 nmae_list.append(nmae(x_mlp, x))
                 psnr_list.append(psnr(x_mlp, x))
 
-                # 记录一个典型样本，用于后续全实验可视化
+                # 记录一个典型样本，用于后续可视化（顺便给出插值 baseline）
                 if (
                     example_recon is None
                     and float(mask_rate) == p_ref
                     and float(noise_sigma) == s_ref
                     and t == t_ref
                 ):
+                    x_interp = _compute_interp_baseline(x, mask_hw)
                     example_recon = {
                         "frame_idx": int(t),
                         "mask_rate": float(mask_rate),
                         "noise_sigma": float(noise_sigma),
                         "x_true": x.tolist(),
                         "x_mlp": x_mlp.tolist(),
+                        "x_interp": x_interp.tolist(),
                     }
 
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
 
+            # === 4.1 POD 系数多尺度误差 ===
+
+            # (a) band-wise 系数 RMSE（与 linear 保持一致）
             band_errors = compute_pod_band_errors(
                 a_hat=A_mlp_all,
                 a_true=A_true,
@@ -458,10 +631,45 @@ def run_mlp_experiment(
             )
             band_errors = {k: float(v) for k, v in band_errors.items()}
 
-            # 从 band_errors 推断“有效模态等级”
+            # (b) band-wise 系数 NRMSE
+            band_nrmse = nrmse_per_band(
+                a_hat=A_mlp_all,
+                a_true=A_true,
+                bands=eval_cfg.pod_bands,
+            )
+            band_nrmse = {k: float(v) for k, v in band_nrmse.items()}
+
+            # (c) per-mode RMSE / NRMSE 谱线
+            coeff_rmse = rmse_per_mode(A_mlp_all, A_true)                          # [r_eff]
+            coeff_nrmse = nrmse_per_mode(A_mlp_all, A_true, eigenvalues=eigenvalues)  # [r_eff]
+
+            # === 4.2 基于 φ 分组的场级 partial 重建 NMSE ===
+
+            partial_info = partial_recon_nmse(
+                a_hat=A_mlp_all,
+                a_true=A_true,
+                Ur=Ur_eff,
+                groups=phi_groups,
+                mean_flat=mean_flat,
+                sample_indices=None,     # 使用全部时间帧
+                reduction="mean",        # 每个组 / 累积一个标量
+            )
+
+            field_nmse_per_group = {
+                name: float(val)
+                for name, val in partial_info["group_nmse"].items()
+            }
+            field_nmse_partial = {
+                name: float(val)
+                for name, val in partial_info["cumulative_nmse"].items()
+            }
+
+            # === 4.3 从 band_errors 推断“有效模态等级”（与 linear 同逻辑） ===
+
             effective_band = None
             effective_r_cut = None
             if band_errors and eval_cfg.pod_bands:
+                # 按 band 起始索引排序，确保从低频到高频
                 band_items = sorted(
                     eval_cfg.pod_bands.items(),
                     key=lambda kv: kv[1][0],
@@ -489,17 +697,34 @@ def run_mlp_experiment(
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
+
+                # 全场误差统计
                 "nmse_mean": float(nmse_arr.mean()),
                 "nmse_std": float(nmse_arr.std()),
                 "nmae_mean": float(nmae_arr.mean()),
                 "nmae_std": float(nmae_arr.std()),
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
-                "band_errors": band_errors,
+
+                # POD 系数级误差
+                "band_errors": band_errors,                         # RMSE
+                "band_nrmse": band_nrmse,                           # NRMSE
+                "coeff_rmse_per_mode": coeff_rmse.tolist(),         # [r_eff]
+                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),       # [r_eff]
+
+                # 场级多尺度误差（φ 分组）
+                "field_nmse_per_group": field_nmse_per_group,       # S1, S2, ...
+                "field_nmse_partial": field_nmse_partial,           # S1, S1+S2, ...
+
+                # 有效模态等级
                 "effective_band": effective_band,
                 "effective_r_cut": effective_r_cut,
+
+                # 数据规模 / 观测数
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
+
+                # 训练信息（保持原来的结构）
                 "train_info": train_info,
             }
             entries.append(entry)
@@ -511,6 +736,7 @@ def run_mlp_experiment(
                     f"effective_band={effective_band}, r_cut={effective_r_cut}"
                 )
 
+    # 5) 汇总结果
     result: Dict[str, Any] = {
         "model_type": "mlp",
         "mask_rates": list(eval_cfg.mask_rates),

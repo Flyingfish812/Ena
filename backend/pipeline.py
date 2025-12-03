@@ -230,8 +230,13 @@ def run_full_eval_pipeline(
     2. 若提供了 train_cfg：
         - 在 eval_cfg.mask_rates / noise_sigmas 上跑 MLP sweep：run_mlp_experiment
         - 自动生成两类典型曲线：
-            - NMSE vs mask_rate（固定最小 noise_sigma）
-            - NMSE vs noise_sigma（固定最小 mask_rate）
+            * NMSE vs mask_rate（固定最小 noise_sigma）
+            * NMSE vs noise_sigma（固定最小 mask_rate）
+    3. 从 linear / mlp 结果中各选一组代表样本，绘制四联图：
+        - input：插值 baseline x_interp
+        - output：模型预测场（linear / mlp）
+        - target：真实场 x_true
+        - error：x_true - x_hat
 
     返回 result 字典包含：
     - "linear": 线性基线的原始结果
@@ -240,8 +245,8 @@ def run_full_eval_pipeline(
     - "df_mlp":    MLP 结果转成的 DataFrame（或 None）
     - "fig_nmse_vs_mask": 叠加 linear / mlp 的 mask_rate 曲线图（或 None）
     - "fig_nmse_vs_noise": 叠加 linear / mlp 的 noise_sigma 曲线图（或 None）
-    - "fig_example_linear": 典型 (p,σ,t) 下 True/Linear/|Linear-True| 的场图（或 None）
-    - "fig_example_mlp":    典型 (p,σ,t) 下 True/MLP/|MLP-True| 的场图（或 None）
+    - "fig_example_linear": 典型 (p,σ,t) 下 input/output/target/error 的四联图（或 None）
+    - "fig_example_mlp":    同上（或 None）
     """
     if verbose:
         print("=== [full-eval] Start full evaluation pipeline ===")
@@ -276,7 +281,7 @@ def run_full_eval_pipeline(
         )
         df_mlp = results_to_dataframe(mlp_results)
 
-        # 3) 生成两张最典型的曲线图
+        # 3) 生成两张最典型的曲线图（linear + mlp）
         if verbose:
             print("[full-eval] Plotting NMSE curves ...")
 
@@ -294,89 +299,133 @@ def run_full_eval_pipeline(
         ax_noise.legend()
         ax_noise.set_title("NMSE vs noise_sigma (linear vs mlp)")
 
-    # 3) 从 example_recon 生成典型场图
+    # 3) 从 example_recon 生成典型四联图
     fig_example_linear = None
     fig_example_mlp = None
 
-    # 3.1 Linear example
+    # 3.1 Linear example：input / output / target / error
     ex_lin = linear_results.get("example_recon", None)
     if ex_lin is not None:
         x_true = np.asarray(ex_lin["x_true"])
         x_lin = np.asarray(ex_lin["x_lin"])
-        # 简单展示第 0 个通道
+        x_interp = np.asarray(ex_lin["x_interp"])
+
+        # 默认展示第 0 个通道
         x_true_ch = x_true[..., 0]
         x_lin_ch = x_lin[..., 0]
-        err_lin = np.abs(x_lin_ch - x_true_ch)
+        x_interp_ch = x_interp[..., 0]
+        err_lin = x_true_ch - x_lin_ch
 
-        vmin = min(x_true_ch.min(), x_lin_ch.min())
-        vmax = max(x_true_ch.max(), x_lin_ch.max())
+        # 三个物理场统一色标
+        vmin = min(x_true_ch.min(), x_lin_ch.min(), x_interp_ch.min())
+        vmax = max(x_true_ch.max(), x_lin_ch.max(), x_interp_ch.max())
 
-        fig_example_linear, axes = plt.subplots(1, 3, figsize=(9, 3))
-        im0 = axes[0].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
-        axes[0].set_title("True (ch=0)")
-        axes[0].set_xticks([])
-        axes[0].set_yticks([])
+        # 误差场用对称色标，方便看正负偏差
+        err_max = float(np.max(np.abs(err_lin)))
+        err_vmin, err_vmax = -err_max, err_max
 
-        im1 = axes[1].imshow(x_lin_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
-        axes[1].set_title("Linear baseline (ch=0)")
-        axes[1].set_xticks([])
-        axes[1].set_yticks([])
+        fig_example_linear, axes = plt.subplots(1, 4, figsize=(12, 3))
+        titles = [
+            "Input: interpolation (ch=0)",
+            "Output: linear baseline (ch=0)",
+            "Target: true field (ch=0)",
+            "Error: true - linear (ch=0)",
+        ]
 
-        im2 = axes[2].imshow(err_lin, origin="lower", cmap="viridis")
-        axes[2].set_title("|Linear - True| (ch=0)")
-        axes[2].set_xticks([])
-        axes[2].set_yticks([])
+        ims = []
+        ims.append(axes[0].imshow(x_interp_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+        ims.append(axes[1].imshow(x_lin_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+        ims.append(axes[2].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+        ims.append(axes[3].imshow(err_lin, origin="lower", cmap="RdBu_r", vmin=err_vmin, vmax=err_vmax))
 
-        fig_example_linear.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-        fig_example_linear.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-        fig_example_linear.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+        for ax, title in zip(axes, titles, strict=False):
+            ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # 共享一个水平色条给前三个物理场
+        fig_example_linear.colorbar(
+            ims[0],
+            ax=axes[:3],
+            orientation="horizontal",
+            fraction=0.046,
+            pad=0.12,
+        )
+        # 误差场单独一个色条
+        fig_example_linear.colorbar(
+            ims[3],
+            ax=axes[3],
+            orientation="horizontal",
+            fraction=0.046,
+            pad=0.25,
+        )
 
         fig_example_linear.suptitle(
             f"Linear example (frame={ex_lin['frame_idx']}, "
             f"p={ex_lin['mask_rate']:.3g}, σ={ex_lin['noise_sigma']:.3g})",
             fontsize=11,
         )
-        fig_example_linear.tight_layout(rect=[0, 0, 1, 0.92])
+        fig_example_linear.tight_layout(rect=[0, 0, 1, 0.88])
 
-    # 3.2 MLP example
+    # 3.2 MLP example：input / output / target / error
     if mlp_results is not None:
         ex_mlp = mlp_results.get("example_recon", None)
         if ex_mlp is not None:
             x_true = np.asarray(ex_mlp["x_true"])
             x_mlp = np.asarray(ex_mlp["x_mlp"])
+            x_interp = np.asarray(ex_mlp["x_interp"])
+
             x_true_ch = x_true[..., 0]
             x_mlp_ch = x_mlp[..., 0]
-            err_mlp = np.abs(x_mlp_ch - x_true_ch)
+            x_interp_ch = x_interp[..., 0]
+            err_mlp = x_true_ch - x_mlp_ch
 
-            vmin = min(x_true_ch.min(), x_mlp_ch.min())
-            vmax = max(x_true_ch.max(), x_mlp_ch.max())
+            vmin = min(x_true_ch.min(), x_mlp_ch.min(), x_interp_ch.min())
+            vmax = max(x_true_ch.max(), x_mlp_ch.max(), x_interp_ch.max())
 
-            fig_example_mlp, axes = plt.subplots(1, 3, figsize=(9, 3))
-            im0 = axes[0].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
-            axes[0].set_title("True (ch=0)")
-            axes[0].set_xticks([])
-            axes[0].set_yticks([])
+            err_max = float(np.max(np.abs(err_mlp)))
+            err_vmin, err_vmax = -err_max, err_max
 
-            im1 = axes[1].imshow(x_mlp_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
-            axes[1].set_title("MLP baseline (ch=0)")
-            axes[1].set_xticks([])
-            axes[1].set_yticks([])
+            fig_example_mlp, axes = plt.subplots(1, 4, figsize=(12, 3))
+            titles = [
+                "Input: interpolation (ch=0)",
+                "Output: MLP baseline (ch=0)",
+                "Target: true field (ch=0)",
+                "Error: true - MLP (ch=0)",
+            ]
 
-            im2 = axes[2].imshow(err_mlp, origin="lower", cmap="viridis")
-            axes[2].set_title("|MLP - True| (ch=0)")
-            axes[2].set_xticks([])
-            axes[2].set_yticks([])
+            ims = []
+            ims.append(axes[0].imshow(x_interp_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+            ims.append(axes[1].imshow(x_mlp_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+            ims.append(axes[2].imshow(x_true_ch, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax))
+            ims.append(axes[3].imshow(err_mlp, origin="lower", cmap="RdBu_r", vmin=err_vmin, vmax=err_vmax))
 
-            fig_example_mlp.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-            fig_example_mlp.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-            fig_example_mlp.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            for ax, title in zip(axes, titles, strict=False):
+                ax.set_title(title)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            fig_example_mlp.colorbar(
+                ims[0],
+                ax=axes[:3],
+                orientation="horizontal",
+                fraction=0.046,
+                pad=0.12,
+            )
+            fig_example_mlp.colorbar(
+                ims[3],
+                ax=axes[3],
+                orientation="horizontal",
+                fraction=0.046,
+                pad=0.25,
+            )
 
             fig_example_mlp.suptitle(
                 f"MLP example (frame={ex_mlp['frame_idx']}, "
                 f"p={ex_mlp['mask_rate']:.3g}, σ={ex_mlp['noise_sigma']:.3g})",
                 fontsize=11,
             )
-            fig_example_mlp.tight_layout(rect=[0, 0, 1, 0.92])
+            fig_example_mlp.tight_layout(rect=[0, 0, 1, 0.88])
 
     if verbose:
         print("[full-eval] Done.")
@@ -1011,6 +1060,7 @@ def quick_test_mlp_baseline(
 def quick_full_experiment(
     nc_path: str | Path = "data/cylinder2d.nc",
     *,
+
     var_keys: tuple[str, ...] = ("u", "v"),
     r: int = 128,
     center: bool = True,
@@ -1034,39 +1084,14 @@ def quick_full_experiment(
     - 自动生成：
         * NMSE vs mask_rate 曲线（linear + mlp）
         * NMSE vs noise_sigma 曲线（linear + mlp）
-        * 某个 (mask_rate, noise_sigma) 组合的 POD band 误差柱状图
-
-    参数
-    ----
-    nc_path:
-        NetCDF 数据集路径。
-    var_keys:
-        要读取的变量名元组，例如 ("u", "v")。
-    r:
-        POD 截断模态数。
-    center:
-        是否进行去均值。
-    mask_rates:
-        评估时的一组观测率；若为 None，默认 [0.01, 0.02, 0.05, 0.10]。
-    noise_sigmas:
-        评估时的一组噪声强度；若为 None，默认 [0.0, 0.01, 0.02]。
-    pod_bands:
-        POD 多尺度 band 定义，例如 {"L": (0,16), "M": (16,64), "H": (64,128)}；
-        若为 None，则按 r 切出三段默认 band。
-    train_mask_rate:
-        训练 MLP 时使用的 mask_rate（通常可选用 mask_rates 中的某一个）。
-    train_noise_sigma:
-        训练 MLP 时使用的噪声强度。
-    hidden_dims, lr, batch_size, max_epochs, device:
-        MLP 的训练超参数。
-    verbose:
-        是否打印中间过程信息。
+        * 在训练配置 (train_mask_rate, train_noise_sigma) 附近的一组 POD band 误差柱状图
 
     返回
     ----
     result:
         在 run_full_eval_pipeline 返回基础上，增加：
         - "fig_multiscale_example": 某个组合的 POD band 误差柱状图 Figure
+        - "configs": 四个 dataclass 配置的快照
     """
     nc_path = Path(nc_path)
 
@@ -1078,7 +1103,6 @@ def quick_full_experiment(
 
     # 如果没给 band，就按 r 划一个简单的 L/M/H
     if pod_bands is None:
-        # 尽量用 0-16, 16-64, 64-r 的形式；若 r < 64 则自动压缩
         r_L = min(16, r)
         r_M = min(64, r)
         pod_bands = {
@@ -1119,7 +1143,7 @@ def quick_full_experiment(
         / f"p{train_mask_rate:.4f}_sigma{train_noise_sigma:.3g}".replace(".", "p"),
     )
 
-    # ---- 3) 调用已有的 full-eval pipeline ----
+    # ---- 3) 调用 full-eval pipeline ----
     result = run_full_eval_pipeline(
         data_cfg=data_cfg,
         pod_cfg=pod_cfg,
@@ -1128,26 +1152,33 @@ def quick_full_experiment(
         verbose=verbose,
     )
 
-    # run_full_eval_pipeline 已经在 result 里塞了：
-    # - "linear" / "mlp" 原始结果
-    # - "df_linear" / "df_mlp" DataFrame
-    # - "fig_nmse_vs_mask" / "fig_nmse_vs_noise" 两张曲线图
-
-    # ---- 4) 顺手再画一张多尺度 band 柱状图（从 MLP 结果里挑一条）----
+    # ---- 4) 多尺度 band 柱状图：优先选训练配置 (p_train, σ_train) ----
     fig_multiscale = None
     mlp_results = result.get("mlp", None)
     if mlp_results is not None:
-        entries = mlp_results.get("entries", [])
+        entries = mlp_results.get("entries", []) or []
         if entries:
-            some_entry = entries[0]
-            band_errors = some_entry.get("band_errors", {})
-            fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
-            title = (
-                f"MLP bands (p={some_entry['mask_rate']}, "
-                f"σ={some_entry['noise_sigma']})"
-            )
-            plot_multiscale_bar(band_errors, ax=ax, title=title)
-            fig_multiscale.tight_layout()
+            # 优先找 mask_rate = train_mask_rate 且 noise_sigma = train_noise_sigma 的 entry
+            target_entry = None
+            for e in entries:
+                if (
+                    abs(float(e.get("mask_rate", -1.0)) - train_mask_rate) < 1e-12
+                    and abs(float(e.get("noise_sigma", -1.0)) - train_noise_sigma) < 1e-12
+                ):
+                    target_entry = e
+                    break
+            if target_entry is None:
+                target_entry = entries[0]
+
+            band_errors = target_entry.get("band_errors", {}) or {}
+            if band_errors:
+                fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
+                title = (
+                    f"MLP POD band errors (p={target_entry['mask_rate']}, "
+                    f"σ={target_entry['noise_sigma']})"
+                )
+                plot_multiscale_bar(band_errors, ax=ax, title=title)
+                fig_multiscale.tight_layout()
 
     result["fig_multiscale_example"] = fig_multiscale
     result["configs"] = {
@@ -1251,6 +1282,46 @@ def run_experiment_from_yaml(
         fig_paths["fig_example_mlp"] = p
         if verbose:
             print(f"[yaml-experiment] Saved figure: {p}")
+
+    # 根据 MLP 结果，额外生成一张多尺度 POD band 柱状图
+    mlp_res = all_result.get("mlp", None)
+    fig_multiscale = None
+    if mlp_res is not None:
+        entries = mlp_res.get("entries", []) or []
+        if entries:
+            # 优先选训练配置 (p_train, σ_train)，与报告中的多尺度分析保持一致
+            train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) or {}
+            p_train = train_meta.get("mask_rate", None)
+            s_train = train_meta.get("noise_sigma", None)
+
+            target_entry = None
+            if p_train is not None and s_train is not None:
+                for e in entries:
+                    if (
+                        float(e.get("mask_rate", -1.0)) == float(p_train)
+                        and float(e.get("noise_sigma", -1.0)) == float(s_train)
+                    ):
+                        target_entry = e
+                        break
+
+            if target_entry is None:
+                target_entry = entries[0]
+
+            band_errors = target_entry.get("band_errors", {}) or {}
+            if band_errors:
+                fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
+                title = (
+                    f"MLP POD band errors (p={target_entry['mask_rate']}, "
+                    f"σ={target_entry['noise_sigma']})"
+                )
+                plot_multiscale_bar(band_errors, ax=ax, title=title)
+                fig_multiscale.tight_layout()
+
+                p = figs_dir / "multiscale_mlp.png"
+                fig_multiscale.savefig(p, dpi=300, bbox_inches="tight")
+                fig_paths["fig_multiscale_example"] = p
+                if verbose:
+                    print(f"[yaml-experiment] Saved figure: {p}")
 
     # 保存 JSON / CSV
     saved_paths = save_full_experiment_results(

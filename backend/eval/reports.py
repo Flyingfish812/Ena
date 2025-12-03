@@ -23,47 +23,88 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
     将 run_linear_baseline_experiment / run_mlp_experiment 返回的结果
     转换为 pandas DataFrame 形式，便于绘图或导出。
 
-    DataFrame 列示例：
+    DataFrame 典型列包括：
     - model_type
     - mask_rate
     - noise_sigma
     - nmse_mean, nmse_std
     - nmae_mean, nmae_std
     - psnr_mean, psnr_std
-    - band_<name>  （例如 band_L, band_M, band_H）
+    - n_frames, n_obs
+    - band_<name>             ：各 POD band 的系数 RMSE
+    - band_nrmse_<name>       ：各 POD band 的系数 NRMSE
+    - group_nmse_<group>      ：场级（单 band）NMSE（φ 分组）
+    - partial_nmse_<group>    ：场级（累积到该 band 位置）的 NMSE
+    - effective_band          ：启发式判定的“有效 band 名字”
+    - effective_r_cut         ：对应的有效模态截止 r 值
     """
     model_type = result.get("model_type", "model")
-    entries = result.get("entries", [])
+    entries = result.get("entries", []) or []
 
     rows: list[dict[str, Any]] = []
 
-    # 收集所有 band 名字，确保列名完整
-    band_names: set[str] = set()
+    # --- 先扫一遍，收集所有可能出现的 key，保证列名完备 ---
+    band_rmse_names: set[str] = set()
+    band_nrmse_names: set[str] = set()
+    group_names: set[str] = set()
+    partial_names: set[str] = set()
+
     for e in entries:
-        band_errors = e.get("band_errors", {})
-        band_names.update(band_errors.keys())
+        band_errors = e.get("band_errors", {}) or {}
+        band_rmse_names.update(band_errors.keys())
 
-    band_names_sorted = sorted(band_names)
+        band_nrmse = e.get("band_nrmse", {}) or {}
+        band_nrmse_names.update(band_nrmse.keys())
 
+        group_err = e.get("field_nmse_per_group", {}) or {}
+        group_names.update(group_err.keys())
+
+        partial_err = e.get("field_nmse_partial", {}) or {}
+        partial_names.update(partial_err.keys())
+
+    band_rmse_sorted = sorted(band_rmse_names)
+    band_nrmse_sorted = sorted(band_nrmse_names)
+    group_sorted = sorted(group_names)
+    partial_sorted = sorted(partial_names)
+
+    # --- 逐 entry 构造行 ---
     for e in entries:
         row: dict[str, Any] = {
             "model_type": model_type,
-            "mask_rate": e["mask_rate"],
-            "noise_sigma": e["noise_sigma"],
-            "nmse_mean": e["nmse_mean"],
-            "nmse_std": e["nmse_std"],
-            "nmae_mean": e["nmae_mean"],
-            "nmae_std": e["nmae_std"],
-            "psnr_mean": e["psnr_mean"],
-            "psnr_std": e["psnr_std"],
+            "mask_rate": e.get("mask_rate", None),
+            "noise_sigma": e.get("noise_sigma", None),
+            "nmse_mean": e.get("nmse_mean", None),
+            "nmse_std": e.get("nmse_std", None),
+            "nmae_mean": e.get("nmae_mean", None),
+            "nmae_std": e.get("nmae_std", None),
+            "psnr_mean": e.get("psnr_mean", None),
+            "psnr_std": e.get("psnr_std", None),
             "n_frames": e.get("n_frames", None),
             "n_obs": e.get("n_obs", None),
+            # 有效模态等级（如有）
+            "effective_band": e.get("effective_band", None),
+            "effective_r_cut": e.get("effective_r_cut", None),
         }
 
-        band_errors = e.get("band_errors", {})
-        for name in band_names_sorted:
+        band_errors = e.get("band_errors", {}) or {}
+        for name in band_rmse_sorted:
             key = f"band_{name}"
             row[key] = float(band_errors.get(name, float("nan")))
+
+        band_nrmse = e.get("band_nrmse", {}) or {}
+        for name in band_nrmse_sorted:
+            key = f"band_nrmse_{name}"
+            row[key] = float(band_nrmse.get(name, float("nan")))
+
+        group_err = e.get("field_nmse_per_group", {}) or {}
+        for name in group_sorted:
+            key = f"group_nmse_{name}"
+            row[key] = float(group_err.get(name, float("nan")))
+
+        partial_err = e.get("field_nmse_partial", {}) or {}
+        for name in partial_sorted:
+            key = f"partial_nmse_{name}"
+            row[key] = float(partial_err.get(name, float("nan")))
 
         rows.append(row)
 
@@ -203,6 +244,7 @@ def generate_experiment_report_md(
     fig_nmse_vs_noise = saved_paths.get("fig_nmse_vs_noise", None)
     fig_example_linear = saved_paths.get("fig_example_linear", None)
     fig_example_mlp = saved_paths.get("fig_example_mlp", None)
+    fig_multiscale_example = saved_paths.get("fig_multiscale_example", None)
 
     # 1) 一些 summary 统计：最好 / 最差 NMSE
     best_lin = df_lin.loc[df_lin["nmse_mean"].idxmin()]
@@ -433,6 +475,12 @@ def generate_experiment_report_md(
         "在正式论文中可以在本节插入对应的 band-wise 柱状图或误差对比图，"
         "用于展示低频/中频/高频结构的恢复能力差异。"
     )
+    if fig_multiscale_example is not None:
+        lines.append("")
+        lines.append(
+            f"本次实验中，已将一幅典型的 POD band 误差柱状图保存为："
+            f"`{Path(fig_multiscale_example)}`，可直接用于插图。"
+        )
     lines.append("")
 
     lines.append("### 4.2 有效模态等级与自适应截断")
