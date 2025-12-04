@@ -7,19 +7,24 @@ pod:
   center: true
   save_dir: artifacts/pod
 eval:
-  mask_rates: [0.01, 0.02, 0.05, 0.1]
-  noise_sigmas: [0.0, 0.01, 0.02]
+  mask_rates: [0.01, 0.02]
+  noise_sigmas: [0.0, 0.01]
   pod_bands:
-    L: [0, 16]
-    M: [16, 64]
-    H: [64, 128]
+    L1: [0, 16]
+    L2: [16, 32]
+    M1: [32, 48]
+    M2: [48, 64]
+    M3: [64, 80]
+    H1: [80, 96]
+    H2: [96, 112]
+    H3: [112, 128]
   save_dir: artifacts/eval
 train:
   mask_rate: 0.02
   noise_sigma: 0.01
-  hidden_dims: [256, 256]
+  hidden_dims: [64, 64]
   lr: 0.001
   batch_size: 64
-  max_epochs: 100
+  max_epochs: 50
   device: cuda
   save_dir: artifacts/nn

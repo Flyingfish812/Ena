@@ -195,45 +195,30 @@ def run_linear_baseline_experiment(
             "mask_rates": [...],
             "noise_sigmas": [...],
             "meta": {... POD 与数据集信息 ...},
-            "entries": [
+            "entries": [... 原有统计 ...],
+
+            # 旧字段：保留一个代表样本（最小 p / σ，t=0），兼容旧绘图逻辑
+            "example_recon": { ... } | None,
+
+            # 新字段：用于多组四联图绘制
+            "examples": [
                 {
+                    "frame_idx": int,
                     "mask_rate": float,
                     "noise_sigma": float,
-                    # 全场误差统计
-                    "nmse_mean": float,
-                    "nmse_std": float,
-                    "nmae_mean": float,
-                    "nmae_std": float,
-                    "psnr_mean": float,
-                    "psnr_std": float,
-
-                    # POD 系数级别
-                    "band_errors": { band_name: float, ... },     # 旧字段：band-wise RMSE
-                    "band_nrmse": { band_name: float, ... },      # 新字段：band-wise NRMSE
-                    "coeff_rmse_per_mode": [float, ...],          # [r_eff]
-                    "coeff_nrmse_per_mode": [float, ...],         # [r_eff]
-
-                    # 场级多尺度误差（基于 φ 分组）
-                    "field_nmse_per_group": { "S1": float, ... },     # 单组重建 NMSE
-                    "field_nmse_partial": { "S1": float, "S2": ..., },# 累积 S1, S1+S2, ...
-
-                    # 有效模态等级（沿用原有逻辑）
-                    "effective_band": str | None,
-                    "effective_r_cut": int | None,
-
-                    "n_frames": int,
-                    "n_obs": int,
+                    "x_true": [...],     # [H,W,C] list
+                    "x_lin":  [...],     # [H,W,C] list
+                    "x_interp": [...],   # [H,W,C] list
                 },
                 ...
             ],
-            "example_recon": {
-                "frame_idx": int,
-                "mask_rate": float,
-                "noise_sigma": float,
-                "x_true": [...],     # [H,W,C] list
-                "x_lin":  [...],     # [H,W,C] list
-                "x_interp": [...],   # [H,W,C] list，插值 baseline
-            } | None
+
+            # 新字段：每个 mask_rate 对应的空间掩膜（为画采样点服务）
+            # key 为格式化后的 mask_rate 字符串，例如 "0.02"
+            "mask_hw_map": {
+                "<mask_rate_str>": [[bool, ...], ...],   # [H,W]
+                ...
+            },
         }
     """
     if verbose:
@@ -260,11 +245,19 @@ def run_linear_baseline_experiment(
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
 
-    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0
+    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0（旧逻辑保留）
     p_ref = float(min(eval_cfg.mask_rates))
     s_ref = float(min(eval_cfg.noise_sigmas))
     t_ref = 0
     example_recon: Dict[str, Any] | None = None
+
+    # 新：为每个 (p,σ) 采样若干帧作为可视化样本，这里最多取 3 帧，均匀分布在时间序列上
+    n_example_frames = min(3, T)
+    example_t_indices = np.linspace(0, T - 1, num=n_example_frames, dtype=int)
+    example_t_set = set(int(t) for t in example_t_indices)
+
+    examples: List[Dict[str, Any]] = []
+    mask_hw_map: Dict[str, Any] = {}
 
     # 3) 遍历 (mask_rate, noise_sigma)
     entries: List[Dict[str, Any]] = []
@@ -277,6 +270,10 @@ def run_linear_baseline_experiment(
         mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate, seed=0)
         mask_flat = flatten_mask(mask_hw, C=C)
         n_obs = int(mask_flat.sum())
+
+        # 记录下该 mask_rate 对应的 mask_hw，后续绘图时用来标采样点
+        mask_key = f"{float(mask_rate):.6g}"
+        mask_hw_map[mask_key] = mask_hw.astype(bool).tolist()
 
         if verbose:
             print(f"  -> total observed entries (with {C} channels) = {n_obs}")
@@ -315,22 +312,36 @@ def run_linear_baseline_experiment(
                 nmae_list.append(nmae(x_lin, x))
                 psnr_list.append(psnr(x_lin, x))
 
-                # 记录一个典型样本，用于后续全实验可视化
+                # 旧逻辑：记录一个典型样本，用于后续全实验可视化（单个例子）
                 if (
                     example_recon is None
                     and float(mask_rate) == p_ref
                     and float(noise_sigma) == s_ref
                     and t == t_ref
                 ):
-                    x_interp = _compute_interp_baseline(x, mask_hw)
+                    x_interp_ref = _compute_interp_baseline(x, mask_hw)
                     example_recon = {
                         "frame_idx": int(t),
                         "mask_rate": float(mask_rate),
                         "noise_sigma": float(noise_sigma),
                         "x_true": x.tolist(),
                         "x_lin": x_lin.tolist(),
-                        "x_interp": x_interp.tolist(),
+                        "x_interp": x_interp_ref.tolist(),
                     }
+
+                # 新逻辑：为每个 (p,σ) 挑选若干帧作为四联图样本
+                if int(t) in example_t_set:
+                    x_interp = _compute_interp_baseline(x, mask_hw)
+                    examples.append(
+                        {
+                            "frame_idx": int(t),
+                            "mask_rate": float(mask_rate),
+                            "noise_sigma": float(noise_sigma),
+                            "x_true": x.tolist(),
+                            "x_lin": x_lin.tolist(),
+                            "x_interp": x_interp.tolist(),
+                        }
+                    )
 
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
@@ -464,6 +475,8 @@ def run_linear_baseline_experiment(
         },
         "entries": entries,
         "example_recon": example_recon,
+        "examples": examples,
+        "mask_hw_map": mask_hw_map,
     }
 
     if verbose:
@@ -483,16 +496,10 @@ def run_mlp_experiment(
     """
     在全数据集上，对一组 (mask_rate, noise_sigma) 组合运行 MLP 重建。
 
-    设计选择：
-    - 对于每个 mask_rate，训练一个对应的 MLP（训练噪声强度由 train_cfg.noise_sigma 决定）；
-    - 对该 mask_rate 下的多个 noise_sigma（测试噪声）进行评估；
-    - 每个组合输出：
-        * 全场误差统计（NMSE / NMAE / PSNR）
-        * POD 系数级谱线：coeff_rmse_per_mode / coeff_nrmse_per_mode
-        * POD band 级误差：band_errors (RMSE) / band_nrmse (NRMSE)
-        * 基于 φ 分组的场级多尺度误差：
-              field_nmse_per_group、field_nmse_partial
-        * 有效模态等级：effective_band / effective_r_cut
+    新增：
+    - "examples": 每个 (mask_rate, noise_sigma) 下若干帧的 x_true / x_mlp / x_interp，
+      用于后续四联图绘制；
+    - "mask_hw_map": 与线性基线同结构，用于标出采样点。
     """
     if verbose:
         print("=== [eval-mlp] Start MLP experiment ===")
@@ -520,11 +527,19 @@ def run_mlp_experiment(
     D = H * W * C
     X_flat_all = X_thwc.reshape(T, D)
 
-    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0
+    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0（兼容旧逻辑）
     p_ref = float(min(eval_cfg.mask_rates))
     s_ref = float(min(eval_cfg.noise_sigmas))
     t_ref = 0
     example_recon: Dict[str, Any] | None = None
+
+    # 新：统一为每个 (p,σ) 选若干帧作为可视化样本
+    n_example_frames = min(3, T)
+    example_t_indices = np.linspace(0, T - 1, num=n_example_frames, dtype=int)
+    example_t_set = set(int(t) for t in example_t_indices)
+
+    examples: List[Dict[str, Any]] = []
+    mask_hw_map: Dict[str, Any] = {}
 
     entries: List[Dict[str, Any]] = []
 
@@ -537,6 +552,10 @@ def run_mlp_experiment(
         mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate, seed=0)
         mask_flat = flatten_mask(mask_hw, C=C)
         n_obs = int(mask_flat.sum())
+
+        # 记录 mask_hw
+        mask_key = f"{float(mask_rate):.6g}"
+        mask_hw_map[mask_key] = mask_hw.astype(bool).tolist()
 
         if verbose:
             print(f"  -> total observed entries (with {C} channels) = {n_obs}")
@@ -600,22 +619,36 @@ def run_mlp_experiment(
                 nmae_list.append(nmae(x_mlp, x))
                 psnr_list.append(psnr(x_mlp, x))
 
-                # 记录一个典型样本，用于后续可视化（顺便给出插值 baseline）
+                # 旧单例 example_recon（最小 p/σ，t=0）
                 if (
                     example_recon is None
                     and float(mask_rate) == p_ref
                     and float(noise_sigma) == s_ref
                     and t == t_ref
                 ):
-                    x_interp = _compute_interp_baseline(x, mask_hw)
+                    x_interp_ref = _compute_interp_baseline(x, mask_hw)
                     example_recon = {
                         "frame_idx": int(t),
                         "mask_rate": float(mask_rate),
                         "noise_sigma": float(noise_sigma),
                         "x_true": x.tolist(),
                         "x_mlp": x_mlp.tolist(),
-                        "x_interp": x_interp.tolist(),
+                        "x_interp": x_interp_ref.tolist(),
                     }
+
+                # 新：多帧样本
+                if int(t) in example_t_set:
+                    x_interp = _compute_interp_baseline(x, mask_hw)
+                    examples.append(
+                        {
+                            "frame_idx": int(t),
+                            "mask_rate": float(mask_rate),
+                            "noise_sigma": float(noise_sigma),
+                            "x_true": x.tolist(),
+                            "x_mlp": x_mlp.tolist(),
+                            "x_interp": x_interp.tolist(),
+                        }
+                    )
 
             nmse_arr = np.array(nmse_list)
             nmae_arr = np.array(nmae_list)
@@ -761,6 +794,8 @@ def run_mlp_experiment(
         },
         "entries": entries,
         "example_recon": example_recon,
+        "examples": examples,
+        "mask_hw_map": mask_hw_map,
     }
 
     if verbose:
