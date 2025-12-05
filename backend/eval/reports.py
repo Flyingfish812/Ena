@@ -192,24 +192,14 @@ def generate_experiment_report_md(
     """
     根据一次完整实验的结果，生成一个模板化的 report.md。
 
-    参数
-    ----
-    all_result:
-        run_full_eval_pipeline / quick_full_experiment 的返回值。
-        建议包含:
-          - "linear", "mlp" (可选)
-          - "df_linear", "df_mlp" (可选)
-          - "saved_paths" (可选, 内含 CSV / JSON / 图像文件路径)
-    out_path:
-        输出的 markdown 路径。
-    experiment_name:
-        报告标题中的实验名称。
-    config_yaml:
-        若提供，将在报告中附上该 YAML 配置的路径。
-
-    返回
-    ----
-    out_path (Path)
+    说明（v1.06 更新）：
+    - 全局重建性能仍然以场空间 NMSE / NMAE / PSNR 为主。
+    - 多尺度部分区分两类量：
+        1) band_*/band_nrmse_*：在 POD 系数空间的 per-band 误差
+        2) partial_nmse_*     ：在场空间的部分重建 NMSE（累积到某个 band 为止）
+    - “有效模态等级”不再依赖 legacy 的 effective_r_cut，而是
+      从 partial NMSE 曲线中自动识别“误差几乎不再下降”的 band，
+      用于描述模型的有效恢复尺度。
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,18 +236,20 @@ def generate_experiment_report_md(
     fig_example_mlp = saved_paths.get("fig_example_mlp", None)
     fig_multiscale_example = saved_paths.get("fig_multiscale_example", None)
 
-    # 1) 一些 summary 统计：最好 / 最差 NMSE
+    # ------------------------------------------------------------------
+    # 1) 一些 summary 统计：最好 / 最差 NMSE（场空间）
+    # ------------------------------------------------------------------
     best_lin = df_lin.loc[df_lin["nmse_mean"].idxmin()]
     worst_lin = df_lin.loc[df_lin["nmse_mean"].idxmax()]
 
     summary_lines: list[str] = []
 
     summary_lines.append(
-        f"- Linear baseline 最佳 NMSE = {best_lin['nmse_mean']:.4e} "
+        f"- Linear baseline 最佳场级 NMSE = {best_lin['nmse_mean']:.4e} "
         f"(p={best_lin['mask_rate']:.3g}, σ={best_lin['noise_sigma']:.3g})"
     )
     summary_lines.append(
-        f"- Linear baseline 最差 NMSE = {worst_lin['nmse_mean']:.4e} "
+        f"- Linear baseline 最差场级 NMSE = {worst_lin['nmse_mean']:.4e} "
         f"(p={worst_lin['mask_rate']:.3g}, σ={worst_lin['noise_sigma']:.3g})"
     )
 
@@ -266,15 +258,15 @@ def generate_experiment_report_md(
         worst_mlp = df_mlp.loc[df_mlp["nmse_mean"].idxmax()]
 
         summary_lines.append(
-            f"- MLP baseline 最佳 NMSE = {best_mlp['nmse_mean']:.4e} "
+            f"- MLP baseline 最佳场级 NMSE = {best_mlp['nmse_mean']:.4e} "
             f"(p={best_mlp['mask_rate']:.3g}, σ={best_mlp['noise_sigma']:.3g})"
         )
         summary_lines.append(
-            f"- MLP baseline 最差 NMSE = {worst_mlp['nmse_mean']:.4e} "
+            f"- MLP baseline 最差场级 NMSE = {worst_mlp['nmse_mean']:.4e} "
             f"(p={worst_mlp['mask_rate']:.3g}, σ={worst_mlp['noise_sigma']:.3g})"
         )
 
-        # 尝试比较同一 (p,σ) 下的提升
+        # 尝试比较同一 (p,σ) 下的提升（仍然是场空间 NMSE）
         try:
             p_ref = sorted(set(df_lin["mask_rate"]))[0]
             s_ref = sorted(set(df_lin["noise_sigma"]))[0]
@@ -289,14 +281,16 @@ def generate_experiment_report_md(
             if lin_ref > 0:
                 rel_improve = (lin_ref - mlp_ref) / lin_ref * 100.0
                 summary_lines.append(
-                    f"- 在 p={p_ref:.3g}, σ={s_ref:.3g} 处，MLP 相比 Linear 的 NMSE "
+                    f"- 在 p={p_ref:.3g}, σ={s_ref:.3g} 处，MLP 相比 Linear 的场级 NMSE "
                     f"相对改善约 {rel_improve:.2f}%"
                 )
         except Exception:
             # 配置不完整或筛选失败时，默默跳过即可
             pass
 
-    # 2) 多尺度 band-wise 对比（选取一组典型 (p,σ)，优先训练配置）
+    # ------------------------------------------------------------------
+    # 2) 多尺度 band-wise 对比（系数空间）——只做数值罗列，不乱下“128 模态全恢复”的结论
+    # ------------------------------------------------------------------
     multiscale_lines: list[str] = []
     if df_mlp is not None and len(df_mlp) > 0:
         train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) if mlp_res else {}
@@ -325,60 +319,102 @@ def generate_experiment_report_md(
 
         if row_lin is not None and row_mlp is not None:
             multiscale_lines.append(
-                f"选取典型点 p={p_train:.3g}, σ={s_train:.3g}，比较各 POD band 的系数 RMSE："
+                f"选取典型点 p={p_train:.3g}, σ={s_train:.3g}，比较各 POD band 的系数 RMSE / NRMSE："
             )
 
-            for band_name in sorted(pod_bands.keys()):
-                key = f"band_{band_name}"
-                val_lin = row_lin.get(key, float("nan"))
-                val_mlp = row_mlp.get(key, float("nan"))
+            band_names = sorted(pod_bands.keys())
+            for band_name in band_names:
+                key_rmse = f"band_{band_name}"
+                key_nrmse = f"band_nrmse_{band_name}"
+                val_lin = row_lin.get(key_rmse, float("nan"))
+                val_mlp = row_mlp.get(key_rmse, float("nan"))
+                val_mlp_nrmse = row_mlp.get(key_nrmse, float("nan"))
                 if not (pd.isna(val_lin) or pd.isna(val_mlp)):
-                    multiscale_lines.append(
-                        f"- Band {band_name}: Linear={val_lin:.4e}, MLP={val_mlp:.4e}"
+                    line = (
+                        f"- Band {band_name}: "
+                        f"Linear RMSE={val_lin:.4e}, "
+                        f"MLP RMSE={val_mlp:.4e}"
                     )
+                    if not pd.isna(val_mlp_nrmse):
+                        line += f",  MLP NRMSE≈{val_mlp_nrmse:.3f}"
+                    multiscale_lines.append(line)
 
-    # 2') 有效模态等级统计（基于 effective_r_cut）
+    # ------------------------------------------------------------------
+    # 3) 有效模态等级：从 partial NMSE（场空间）中自动识别“误差几乎不再下降”的 band
+    # ------------------------------------------------------------------
     effective_lines: list[str] = []
-    if df_mlp is not None and len(df_mlp) > 0 and "effective_r_cut" in df_mlp.columns:
-        df_eff = df_mlp.dropna(subset=["effective_r_cut"]).copy()
-        if len(df_eff) > 0:
-            # 先看噪声较小的一条曲线下，随着 mask_rate 变化，有效模态数如何变化
-            s_min = df_eff["noise_sigma"].min()
-            sub_smin = df_eff[df_eff["noise_sigma"] == s_min].sort_values("mask_rate")
-            if len(sub_smin) > 0:
-                effective_lines.append(
-                    f"在噪声较小 (σ≈{s_min:.3g}) 的情况下，不同观测率下 MLP 的有效模态等级为："
-                )
-                for _, row in sub_smin.iterrows():
-                    effective_lines.append(
-                        f"- p={row['mask_rate']:.3g} 时，有效模态截止约为 r≈{int(row['effective_r_cut'])} "
-                        f"(effective_band='{row.get('effective_band', 'N/A')}')"
-                    )
+    if df_mlp is not None and len(df_mlp) > 0:
+        # 仍然选用训练配置或其 fallback 那一组 (p,σ)
+        train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) if mlp_res else {}
+        p_train = train_meta.get("mask_rate", None)
+        s_train = train_meta.get("noise_sigma", None)
 
-            # 再比较噪声最小 / 最大时的平均有效模态数
-            s_max = df_eff["noise_sigma"].max()
-            r_min = float(df_eff[df_eff["noise_sigma"] == s_min]["effective_r_cut"].mean())
-            r_max = float(df_eff[df_eff["noise_sigma"] == s_max]["effective_r_cut"].mean())
+        def _pick_row(df: pd.DataFrame, p: float, s: float):
+            sel = df[(df["mask_rate"] == p) & (df["noise_sigma"] == s)]
+            if len(sel) == 0:
+                return None
+            return sel.iloc[0]
 
+        row_mlp = None
+        if p_train is not None and s_train is not None:
+            row_mlp = _pick_row(df_mlp, p_train, s_train)
+
+        if row_mlp is None:
+            row_mlp = df_mlp.iloc[0]
+            p_train = row_mlp["mask_rate"]
+            s_train = row_mlp["noise_sigma"]
+
+        # 抽取当前 (p,σ) 下的所有 partial_nmse_* 列
+        partial_cols = [c for c in df_mlp.columns if c.startswith("partial_nmse_")]
+        partial_cols = sorted(partial_cols)
+
+        if row_mlp is not None and partial_cols:
+            effective_lines.append(
+                f"选取 MLP 在 p={p_train:.3g}, σ={s_train:.3g} 条件下，"
+                "分析 partial NMSE 曲线以估计有效恢复模态等级："
+            )
             effective_lines.append("")
-            effective_lines.append(
-                f"在噪声最小 σ≈{s_min:.3g} 与最大 σ≈{s_max:.3g} 的对比下："
-            )
-            effective_lines.append(
-                f"- 低噪声下平均有效模态数约为 r≈{r_min:.1f}；高噪声下约为 r≈{r_max:.1f}。"
-            )
 
-            if r_max < 0.8 * r_min:
+            vals: list[tuple[str, float]] = []
+            min_val = float("inf")
+            for col in partial_cols:
+                name = col.replace("partial_nmse_", "")
+                val = float(row_mlp[col])
+                vals.append((name, val))
+                min_val = min(min_val, val)
                 effective_lines.append(
-                    "- 随着噪声水平升高，有效可恢复模态数显著下降，高频模态更容易被噪声主导，"
-                    "在实际应用中可考虑在 r≈高噪声下的有效截止附近进行自适应截断。"
-                )
-            else:
-                effective_lines.append(
-                    "- 在所考察的噪声范围内，有效恢复模态数变化相对缓和，模型对噪声具备一定的尺度鲁棒性。"
+                    f"- 累积到 {name} 时，场级 NMSE ≈ {val:.4e}"
                 )
 
-    # 3) 拼 Markdown 文本
+            # 定义一个容忍度：到达整体最小值 5% 以内就认为“已基本收敛”
+            tol = 0.05
+            eff_name = None
+            for name, val in vals:
+                if val <= (1.0 + tol) * min_val:
+                    eff_name = name
+                    break
+
+            if eff_name is not None:
+                effective_lines.append("")
+                effective_lines.append(
+                    f"可以看到，累积到 {eff_name} 时，partial NMSE 已接近全局最小值 "
+                    f"(在 {tol*100:.1f}% 容忍度以内)，"
+                    "继续加入更高频 band 对误差下降的贡献已经非常有限。"
+                )
+                effective_lines.append(
+                    "因此，可以将该累积 band 视为当前配置下的“有效恢复尺度上限”，"
+                    "高于该尺度的高频模态主要受能量极低和可辨识性限制影响，"
+                    "难以从稀疏有噪观测中可靠重建。"
+                )
+        else:
+            effective_lines.append(
+                "当前结果中未显式提供 partial_nmse_* 信息，"
+                "无法从场空间曲线自动推断有效模态等级。"
+            )
+
+    # ------------------------------------------------------------------
+    # 4) 拼 Markdown 文本
+    # ------------------------------------------------------------------
     lines: list[str] = []
 
     # 标题
@@ -404,12 +440,33 @@ def generate_experiment_report_md(
     lines.append("")
     lines.append("### 2.1 指标说明")
     lines.append("")
-    lines.append("- **NMSE** (Normalized MSE)：对整体能量归一化后的均方误差，越小表示整体重建越准确。")
-    lines.append("- **NMAE** (Normalized MAE)：归一化后的平均绝对误差，相比 NMSE 对少量极端异常值不那么敏感。")
-    lines.append("- **PSNR** (Peak Signal-to-Noise Ratio)：以 dB 表示的峰值信噪比，越高表示重建场与真值之间的对比度越好。")
     lines.append(
-        "- **band_***：在 POD 系数空间中，对低频/中频/高频等 band 的系数 RMSE，"
-        "用于刻画不同尺度结构（大尺度流型 vs 细节涡量）的恢复能力。"
+        "- **NMSE** (Normalized MSE)：在物理场空间计算的归一化均方误差，"
+        "形式上为 E[‖û−u‖²]/E[‖u‖²]，直接刻画整体能量意义下的重建精度。"
+    )
+    lines.append(
+        "- **NMAE** (Normalized MAE)：归一化后的平均绝对误差，相比 NMSE 对少量极端异常值不那么敏感。"
+    )
+    lines.append(
+        "- **PSNR** (Peak Signal-to-Noise Ratio)：以 dB 表示的峰值信噪比，越高表示重建场与真值之间的对比度越好。"
+    )
+    lines.append(
+        "- **band_***：在 POD 系数空间中，各 POD band 的系数 RMSE，用于观察不同尺度下系数误差的绝对大小。"
+    )
+    lines.append(
+        "- **band_nrmse_***：在 POD 系数空间中，以模态能量 λₖ 归一化后的 per-band NRMSE，"
+        "近似刻画“该 band 的误差能量 / 该 band 真实能量”的比例。"
+    )
+    lines.append(
+        "  场级 NMSE 与模态 NRMSE 之间满足能量加权关系："
+        "NMSE_field = (∑ₖ λₖ·NRMSEₖ²)/(∑ₖ λₖ)，"
+        "因此即便部分高频 band 的 NRMSE 接近 1，只要其特征值 λₖ 很小，"
+        "对整体场级 NMSE 的贡献仍然可以忽略。"
+    )
+    lines.append(
+        "- **partial_nmse_***：在场空间中，累积到某个 band 为止的部分重建 NMSE "
+        "（例如 S1, S1+S2, ...），用于分析“加入更多模态后整体误差是否仍显著下降”，"
+        "从而推断模型的有效恢复尺度。"
     )
     lines.append("")
 
@@ -460,7 +517,7 @@ def generate_experiment_report_md(
     lines.append("```")
     lines.append("")
 
-    # 4. 多尺度分析 + 有效模态等级
+    # 4. 多尺度分析 + 有效模态等级（新版逻辑）
     lines.append("## 4. 多尺度（POD band）恢复性能与有效模态等级分析")
     lines.append("")
 
@@ -478,30 +535,38 @@ def generate_experiment_report_md(
     if fig_multiscale_example is not None:
         lines.append("")
         lines.append(
-            f"本次实验中，已将一幅典型的 POD band 误差柱状图保存为："
+            f"本次实验中，已将一幅典型的 POD 多尺度误差图保存为："
             f"`{Path(fig_multiscale_example)}`，可直接用于插图。"
         )
     lines.append("")
 
-    lines.append("### 4.2 有效模态等级与自适应截断")
+    lines.append("### 4.2 基于 partial NMSE 的有效模态等级与自适应截断")
     lines.append("")
     if effective_lines:
         lines.extend(effective_lines)
     else:
-        lines.append("当前结果中未显式提供 effective_r_cut 信息，无法自动推断有效模态等级。")
+        lines.append(
+            "当前结果中未显式提供 partial_nmse_* 信息，无法自动从场空间曲线推断有效模态等级。"
+        )
     lines.append("")
 
-    # 5. 结果讨论与展望（依然是模板，可基于上方结论做微调）
+    # 5. 结果讨论与展望（模板）
     lines.append("## 5. 结果讨论与展望（模板）")
     lines.append("")
-    lines.append("- 当观测率较低时，线性基线在高频 band 上的误差通常更大，表明高频结构对稀疏观测更敏感；")
-    lines.append("- MLP baseline 在中高频 POD band 上往往优于线性基线，特别是在中等噪声水平下更能保持结构细节；")
-    lines.append("- 随着观测率提升，两者的性能差距可能逐渐缩小，说明在高采样场景中线性方法已经接近饱和；")
     lines.append(
-        "- 结合 4.2 节的有效模态等级分析，可以在 r≈有效截止附近进行自适应截断，"
-        "在保证主要流动结构重建质量的前提下，显著压缩模型复杂度与推理成本；"
+        "- 从 4.1 与 4.2 的结果可以看出，模型在 POD 能量主导的低频 / 中低频 band 上"
+        "具有较好的重建精度，而在高频 band 上误差显著增大，这与稀疏观测条件下"
+        "高频模态本身能量低、可辨识性差的特性相一致；"
     )
-    lines.append("- 后续可以尝试引入卷积/注意力结构，或在损失中加入物理约束，以进一步改善高频恢复表现与泛化能力。")
+    lines.append(
+        "- partial NMSE 曲线表明，累积到某一 band 后整体误差已基本收敛，"
+        "进一步加入高频模态对场级 NMSE 的改善有限，可以据此选择一个有效截断等级，"
+        "在保证主要物理结构重建的前提下控制模型复杂度；"
+    )
+    lines.append(
+        "- 后续可以尝试在 MLP 结构中引入卷积/注意力或物理正则项，"
+        "以改善中频尺度的恢复能力，并系统比较不同网络结构在“可恢复能量带宽”上的差异。"
+    )
     lines.append("")
     lines.append(
         "> 注：以上条目为模板化描述，可根据实际数值结果进行适当修改和细化。"
