@@ -201,24 +201,10 @@ def run_linear_baseline_experiment(
             "example_recon": { ... } | None,
 
             # 新字段：用于多组四联图绘制
-            "examples": [
-                {
-                    "frame_idx": int,
-                    "mask_rate": float,
-                    "noise_sigma": float,
-                    "x_true": [...],     # [H,W,C] list
-                    "x_lin":  [...],     # [H,W,C] list
-                    "x_interp": [...],   # [H,W,C] list
-                },
-                ...
-            ],
+            "examples": [...],
 
             # 新字段：每个 mask_rate 对应的空间掩膜（为画采样点服务）
-            # key 为格式化后的 mask_rate 字符串，例如 "0.02"
-            "mask_hw_map": {
-                "<mask_rate_str>": [[bool, ...], ...],   # [H,W]
-                ...
-            },
+            "mask_hw_map": {...},
         }
     """
     if verbose:
@@ -241,6 +227,17 @@ def run_linear_baseline_experiment(
         r_eff=r_eff,
         verbose=verbose,
     )
+
+    # 1.2 从 eigenvalues 推出能量比例与累计能量（供多尺度能量曲线使用）
+    energy_frac = None
+    energy_cum = None
+    if eigenvalues is not None:
+        e = np.asarray(eigenvalues, dtype=float)
+        total = float(e.sum())
+        if total > 0.0:
+            frac = e / total
+            energy_frac = frac.tolist()
+            energy_cum = np.cumsum(frac).tolist()
 
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
@@ -472,6 +469,8 @@ def run_linear_baseline_experiment(
             "r_eff": r_eff,
             "pod_bands": eval_cfg.pod_bands,
             "center": meta.get("center", True),
+            "energy_frac": energy_frac,
+            "energy_cum": energy_cum,
         },
         "entries": entries,
         "example_recon": example_recon,
@@ -483,7 +482,6 @@ def run_linear_baseline_experiment(
         print("\n=== [eval-linear] Done ===")
 
     return result
-
 
 def run_mlp_experiment(
     data_cfg: DataConfig,
@@ -521,6 +519,17 @@ def run_mlp_experiment(
         r_eff=r_eff,
         verbose=verbose,
     )
+
+    # 1.2 从 eigenvalues 推出能量比例与累计能量（供多尺度能量曲线使用）
+    energy_frac = None
+    energy_cum = None
+    if eigenvalues is not None:
+        e = np.asarray(eigenvalues, dtype=float)
+        total = float(e.sum())
+        if total > 0.0:
+            frac = e / total
+            energy_frac = frac.tolist()
+            energy_cum = np.cumsum(frac).tolist()
 
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
@@ -782,6 +791,8 @@ def run_mlp_experiment(
             "r_eff": r_eff,
             "pod_bands": eval_cfg.pod_bands,
             "center": meta.get("center", True),
+            "energy_frac": energy_frac,
+            "energy_cum": energy_cum,
             "train_cfg": {
                 "mask_rate": train_cfg.mask_rate,
                 "noise_sigma": train_cfg.noise_sigma,

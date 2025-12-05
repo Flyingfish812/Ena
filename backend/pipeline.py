@@ -39,7 +39,7 @@ from .eval.reconstruction import (
 )
 from .eval.reports import results_to_dataframe
 from .viz.curves import plot_nmse_vs_mask_rate, plot_nmse_vs_noise
-from .viz.multiscale_plots import plot_multiscale_bar
+from .viz.multiscale_plots import plot_multiscale_bar, plot_multiscale_summary
 from .config.yaml_io import load_experiment_yaml, save_experiment_yaml  # 可选用
 from .eval.reports import (
     results_to_dataframe,
@@ -1230,31 +1230,15 @@ def quick_full_experiment(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    一行跑完“小论文主实验”的高层接口：
-
-    - 自动构建 DataConfig / PodConfig / EvalConfig / TrainConfig；
-    - 调用 run_full_eval_pipeline 进行线性基线 + MLP 的 p-σ sweep；
-    - 自动生成：
-        * NMSE vs mask_rate 曲线（linear + mlp）
-        * NMSE vs noise_sigma 曲线（linear + mlp）
-        * 在训练配置 (train_mask_rate, train_noise_sigma) 附近的一组 POD band 误差柱状图
-
-    返回
-    ----
-    result:
-        在 run_full_eval_pipeline 返回基础上，增加：
-        - "fig_multiscale_example": 某个组合的 POD band 误差柱状图 Figure
-        - "configs": 四个 dataclass 配置的快照
+    一行跑完“小论文主实验”的高层接口。
     """
     nc_path = Path(nc_path)
 
-    # ---- 1) 默认 mask_rates / noise_sigmas / pod_bands ----
     if mask_rates is None:
         mask_rates = [0.01, 0.02, 0.05, 0.10]
     if noise_sigmas is None:
         noise_sigmas = [0.0, 0.01, 0.02]
 
-    # 如果没给 band，就按 r 划一个简单的 L/M/H
     if pod_bands is None:
         r_L = min(16, r)
         r_M = min(64, r)
@@ -1264,7 +1248,6 @@ def quick_full_experiment(
             "H": (r_M, r),
         }
 
-    # ---- 2) 构造四个配置 dataclass ----
     data_cfg = DataConfig(
         nc_path=nc_path,
         var_keys=var_keys,
@@ -1296,7 +1279,6 @@ def quick_full_experiment(
         / f"p{train_mask_rate:.4f}_sigma{train_noise_sigma:.3g}".replace(".", "p"),
     )
 
-    # ---- 3) 调用 full-eval pipeline ----
     result = run_full_eval_pipeline(
         data_cfg=data_cfg,
         pod_cfg=pod_cfg,
@@ -1305,35 +1287,81 @@ def quick_full_experiment(
         verbose=verbose,
     )
 
-    # ---- 4) 多尺度 band 柱状图：优先选训练配置 (p_train, σ_train) ----
-    fig_multiscale = None
+    # ===== 代表性多尺度图：linear / mlp 各一张 =====
+    fig_ms_lin = None
+    fig_ms_mlp = None
+
+    lin_results = result.get("linear", None)
     mlp_results = result.get("mlp", None)
-    if mlp_results is not None:
-        entries = mlp_results.get("entries", []) or []
-        if entries:
-            # 优先找 mask_rate = train_mask_rate 且 noise_sigma = train_noise_sigma 的 entry
-            target_entry = None
-            for e in entries:
-                if (
-                    abs(float(e.get("mask_rate", -1.0)) - train_mask_rate) < 1e-12
-                    and abs(float(e.get("noise_sigma", -1.0)) - train_noise_sigma) < 1e-12
-                ):
-                    target_entry = e
-                    break
-            if target_entry is None:
-                target_entry = entries[0]
 
-            band_errors = target_entry.get("band_errors", {}) or {}
-            if band_errors:
-                fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
+    if lin_results is not None and mlp_results is not None:
+        lin_entries = lin_results.get("entries", []) or []
+        mlp_entries = mlp_results.get("entries", []) or []
+
+        if lin_entries and mlp_entries:
+            def _build_index(entries):
+                m = {}
+                for e in entries:
+                    p = float(e.get("mask_rate", -1.0))
+                    s = float(e.get("noise_sigma", -1.0))
+                    m[(p, s)] = e
+                return m
+
+            lin_idx = _build_index(lin_entries)
+            mlp_idx = _build_index(mlp_entries)
+
+            train_meta = mlp_results.get("meta", {}).get("train_cfg", {}) or {}
+            p_train = train_meta.get("mask_rate", None)
+            s_train = train_meta.get("noise_sigma", None)
+
+            entry_lin = None
+            entry_mlp = None
+
+            if p_train is not None and s_train is not None:
+                key = (float(p_train), float(s_train))
+                entry_lin = lin_idx.get(key, None)
+                entry_mlp = mlp_idx.get(key, None)
+
+            if entry_mlp is None and mlp_entries:
+                entry_mlp = mlp_entries[0]
+                key = (float(entry_mlp.get("mask_rate", -1.0)),
+                       float(entry_mlp.get("noise_sigma", -1.0)))
+                entry_lin = lin_idx.get(key, None)
+
+            energy_cum = (
+                mlp_results.get("meta", {}).get("energy_cum")
+                or lin_results.get("meta", {}).get("energy_cum")
+            )
+
+            if entry_lin is not None:
                 title = (
-                    f"MLP POD band errors (p={target_entry['mask_rate']}, "
-                    f"σ={target_entry['noise_sigma']})"
+                    f"Multiscale summary (linear, p={entry_lin['mask_rate']}, "
+                    f"σ={entry_lin['noise_sigma']})"
                 )
-                plot_multiscale_bar(band_errors, ax=ax, title=title)
-                fig_multiscale.tight_layout()
+                fig_ms_lin, _ = plot_multiscale_summary(
+                    entry_lin,
+                    energy_cum=energy_cum,
+                    title_prefix=title,
+                    model_label="linear",
+                )
 
-    result["fig_multiscale_example"] = fig_multiscale
+            if entry_mlp is not None:
+                title = (
+                    f"Multiscale summary (mlp, p={entry_mlp['mask_rate']}, "
+                    f"σ={entry_mlp['noise_sigma']})"
+                )
+                fig_ms_mlp, _ = plot_multiscale_summary(
+                    entry_mlp,
+                    energy_cum=energy_cum,
+                    title_prefix=title,
+                    model_label="mlp",
+                )
+
+    # 兼容旧字段：默认把 mlp 的那张作为 fig_multiscale_example
+    result["fig_multiscale_example_linear"] = fig_ms_lin
+    result["fig_multiscale_example_mlp"] = fig_ms_mlp
+    result["fig_multiscale_example"] = fig_ms_mlp
+
     result["configs"] = {
         "data_cfg": data_cfg,
         "pod_cfg": pod_cfg,
@@ -1351,33 +1379,6 @@ def run_experiment_from_yaml(
     generate_report: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    从 YAML 配置文件一键运行完整实验（POD 构建 + 线性 sweep + MLP sweep），
-    并将结果与报告落盘。
-
-    目录结构示意：
-    artifacts/experiments/{experiment_name}/
-        figs/
-            nmse_vs_mask.png
-            nmse_vs_noise.png
-            example_linear.png
-            example_mlp.png
-            multiscale_mlp.png
-        p0p0100_sigma0p0/
-            linear_example_00.png
-            linear_example_01.png
-            linear_example_02.png
-            mlp_example_00.png
-            ...
-        p0p0200_sigma0p01/
-            ...
-
-    返回
-    ----
-    all_result:
-        run_full_eval_pipeline 的返回结果，
-        并额外包含 "saved_paths" 与 "report_path" (若生成)。
-    """
     yaml_path = Path(yaml_path)
     if experiment_name is None:
         experiment_name = yaml_path.stem
@@ -1398,14 +1399,12 @@ def run_experiment_from_yaml(
         verbose=verbose,
     )
 
-    # 先确定实验目录与 figs 子目录
     save_root = Path(save_root)
     exp_dir = save_root / experiment_name
     figs_dir = exp_dir / "figs"
     ensure_dir(figs_dir)
 
-    # 将 full-eval 返回的典型曲线图（若存在）保存下来
-    fig_paths: Dict[str, Path] = {}
+    fig_paths: Dict[str, Any] = {}
 
     fig_mask = all_result.get("fig_nmse_vs_mask", None)
     if fig_mask is not None:
@@ -1423,7 +1422,6 @@ def run_experiment_from_yaml(
         if verbose:
             print(f"[yaml-experiment] Saved figure: {p}")
 
-    # 代表性单例场图（Linear / MLP）
     fig_example_linear = all_result.get("fig_example_linear", None)
     if fig_example_linear is not None:
         p = figs_dir / "example_linear.png"
@@ -1440,7 +1438,7 @@ def run_experiment_from_yaml(
         if verbose:
             print(f"[yaml-experiment] Saved figure: {p}")
 
-    # 新增：为每个 (p,σ) 的多帧四联图创建子目录并保存
+    # 四联图 per-(p,σ)
     fig_examples_linear = all_result.get("fig_examples_linear") or {}
     fig_examples_mlp = all_result.get("fig_examples_mlp") or {}
 
@@ -1448,14 +1446,12 @@ def run_experiment_from_yaml(
         if verbose:
             print("[yaml-experiment] Saving per-(p,σ) quadruple figures ...")
 
-    # 先收集所有出现过的配置名（字符串，例如 'p0p0100_sigma0p0'）
     all_cfg_names = set(fig_examples_linear.keys()) | set(fig_examples_mlp.keys())
 
     for cfg_name in sorted(all_cfg_names):
         cfg_dir = exp_dir / cfg_name
         ensure_dir(cfg_dir)
 
-        # 线性模型图
         lin_figs = fig_examples_linear.get(cfg_name, []) or []
         for idx, fig in enumerate(lin_figs):
             p = cfg_dir / f"linear_example_{idx:02d}.png"
@@ -1465,7 +1461,6 @@ def run_experiment_from_yaml(
             if verbose:
                 print(f"[yaml-experiment] Saved figure: {p}")
 
-        # MLP 模型图
         mlp_figs = fig_examples_mlp.get(cfg_name, []) or []
         for idx, fig in enumerate(mlp_figs):
             p = cfg_dir / f"mlp_example_{idx:02d}.png"
@@ -1475,58 +1470,138 @@ def run_experiment_from_yaml(
             if verbose:
                 print(f"[yaml-experiment] Saved figure: {p}")
 
-    # 根据 MLP 结果，额外生成一张多尺度 POD band 柱状图（保持原有逻辑）
+    # ===== 多尺度 “四合一” 图：linear 和 mlp 分开画 =====
+    lin_res = all_result.get("linear", None)
     mlp_res = all_result.get("mlp", None)
-    fig_multiscale = None
-    if mlp_res is not None:
-        entries = mlp_res.get("entries", []) or []
-        if entries:
-            # 优先选训练配置 (p_train, σ_train)，与报告中的多尺度分析保持一致
-            train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) or {}
-            p_train = train_meta.get("mask_rate", None)
-            s_train = train_meta.get("noise_sigma", None)
 
-            target_entry = None
-            if p_train is not None and s_train is not None:
-                for e in entries:
-                    if (
-                        float(e.get("mask_rate", -1.0)) == float(p_train)
-                        and float(e.get("noise_sigma", -1.0)) == float(s_train)
-                    ):
-                        target_entry = e
-                        break
+    if lin_res is not None and mlp_res is not None:
+        lin_entries = lin_res.get("entries", []) or []
+        mlp_entries = mlp_res.get("entries", []) or []
 
-            if target_entry is None:
-                target_entry = entries[0]
+        if verbose:
+            print("[yaml-experiment] Generating multiscale summary figures for each (p,σ) ...")
 
-            band_errors = target_entry.get("band_errors", {}) or {}
-            if band_errors:
-                fig_multiscale, ax = plt.subplots(1, 1, figsize=(4, 3))
-                title = (
-                    f"MLP POD band errors (p={target_entry['mask_rate']}, "
-                    f"σ={target_entry['noise_sigma']})"
+        def _build_index(entries):
+            m = {}
+            for e in entries:
+                p = float(e.get("mask_rate", -1.0))
+                s = float(e.get("noise_sigma", -1.0))
+                m[(p, s)] = e
+            return m
+
+        lin_idx = _build_index(lin_entries)
+        mlp_idx = _build_index(mlp_entries)
+
+        energy_cum = (
+            mlp_res.get("meta", {}).get("energy_cum")
+            or lin_res.get("meta", {}).get("energy_cum")
+        )
+
+        all_ps = sorted(set(lin_idx.keys()) | set(mlp_idx.keys()))
+
+        for (p_val, s_val) in all_ps:
+            entry_lin = lin_idx.get((p_val, s_val), None)
+            entry_mlp = mlp_idx.get((p_val, s_val), None)
+
+            cfg_name = f"p{p_val:.4f}_sigma{s_val:.3g}".replace(".", "p")
+            cfg_dir = exp_dir / cfg_name
+            ensure_dir(cfg_dir)
+
+            # 线性模型的多尺度图
+            if entry_lin is not None:
+                title_lin = f"Multiscale summary (linear, p={p_val}, σ={s_val})"
+                fig_lin, _ = plot_multiscale_summary(
+                    entry_lin,
+                    energy_cum=energy_cum,
+                    title_prefix=title_lin,
+                    model_label="linear",
                 )
-                plot_multiscale_bar(band_errors, ax=ax, title=title)
-                fig_multiscale.tight_layout()
-
-                p = figs_dir / "multiscale_mlp.png"
-                fig_multiscale.savefig(p, dpi=300, bbox_inches="tight")
-                fig_paths["fig_multiscale_example"] = p
+                out_lin = cfg_dir / "multiscale_linear.png"
+                fig_lin.savefig(out_lin, dpi=300, bbox_inches="tight")
+                fig_paths.setdefault(f"multiscale_linear/{cfg_name}", [])
+                fig_paths[f"multiscale_linear/{cfg_name}"].append(out_lin)
                 if verbose:
-                    print(f"[yaml-experiment] Saved figure: {p}")
+                    print(f"[yaml-experiment] Saved multiscale linear: {out_lin}")
 
-    # 保存 JSON / CSV
+            # MLP 模型的多尺度图
+            if entry_mlp is not None:
+                title_mlp = f"Multiscale summary (mlp, p={p_val}, σ={s_val})"
+                fig_mlp, _ = plot_multiscale_summary(
+                    entry_mlp,
+                    energy_cum=energy_cum,
+                    title_prefix=title_mlp,
+                    model_label="mlp",
+                )
+                out_mlp = cfg_dir / "multiscale_mlp.png"
+                fig_mlp.savefig(out_mlp, dpi=300, bbox_inches="tight")
+                fig_paths.setdefault(f"multiscale_mlp/{cfg_name}", [])
+                fig_paths[f"multiscale_mlp/{cfg_name}"].append(out_mlp)
+                if verbose:
+                    print(f"[yaml-experiment] Saved multiscale mlp: {out_mlp}")
+
+        # 选一个代表 (p,σ)，在 figs/ 下再各存一张 linear / mlp 示例
+        train_meta = mlp_res.get("meta", {}).get("train_cfg", {}) or {}
+        p_train = train_meta.get("mask_rate", None)
+        s_train = train_meta.get("noise_sigma", None)
+
+        rep_lin = None
+        rep_mlp = None
+
+        if p_train is not None and s_train is not None:
+            key = (float(p_train), float(s_train))
+            rep_lin = lin_idx.get(key, None)
+            rep_mlp = mlp_idx.get(key, None)
+
+        if rep_mlp is None and mlp_entries:
+            rep_mlp = mlp_entries[0]
+            key = (float(rep_mlp.get("mask_rate", -1.0)),
+                   float(rep_mlp.get("noise_sigma", -1.0)))
+            rep_lin = lin_idx.get(key, None)
+
+        if rep_lin is not None:
+            title = (
+                f"Multiscale summary (linear, p={rep_lin['mask_rate']}, "
+                f"σ={rep_lin['noise_sigma']})"
+            )
+            fig_lin_rep, _ = plot_multiscale_summary(
+                rep_lin,
+                energy_cum=energy_cum,
+                title_prefix=title,
+                model_label="linear",
+            )
+            p_lin = figs_dir / "multiscale_linear_example.png"
+            fig_lin_rep.savefig(p_lin, dpi=300, bbox_inches="tight")
+            fig_paths["fig_multiscale_linear_example"] = p_lin
+            if verbose:
+                print(f"[yaml-experiment] Saved representative multiscale linear: {p_lin}")
+
+        if rep_mlp is not None:
+            title = (
+                f"Multiscale summary (mlp, p={rep_mlp['mask_rate']}, "
+                f"σ={rep_mlp['noise_sigma']})"
+            )
+            fig_mlp_rep, _ = plot_multiscale_summary(
+                rep_mlp,
+                energy_cum=energy_cum,
+                title_prefix=title,
+                model_label="mlp",
+            )
+            p_mlp = figs_dir / "multiscale_mlp_example.png"
+            fig_mlp_rep.savefig(p_mlp, dpi=300, bbox_inches="tight")
+            fig_paths["fig_multiscale_mlp_example"] = p_mlp
+            # 兼容旧字段名：fig_multiscale_example 指向 mlp 的例子
+            fig_paths["fig_multiscale_example"] = p_mlp
+            if verbose:
+                print(f"[yaml-experiment] Saved representative multiscale mlp: {p_mlp}")
+
     saved_paths = save_full_experiment_results(
         all_result,
         base_dir=save_root,
         experiment_name=experiment_name,
     )
-
-    # 把图像路径也并入 saved_paths，方便后续查阅
     saved_paths.update(fig_paths)
     all_result["saved_paths"] = saved_paths
 
-    # 生成 report.md
     report_path = None
     if generate_report:
         report_path = generate_experiment_report_md(
