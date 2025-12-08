@@ -40,14 +40,6 @@ def plot_multiscale_bar(
     return ax
 
 
-def _sorted_keys_union(*dicts: Mapping[str, float]) -> Sequence[str]:
-    keys: set[str] = set()
-    for d in dicts:
-        keys.update(d.keys())
-    # 简单按字符串排序，"S1" < "S1+S2" < "S1+S2+S3" 这种顺序是符合直觉的
-    return sorted(keys)
-
-
 def plot_multiscale_summary(
     entry: Mapping[str, object],
     *,
@@ -86,19 +78,53 @@ def plot_multiscale_summary(
 
     # ---------------- 1) Per-band NRMSE 条形图 ----------------
     band_nrmse = dict(entry.get("band_nrmse", {})) if entry else {}
-    band_names = sorted(band_nrmse.keys())
+    band_names = band_nrmse.keys()
 
     if band_names:
         x = np.arange(len(band_names))
-        y = [float(band_nrmse[k]) for k in band_names]
+        y = np.asarray([float(band_nrmse[k]) for k in band_names], dtype=float)
 
-        ax_band.bar(x, y, width=0.6)
+        # 颜色分段：0–0.5 深绿，0.5–0.9 深蓝，0.9+ 深红
+        colors: list[str] = []
+        for val in y:
+            if np.isnan(val):
+                colors.append("gray")
+            elif val <= 0.5:
+                colors.append("darkgreen")
+            elif val <= 0.9:
+                colors.append("navy")
+            else:
+                colors.append("darkred")
+
+        bars = ax_band.bar(x, y, width=0.6, color=colors)
+
         ax_band.set_xticks(x)
         ax_band.set_xticklabels(band_names)
         ax_band.set_xlabel("POD band")
         ax_band.set_ylabel("Per-band NRMSE")
         ax_band.set_title(f"Per-band NRMSE ({model_label})")
         ax_band.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+
+        # 在柱顶标数值
+        if len(y) > 0:
+            offset = 0.01 * float(np.nanmax(np.abs(y))) if np.isfinite(np.nanmax(np.abs(y))) else 0.0
+        else:
+            offset = 0.0
+        for xi, yi in zip(x, y):
+            if np.isnan(yi):
+                label = "nan"
+                yy = 0.0
+            else:
+                label = f"{yi:.3f}"
+                yy = yi
+            ax_band.text(
+                xi,
+                yy + offset,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
     else:
         ax_band.text(
             0.5,
@@ -165,17 +191,57 @@ def plot_multiscale_summary(
         )
         ax_partial.set_axis_off()
 
-    # ---------------- 4) 能量比例累积曲线 ----------------
+    # ---------------- 4) 能量比例累积曲线 + 阈值虚线 ----------------
     if energy_cum is not None:
         e = np.asarray(energy_cum, dtype=float)
         n_modes = e.shape[0]
         x_e = np.arange(1, n_modes + 1)
+
         ax_energy.plot(x_e, e, linewidth=1.0)
         ax_energy.set_xlabel("Mode index n")
         ax_energy.set_ylabel(r"Cumulative energy $\mathcal{E}^{(n)}$")
         ax_energy.set_title("Cumulative POD energy ratio")
         ax_energy.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
         ax_energy.set_ylim(0.0, 1.05)
+
+        # 在 0.9 / 0.99 / 0.999 / 0.9999 四个阈值处标出使用的模态数
+        thresholds = [0.9, 0.99, 0.999, 0.9999]
+        # 对应的 m1, m2, m3, m4 编号，仅用于标注文本时区分
+        labels = ["m1", "m2", "m3", "m4"]
+
+        for thr, lbl in zip(thresholds, labels):
+            # 找到最小的 n 使得 e[n-1] >= thr
+            idx = int(np.searchsorted(e, thr, side="left")) + 1  # 转成 1-based index
+            if idx <= n_modes:
+                # 标出 (m, thr) 点
+                ax_energy.plot(idx, thr, marker="o", markersize=4, color="k")
+                # 竖直虚线：从 (m, 0) 到 (m, thr)
+                ax_energy.vlines(
+                    idx,
+                    0.0,
+                    thr,
+                    linestyles="--",
+                    linewidth=0.8,
+                    color="gray",
+                )
+                # 水平虚线：从 (1, thr) 到 (m, thr)
+                ax_energy.hlines(
+                    thr,
+                    1,
+                    idx,
+                    linestyles="--",
+                    linewidth=0.8,
+                    color="gray",
+                )
+                # 在点上方标注 (m_k, 阈值)
+                ax_energy.text(
+                    idx,
+                    thr + 0.01,
+                    f"{lbl}={idx}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
     else:
         ax_energy.text(
             0.5,

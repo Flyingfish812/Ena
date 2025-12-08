@@ -12,24 +12,41 @@ import numpy as np
 def generate_random_mask_hw(
     H: int,
     W: int,
-    mask_rate: float,
+    mask_rate: float | None = None,
     seed: int | None = None,
+    mask_num: int | None = None,
 ) -> np.ndarray:
     """
     在 H×W 网格上生成随机均匀采样的观测 mask。
+
+    参数
+    ----
+    mask_rate:
+        观测比例 (0,1]。若同时给定 mask_rate 与 mask_num，则优先使用 mask_num。
+    mask_num:
+        观测点个数（以空间网格点计，不含通道）。若给定则直接使用该个数。
 
     返回
     ----
     mask:
         形状为 [H, W] 的 bool 数组，其中 True 表示被观测。
     """
-    if not (0 < mask_rate <= 1.0):
-        raise ValueError(f"mask_rate must be in (0,1], got {mask_rate}")
+    num_points = H * W
+
+    if mask_num is not None:
+        num_obs = int(mask_num)
+        if num_obs <= 0:
+            raise ValueError(f"mask_num must be positive, got {mask_num}")
+        # 不允许超过网格总点数
+        num_obs = min(num_obs, num_points)
+    else:
+        if mask_rate is None:
+            raise ValueError("Either mask_rate or mask_num must be provided.")
+        if not (0 < mask_rate <= 1.0):
+            raise ValueError(f"mask_rate must be in (0,1], got {mask_rate}")
+        num_obs = max(1, int(round(num_points * mask_rate)))
 
     rng = np.random.RandomState(seed)
-    num_points = H * W
-    num_obs = max(1, int(round(num_points * mask_rate)))
-
     flat_mask = np.zeros(num_points, dtype=bool)
     idx = rng.choice(num_points, size=num_obs, replace=False)
     flat_mask[idx] = True
