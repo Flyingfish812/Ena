@@ -38,14 +38,9 @@ from .eval.reconstruction import (
     run_mlp_experiment,
 )
 from .eval.reports import results_to_dataframe
-from .viz.curves import plot_nmse_vs_mask_rate, plot_nmse_vs_noise
 from .viz.multiscale_plots import plot_multiscale_bar, plot_multiscale_summary
 from .config.yaml_io import load_experiment_yaml, save_experiment_yaml  # 可选用
-from .eval.reports import (
-    results_to_dataframe,
-    save_full_experiment_results,
-    generate_experiment_report_md,
-)
+from .eval.reports import results_to_dataframe
 
 def _plot_recon_quadruple(
     x_interp: np.ndarray,
@@ -141,6 +136,498 @@ def _plot_recon_quadruple(
         fig.suptitle(title_prefix, fontsize=11)
 
     return fig
+
+def plot_example_from_npz(
+    npz_path: str | Path,
+    *,
+    model_name: str | None = None,
+    channel: int = 0,
+    title_prefix: str | None = None,
+) -> plt.Figure:
+    """
+    从保存的 example npz 文件中恢复一张四联图。
+
+    约定 npz 内至少包含:
+        - x_true:   [H,W,C]
+        - x_hat:    [H,W,C]
+        - x_interp: [H,W,C]
+      可选:
+        - mask_hw:      [H,W] bool
+        - mask_rate:    float
+        - noise_sigma:  float
+        - frame_idx:    int
+        - model_type:   str ("linear"/"mlp")
+
+    参数:
+        model_name: 若为 None, 优先从 npz["model_type"] 读取, 否则使用传入值。
+        channel:    可视化的通道索引。
+        title_prefix: 若为 None, 自动根据 (frame_idx, p, σ) 拼一个标题。
+    """
+    npz_path = Path(npz_path)
+    data = np.load(npz_path, allow_pickle=False)
+
+    x_true = data["x_true"]
+    x_hat = data["x_hat"]
+    x_interp = data["x_interp"]
+
+    mask_hw = data["mask_hw"] if "mask_hw" in data.files else None
+
+    p = float(data["mask_rate"]) if "mask_rate" in data.files else None
+    s = float(data["noise_sigma"]) if "noise_sigma" in data.files else None
+    frame_idx = int(data["frame_idx"]) if "frame_idx" in data.files else None
+
+    if model_name is None:
+        if "model_type" in data.files:
+            model_name = str(data["model_type"])
+        else:
+            model_name = "model"
+
+    if title_prefix is None:
+        parts = [model_name]
+        if frame_idx is not None:
+            parts.append(f"frame={frame_idx}")
+        if p is not None:
+            parts.append(f"p={p:.3g}")
+        if s is not None:
+            parts.append(f"σ={s:.3g}")
+        title_prefix = " | ".join(parts)
+
+    fig = _plot_recon_quadruple(
+        x_interp=x_interp,
+        x_hat=x_hat,
+        x_true=x_true,
+        mask_hw=mask_hw,
+        model_name=model_name,
+        channel=channel,
+        title_prefix=title_prefix,
+    )
+    return fig
+
+def _infer_keys(df):
+    """
+    根据 DataFrame 的列名自动推断:
+    - mask 列 (mask_rate)
+    - noise 列 (noise_sigma)
+    - nmse 列 (nmse_mean)
+
+    只做简单的包含判断，避免强绑列名。
+    """
+    cols = list(getattr(df, "columns", []))
+    lower = [str(c).lower() for c in cols]
+
+    def _find(pred):
+        for c, lc in zip(cols, lower, strict=False):
+            if pred(c, lc):
+                return c
+        return None
+
+    mask_col = _find(lambda c, lc: "mask" in lc and "rate" in lc)
+    noise_col = _find(lambda c, lc: ("noise" in lc) or ("sigma" in lc))
+    nmse_col = _find(lambda c, lc: "nmse" in lc)
+    return mask_col, noise_col, nmse_col
+
+def _plot_multi_curves_on_ax(
+    df,
+    ax: plt.Axes,
+    *,
+    x_key: str,
+    group_key: str,
+    nmse_key: str,
+    line_prefix: str,
+):
+    """
+    在单个 ax 上画“多折线 + 末端标数值 + 右侧 legend”。
+
+    - x 轴可以是 mask_rate / noise_sigma
+    - group_key 作为多折线分组（比如按噪声或按采样率）
+    - y 轴默认是场级 NMSE（对数刻度）
+    """
+    if df is None or x_key is None or group_key is None or nmse_key is None:
+        return
+
+    grouped_vals = sorted(df[group_key].unique())
+    for g_val in grouped_vals:
+        sub = df[df[group_key] == g_val].sort_values(by=x_key)
+        if sub.empty:
+            continue
+
+        x = np.asarray(sub[x_key], dtype=float)
+        y = np.asarray(sub[nmse_key], dtype=float)
+
+        # log 轴：只保留 >0 的点
+        mask_pos = np.isfinite(y) & (y > 0)
+        if not np.any(mask_pos):
+            continue
+        x = x[mask_pos]
+        y = y[mask_pos]
+
+        label = f"{line_prefix}{group_key}={float(g_val):.3g}"
+        line, = ax.plot(
+            x,
+            y,
+            marker="o",
+            linewidth=1.0,
+            markersize=3,
+            label=label,
+        )
+
+        # 只在最后一个点旁边标一次数值（4 位小数）
+        x_last = x[-1]
+        y_last = y[-1]
+        ax.annotate(
+            f"{y_last:.4f}",
+            xy=(x_last, y_last),
+            xytext=(3, 0),
+            textcoords="offset points",
+            fontsize=7,
+            ha="left",
+            va="center",
+            color=line.get_color(),
+        )
+
+    ax.set_yscale("log")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+            fontsize=7,
+        )
+
+def compute_full_eval_results(
+    data_cfg: DataConfig,
+    pod_cfg: PodConfig,
+    eval_cfg: EvalConfig,
+    train_cfg: TrainConfig | None = None,
+    *,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    只做“数值实验”：线性基线 sweep + (可选) MLP sweep，
+    返回原始结果和对应的 DataFrame，不进行任何绘图或保存。
+
+    返回结构:
+    {
+        "linear": linear_results_dict,
+        "mlp": mlp_results_dict | None,
+        "df_linear": pd.DataFrame,
+        "df_mlp": pd.DataFrame | None,
+    }
+    """
+    if verbose:
+        print("=== [full-eval] compute_full_eval_results ===")
+        print("[full-eval] Running linear baseline sweep ...")
+
+    # 1) 线性基线 sweep
+    linear_results = run_linear_baseline_experiment(
+        data_cfg=data_cfg,
+        pod_cfg=pod_cfg,
+        eval_cfg=eval_cfg,
+        verbose=verbose,
+    )
+    df_linear = results_to_dataframe(linear_results)
+
+    # 2) 可选的 MLP sweep
+    mlp_results = None
+    df_mlp = None
+    if train_cfg is not None:
+        if verbose:
+            print("[full-eval] Running MLP sweep ...")
+        mlp_results = run_mlp_experiment(
+            data_cfg=data_cfg,
+            pod_cfg=pod_cfg,
+            eval_cfg=eval_cfg,
+            train_cfg=train_cfg,
+            verbose=verbose,
+        )
+        df_mlp = results_to_dataframe(mlp_results)
+
+    return {
+        "linear": linear_results,
+        "mlp": mlp_results,
+        "df_linear": df_linear,
+        "df_mlp": df_mlp,
+    }
+
+def build_eval_figures(
+    linear_results: Dict[str, Any],
+    mlp_results: Dict[str, Any] | None = None,
+    *,
+    df_linear: Any | None = None,
+    df_mlp: Any | None = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    只做“画图”：基于 eval 结果构建所有用于论文/报告的 Figure。
+
+    参数:
+    - linear_results, mlp_results: run_linear_baseline_experiment / run_mlp_experiment 的原始 dict
+    - df_linear, df_mlp: 对应的 DataFrame；若为 None 则自动通过 results_to_dataframe 构造
+
+    返回:
+    {
+        "fig_nmse_vs_mask_linear": Figure | None,
+        "fig_nmse_vs_mask_mlp": Figure | None,
+        "fig_nmse_vs_noise_linear": Figure | None,
+        "fig_nmse_vs_noise_mlp": Figure | None,
+        "fig_example_linear": Figure | None,
+        "fig_example_mlp": Figure | None,
+        "fig_examples_linear": Dict[str, List[Figure]] | None,
+        "fig_examples_mlp": Dict[str, List[Figure]] | None,
+    }
+    """
+    # 保证有 DataFrame
+    if df_linear is None:
+        df_linear = results_to_dataframe(linear_results)
+    if mlp_results is not None and df_mlp is None:
+        df_mlp = results_to_dataframe(mlp_results)
+
+    # 这四个 figure：linear/mlp × mask/noise
+    fig_mask_linear = None
+    fig_mask_mlp = None
+    fig_noise_linear = None
+    fig_noise_mlp = None
+
+    # 自动推断列名
+    mask_col, noise_col, nmse_col = _infer_keys(df_linear)
+    if verbose:
+        print(
+            "[build-figs] inferred columns from linear df: "
+            f"mask={mask_col}, noise={noise_col}, nmse={nmse_col}"
+        )
+
+    # --- 图 1：linear, x=mask_rate，按 noise 分组 ---
+    if mask_col is not None and noise_col is not None and nmse_col is not None:
+        fig_mask_linear, ax_lin = plt.subplots(1, 1, figsize=(6, 4))
+        _plot_multi_curves_on_ax(
+            df_linear,
+            ax_lin,
+            x_key=mask_col,
+            group_key=noise_col,
+            nmse_key=nmse_col,
+            line_prefix="σ=",
+        )
+        ax_lin.set_xlabel(mask_col)
+        ax_lin.set_ylabel(nmse_col)
+        ax_lin.set_title("linear: NMSE vs mask_rate (all σ)")
+        fig_mask_linear.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+
+    # --- 图 2：mlp, x=mask_rate，按 noise 分组 ---
+    if (
+        df_mlp is not None
+        and mask_col is not None
+        and noise_col is not None
+        and nmse_col is not None
+    ):
+        fig_mask_mlp, ax_mlp = plt.subplots(1, 1, figsize=(6, 4))
+        _plot_multi_curves_on_ax(
+            df_mlp,
+            ax_mlp,
+            x_key=mask_col,
+            group_key=noise_col,
+            nmse_key=nmse_col,
+            line_prefix="σ=",
+        )
+        ax_mlp.set_xlabel(mask_col)
+        ax_mlp.set_ylabel(nmse_col)
+        ax_mlp.set_title("mlp: NMSE vs mask_rate (all σ)")
+        fig_mask_mlp.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+
+    # --- 图 3：linear, x=noise_sigma，按 mask_rate 分组 ---
+    if mask_col is not None and noise_col is not None and nmse_col is not None:
+        fig_noise_linear, ax_lin_n = plt.subplots(1, 1, figsize=(6, 4))
+        _plot_multi_curves_on_ax(
+            df_linear,
+            ax_lin_n,
+            x_key=noise_col,
+            group_key=mask_col,
+            nmse_key=nmse_col,
+            line_prefix="p=",
+        )
+        ax_lin_n.set_xlabel(noise_col)
+        ax_lin_n.set_ylabel(nmse_col)
+        ax_lin_n.set_title("linear: NMSE vs noise_sigma (all p)")
+        fig_noise_linear.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+
+    # --- 图 4：mlp, x=noise_sigma，按 mask_rate 分组 ---
+    if (
+        df_mlp is not None
+        and mask_col is not None
+        and noise_col is not None
+        and nmse_col is not None
+    ):
+        fig_noise_mlp, ax_mlp_n = plt.subplots(1, 1, figsize=(6, 4))
+        _plot_multi_curves_on_ax(
+            df_mlp,
+            ax_mlp_n,
+            x_key=noise_col,
+            group_key=mask_col,
+            nmse_key=nmse_col,
+            line_prefix="p=",
+        )
+        ax_mlp_n.set_xlabel(noise_col)
+        ax_mlp_n.set_ylabel(nmse_col)
+        ax_mlp_n.set_title("mlp: NMSE vs noise_sigma (all p)")
+        fig_noise_mlp.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+
+    # ------------------------------------------------------------------
+    # 代表性四联图（单个 example_recon，用于 notebook 快速看）
+    # ------------------------------------------------------------------
+    fig_example_linear = None
+    fig_example_mlp = None
+
+    ex_lin = linear_results.get("example_recon", None)
+    if ex_lin is not None:
+        x_true = np.asarray(ex_lin["x_true"])
+        x_lin = np.asarray(ex_lin["x_lin"])
+        x_interp = np.asarray(ex_lin["x_interp"])
+
+        mask_hw = None
+        mask_map = linear_results.get("mask_hw_map", {}) or {}
+        try:
+            p = float(ex_lin["mask_rate"])
+            mask_key = f"{p:.6g}"
+            if mask_key in mask_map:
+                mask_hw = np.asarray(mask_map[mask_key], dtype=bool)
+        except Exception:
+            mask_hw = None
+
+        title = (
+            f"Linear example (frame={ex_lin['frame_idx']}, "
+            f"p={ex_lin['mask_rate']:.3g}, σ={ex_lin['noise_sigma']:.3g})"
+        )
+        fig_example_linear = _plot_recon_quadruple(
+            x_interp=x_interp,
+            x_hat=x_lin,
+            x_true=x_true,
+            mask_hw=mask_hw,
+            model_name="linear",
+            channel=0,
+            title_prefix=title,
+        )
+
+    if mlp_results is not None:
+        ex_mlp = mlp_results.get("example_recon", None)
+        if ex_mlp is not None:
+            x_true = np.asarray(ex_mlp["x_true"])
+            x_mlp = np.asarray(ex_mlp["x_mlp"])
+            x_interp = np.asarray(ex_mlp["x_interp"])
+
+            mask_hw = None
+            mask_map_mlp = mlp_results.get("mask_hw_map", {}) or {}
+            try:
+                p = float(ex_mlp["mask_rate"])
+                mask_key = f"{p:.6g}"
+                if mask_key in mask_map_mlp:
+                    mask_hw = np.asarray(mask_map_mlp[mask_key], dtype=bool)
+            except Exception:
+                mask_hw = None
+
+            title = (
+                f"MLP example (frame={ex_mlp['frame_idx']}, "
+                f"p={ex_mlp['mask_rate']:.3g}, σ={ex_mlp['noise_sigma']:.3g})"
+            )
+            fig_example_mlp = _plot_recon_quadruple(
+                x_interp=x_interp,
+                x_hat=x_mlp,
+                x_true=x_true,
+                mask_hw=mask_hw,
+                model_name="mlp",
+                channel=0,
+                title_prefix=title,
+            )
+
+    # ------------------------------------------------------------------
+    # 为每个 (p,σ) 生成多张四联图（供 run_experiment_from_yaml 批量保存）
+    # ------------------------------------------------------------------
+    fig_examples_linear: Dict[str, list[plt.Figure]] = {}
+    fig_examples_mlp: Dict[str, list[plt.Figure]] = {}
+
+    lin_examples = linear_results.get("examples", []) or []
+    lin_mask_map = linear_results.get("mask_hw_map", {}) or {}
+    if lin_examples:
+        if verbose:
+            print("[build-figs] Generating per-(p,σ) linear quadruple figures ...")
+        for ex in lin_examples:
+            p = float(ex["mask_rate"])
+            s = float(ex["noise_sigma"])
+            cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
+
+            x_true = np.asarray(ex["x_true"])
+            x_lin = np.asarray(ex["x_lin"])
+            x_interp = np.asarray(ex["x_interp"])
+
+            mask_key = f"{p:.6g}"
+            mask_hw = None
+            if mask_key in lin_mask_map:
+                mask_hw = np.asarray(lin_mask_map[mask_key], dtype=bool)
+
+            title = (
+                f"Linear (frame={ex['frame_idx']}, "
+                f"p={p:.3g}, σ={s:.3g})"
+            )
+            fig = _plot_recon_quadruple(
+                x_interp=x_interp,
+                x_hat=x_lin,
+                x_true=x_true,
+                mask_hw=mask_hw,
+                model_name="linear",
+                channel=0,
+                title_prefix=title,
+            )
+
+            fig_examples_linear.setdefault(cfg_name, []).append(fig)
+
+    if mlp_results is not None:
+        mlp_examples = mlp_results.get("examples", []) or []
+        mlp_mask_map = mlp_results.get("mask_hw_map", {}) or {}
+        if mlp_examples:
+            if verbose:
+                print("[build-figs] Generating per-(p,σ) MLP quadruple figures ...")
+            for ex in mlp_examples:
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
+                cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
+
+                x_true = np.asarray(ex["x_true"])
+                x_mlp = np.asarray(ex["x_mlp"])
+                x_interp = np.asarray(ex["x_interp"])
+
+                mask_key = f"{p:.6g}"
+                mask_hw = None
+                if mask_key in mlp_mask_map:
+                    mask_hw = np.asarray(mlp_mask_map[mask_key], dtype=bool)
+
+                title = (
+                    f"MLP (frame={ex['frame_idx']}, "
+                    f"p={p:.3g}, σ={s:.3g})"
+                )
+                fig = _plot_recon_quadruple(
+                    x_interp=x_interp,
+                    x_hat=x_mlp,
+                    x_true=x_true,
+                    mask_hw=mask_hw,
+                    model_name="mlp",
+                    channel=0,
+                    title_prefix=title,
+                )
+
+                fig_examples_mlp.setdefault(cfg_name, []).append(fig)
+
+    return {
+        "fig_nmse_vs_mask_linear": fig_mask_linear,
+        "fig_nmse_vs_mask_mlp": fig_mask_mlp,
+        "fig_nmse_vs_noise_linear": fig_noise_linear,
+        "fig_nmse_vs_noise_mlp": fig_noise_mlp,
+        "fig_example_linear": fig_example_linear,
+        "fig_example_mlp": fig_example_mlp,
+        "fig_examples_linear": fig_examples_linear or None,
+        "fig_examples_mlp": fig_examples_mlp or None,
+    }
 
 def run_build_pod_pipeline(
     data_cfg: DataConfig,
@@ -318,366 +805,83 @@ def run_full_eval_pipeline(
 ) -> Dict[str, Any]:
     """
     顶层评估入口：一行代码跑完整的小论文实验 sweep。
+
+    v1.08 起：
+    - 先调用 compute_full_eval_results 做纯数值实验（linear + 可选 mlp）
+    - 再调用 build_eval_figures 统一生成所有 Figure
+    - 返回 dict 里同时包含结果和图像句柄
     """
     if verbose:
         print("=== [full-eval] Start full evaluation pipeline ===")
 
-    # 1) 线性基线 sweep
-    if verbose:
-        print("[full-eval] Running linear baseline sweep ...")
-    linear_results = run_linear_baseline_experiment(
+    eval_results = compute_full_eval_results(
         data_cfg=data_cfg,
         pod_cfg=pod_cfg,
         eval_cfg=eval_cfg,
+        train_cfg=train_cfg,
         verbose=verbose,
     )
-    df_linear = results_to_dataframe(linear_results)
 
-    mlp_results = None
-    df_mlp = None
-
-    # 这四个 figure：linear/mlp × mask/noise
-    fig_mask_linear = None
-    fig_mask_mlp = None
-    fig_noise_linear = None
-    fig_noise_mlp = None
-
-    # 小工具：从 DataFrame 里推断列名
-    def _infer_keys(df):
-        cols = list(getattr(df, "columns", []))
-        lower = [str(c).lower() for c in cols]
-
-        def _find(pred):
-            for c, lc in zip(cols, lower, strict=False):
-                if pred(c, lc):
-                    return c
-            return None
-
-        mask_col = _find(lambda c, lc: "mask" in lc and "rate" in lc)
-        noise_col = _find(lambda c, lc: ("noise" in lc) or ("sigma" in lc))
-        nmse_col = _find(lambda c, lc: "nmse" in lc)
-        return mask_col, noise_col, nmse_col
-
-    # 小工具：在单个 ax 上画“多折线 + 末端标数值 + 右侧 legend”
-    def _plot_multi_curves_on_ax(
-        df,
-        ax: plt.Axes,
-        *,
-        x_key: str,
-        group_key: str,
-        nmse_key: str,
-        line_prefix: str,
-    ):
-        if df is None or x_key is None or group_key is None or nmse_key is None:
-            return
-
-        grouped_vals = sorted(df[group_key].unique())
-        for g_val in grouped_vals:
-            sub = df[df[group_key] == g_val].sort_values(by=x_key)
-            if sub.empty:
-                continue
-
-            x = np.asarray(sub[x_key], dtype=float)
-            y = np.asarray(sub[nmse_key], dtype=float)
-
-            # log 轴：只保留 >0 的点
-            mask_pos = np.isfinite(y) & (y > 0)
-            if not np.any(mask_pos):
-                continue
-            x = x[mask_pos]
-            y = y[mask_pos]
-
-            label = f"{line_prefix}{group_key}={float(g_val):.3g}"
-            line, = ax.plot(
-                x,
-                y,
-                marker="o",
-                linewidth=1.0,
-                markersize=3,
-                label=label,
-            )
-
-            # 只在最后一个点旁边标一次数值（4 位小数）
-            x_last = x[-1]
-            y_last = y[-1]
-            ax.annotate(
-                f"{y_last:.4f}",
-                xy=(x_last, y_last),
-                xytext=(3, 0),
-                textcoords="offset points",
-                fontsize=7,
-                ha="left",
-                va="center",
-                color=line.get_color(),
-            )
-
-        ax.set_yscale("log")
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(
-                handles,
-                labels,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
-                borderaxespad=0.0,
-                fontsize=7,
-            )
-
-    # 2) 若有 train_cfg，则跑 MLP sweep + 画多折线图
-    if train_cfg is not None:
-        if verbose:
-            print("[full-eval] Running MLP sweep ...")
-
-        mlp_results = run_mlp_experiment(
-            data_cfg=data_cfg,
-            pod_cfg=pod_cfg,
-            eval_cfg=eval_cfg,
-            train_cfg=train_cfg,
-            verbose=verbose,
-        )
-        df_mlp = results_to_dataframe(mlp_results)
-
-        mask_col, noise_col, nmse_col = _infer_keys(df_linear)
-
-        if verbose:
-            print("[full-eval] Plotting multi-line NMSE curves ...")
-            print(
-                f"[full-eval] inferred columns: "
-                f"mask={mask_col}, noise={noise_col}, nmse={nmse_col}"
-            )
-
-        # --- 图 1：linear, x=mask_rate，按 noise 分组 ---
-        if mask_col is not None and noise_col is not None and nmse_col is not None:
-            fig_mask_linear, ax_lin = plt.subplots(1, 1, figsize=(6, 4))
-            _plot_multi_curves_on_ax(
-                df_linear,
-                ax_lin,
-                x_key=mask_col,
-                group_key=noise_col,
-                nmse_key=nmse_col,
-                line_prefix="σ=",
-            )
-            ax_lin.set_xlabel(mask_col)
-            ax_lin.set_ylabel(nmse_col)
-            ax_lin.set_title("linear: NMSE vs mask_rate (all σ)")
-            fig_mask_linear.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
-
-        # --- 图 2：mlp, x=mask_rate，按 noise 分组 ---
-        if (
-            df_mlp is not None
-            and mask_col is not None
-            and noise_col is not None
-            and nmse_col is not None
-        ):
-            fig_mask_mlp, ax_mlp = plt.subplots(1, 1, figsize=(6, 4))
-            _plot_multi_curves_on_ax(
-                df_mlp,
-                ax_mlp,
-                x_key=mask_col,
-                group_key=noise_col,
-                nmse_key=nmse_col,
-                line_prefix="σ=",
-            )
-            ax_mlp.set_xlabel(mask_col)
-            ax_mlp.set_ylabel(nmse_col)
-            ax_mlp.set_title("mlp: NMSE vs mask_rate (all σ)")
-            fig_mask_mlp.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
-
-        # --- 图 3：linear, x=noise_sigma，按 mask_rate 分组 ---
-        if mask_col is not None and noise_col is not None and nmse_col is not None:
-            fig_noise_linear, ax_lin_n = plt.subplots(1, 1, figsize=(6, 4))
-            _plot_multi_curves_on_ax(
-                df_linear,
-                ax_lin_n,
-                x_key=noise_col,
-                group_key=mask_col,
-                nmse_key=nmse_col,
-                line_prefix="p=",
-            )
-            ax_lin_n.set_xlabel(noise_col)
-            ax_lin_n.set_ylabel(nmse_col)
-            ax_lin_n.set_title("linear: NMSE vs noise_sigma (all p)")
-            fig_noise_linear.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
-
-        # --- 图 4：mlp, x=noise_sigma，按 mask_rate 分组 ---
-        if (
-            df_mlp is not None
-            and mask_col is not None
-            and noise_col is not None
-            and nmse_col is not None
-        ):
-            fig_noise_mlp, ax_mlp_n = plt.subplots(1, 1, figsize=(6, 4))
-            _plot_multi_curves_on_ax(
-                df_mlp,
-                ax_mlp_n,
-                x_key=noise_col,
-                group_key=mask_col,
-                nmse_key=nmse_col,
-                line_prefix="p=",
-            )
-            ax_mlp_n.set_xlabel(noise_col)
-            ax_mlp_n.set_ylabel(nmse_col)
-            ax_mlp_n.set_title("mlp: NMSE vs noise_sigma (all p)")
-            fig_noise_mlp.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
-
-    # 3) 代表性四联图（只用于 notebook 交互，不批量保存）
-    fig_example_linear = None
-    fig_example_mlp = None
-
-    ex_lin = linear_results.get("example_recon", None)
-    if ex_lin is not None:
-        x_true = np.asarray(ex_lin["x_true"])
-        x_lin = np.asarray(ex_lin["x_lin"])
-        x_interp = np.asarray(ex_lin["x_interp"])
-
-        mask_hw = None
-        mask_map = linear_results.get("mask_hw_map", {}) or {}
-        try:
-            p = float(ex_lin["mask_rate"])
-            mask_key = f"{p:.6g}"
-            if mask_key in mask_map:
-                mask_hw = np.asarray(mask_map[mask_key], dtype=bool)
-        except Exception:
-            mask_hw = None
-
-        title = (
-            f"Linear example (frame={ex_lin['frame_idx']}, "
-            f"p={ex_lin['mask_rate']:.3g}, σ={ex_lin['noise_sigma']:.3g})"
-        )
-        fig_example_linear = _plot_recon_quadruple(
-            x_interp=x_interp,
-            x_hat=x_lin,
-            x_true=x_true,
-            mask_hw=mask_hw,
-            model_name="linear",
-            channel=0,
-            title_prefix=title,
-        )
-
-    if mlp_results is not None:
-        ex_mlp = mlp_results.get("example_recon", None)
-        if ex_mlp is not None:
-            x_true = np.asarray(ex_mlp["x_true"])
-            x_mlp = np.asarray(ex_mlp["x_mlp"])
-            x_interp = np.asarray(ex_mlp["x_interp"])
-
-            mask_hw = None
-            mask_map_mlp = mlp_results.get("mask_hw_map", {}) or {}
-            try:
-                p = float(ex_mlp["mask_rate"])
-                mask_key = f"{p:.6g}"
-                if mask_key in mask_map_mlp:
-                    mask_hw = np.asarray(mask_map_mlp[mask_key], dtype=bool)
-            except Exception:
-                mask_hw = None
-
-            title = (
-                f"MLP example (frame={ex_mlp['frame_idx']}, "
-                f"p={ex_mlp['mask_rate']:.3g}, σ={ex_mlp['noise_sigma']:.3g})"
-            )
-            fig_example_mlp = _plot_recon_quadruple(
-                x_interp=x_interp,
-                x_hat=x_mlp,
-                x_true=x_true,
-                mask_hw=mask_hw,
-                model_name="mlp",
-                channel=0,
-                title_prefix=title,
-            )
-
-    # 4) 为每个 (p,σ) 生成多张四联图（供 run_experiment_from_yaml 保存）
-    fig_examples_linear: Dict[str, list[plt.Figure]] = {}
-    fig_examples_mlp: Dict[str, list[plt.Figure]] = {}
-
-    lin_examples = linear_results.get("examples", []) or []
-    lin_mask_map = linear_results.get("mask_hw_map", {}) or {}
-    if lin_examples:
-        if verbose:
-            print("[full-eval] Generating per-(p,σ) linear quadruple figures ...")
-        for ex in lin_examples:
-            p = float(ex["mask_rate"])
-            s = float(ex["noise_sigma"])
-            cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
-
-            x_true = np.asarray(ex["x_true"])
-            x_lin = np.asarray(ex["x_lin"])
-            x_interp = np.asarray(ex["x_interp"])
-
-            mask_key = f"{p:.6g}"
-            mask_hw = None
-            if mask_key in lin_mask_map:
-                mask_hw = np.asarray(lin_mask_map[mask_key], dtype=bool)
-
-            title = (
-                f"Linear (frame={ex['frame_idx']}, "
-                f"p={p:.3g}, σ={s:.3g})"
-            )
-            fig = _plot_recon_quadruple(
-                x_interp=x_interp,
-                x_hat=x_lin,
-                x_true=x_true,
-                mask_hw=mask_hw,
-                model_name="linear",
-                channel=0,
-                title_prefix=title,
-            )
-
-            fig_examples_linear.setdefault(cfg_name, []).append(fig)
-
-    if mlp_results is not None:
-        mlp_examples = mlp_results.get("examples", []) or []
-        mlp_mask_map = mlp_results.get("mask_hw_map", {}) or {}
-        if mlp_examples:
-            if verbose:
-                print("[full-eval] Generating per-(p,σ) MLP quadruple figures ...")
-            for ex in mlp_examples:
-                p = float(ex["mask_rate"])
-                s = float(ex["noise_sigma"])
-                cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
-
-                x_true = np.asarray(ex["x_true"])
-                x_mlp = np.asarray(ex["x_mlp"])
-                x_interp = np.asarray(ex["x_interp"])
-
-                mask_key = f"{p:.6g}"
-                mask_hw = None
-                if mask_key in mlp_mask_map:
-                    mask_hw = np.asarray(mlp_mask_map[mask_key], dtype=bool)
-
-                title = (
-                    f"MLP (frame={ex['frame_idx']}, "
-                    f"p={p:.3g}, σ={s:.3g})"
-                )
-                fig = _plot_recon_quadruple(
-                    x_interp=x_interp,
-                    x_hat=x_mlp,
-                    x_true=x_true,
-                    mask_hw=mask_hw,
-                    model_name="mlp",
-                    channel=0,
-                    title_prefix=title,
-                )
-
-                fig_examples_mlp.setdefault(cfg_name, []).append(fig)
+    figs = build_eval_figures(
+        linear_results=eval_results["linear"],
+        mlp_results=eval_results.get("mlp"),
+        df_linear=eval_results.get("df_linear"),
+        df_mlp=eval_results.get("df_mlp"),
+        verbose=verbose,
+    )
 
     if verbose:
         print("[full-eval] Done.")
 
-    return {
-        "linear": linear_results,
-        "mlp": mlp_results,
-        "df_linear": df_linear,
-        "df_mlp": df_mlp,
-        "fig_nmse_vs_mask_linear": fig_mask_linear,
-        "fig_nmse_vs_mask_mlp": fig_mask_mlp,
-        "fig_nmse_vs_noise_linear": fig_noise_linear,
-        "fig_nmse_vs_noise_mlp": fig_noise_mlp,
-        "fig_example_linear": fig_example_linear,
-        "fig_example_mlp": fig_example_mlp,
-        "fig_examples_linear": fig_examples_linear or None,
-        "fig_examples_mlp": fig_examples_mlp or None,
+    # 汇总：保持原有字段命名，兼容 quick_full_experiment / run_experiment_from_yaml
+    result: Dict[str, Any] = {
+        "linear": eval_results["linear"],
+        "mlp": eval_results.get("mlp"),
+        "df_linear": eval_results.get("df_linear"),
+        "df_mlp": eval_results.get("df_mlp"),
     }
+    result.update(figs)
+    return result
+
+def quick_figs_from_saved_experiment(
+    base_dir: str | Path,
+    experiment_name: str,
+    *,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    从磁盘已保存的实验结果目录中恢复所有“结果级别”的 Figure，
+    不再重新跑任何训练 / 评估。
+
+    约定:
+        - base_dir/experiment_name 目录下存在由 save_full_experiment_results
+          写出的 linear_results.json / mlp_results.json / *.csv 等文件。
+    """
+    from .eval.reports import load_full_experiment_results
+
+    if verbose:
+        print(
+            f"[quick-figs] Loading numeric results from "
+            f"{Path(base_dir) / experiment_name} ..."
+        )
+
+    loaded = load_full_experiment_results(
+        base_dir=base_dir,
+        experiment_name=experiment_name,
+    )
+
+    figs = build_eval_figures(
+        linear_results=loaded["linear"],
+        mlp_results=loaded.get("mlp"),
+        df_linear=loaded.get("df_linear"),
+        df_mlp=loaded.get("df_mlp"),
+        verbose=verbose,
+    )
+
+    if verbose:
+        print("[quick-figs] Figures rebuilt from saved numeric results.")
+
+    return figs
 
 def quick_build_pod(
     nc_path: str | Path,
@@ -1456,118 +1660,277 @@ def quick_full_experiment(
 
     return result
 
-def run_experiment_from_yaml(
-    yaml_path: str | Path,
+def extract_and_save_figures(
+    eval_results: Dict[str, Any],
+    figs: Dict[str, Any],
+    exp_dir: Path,
     *,
-    experiment_name: str | None = None,
-    save_root: str | Path = "artifacts/experiments",
-    generate_report: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    yaml_path = Path(yaml_path)
-    if experiment_name is None:
-        experiment_name = yaml_path.stem
+    """
+    从 eval 结果与 Figure bundle 中“抽出”需要保存的图像/原始数据并写入 exp_dir。
 
-    if verbose:
-        print(f"[yaml-experiment] Loading configs from {yaml_path} ...")
+    - 负责保存 4 张全局 NMSE 曲线图 (PNG)
+    - 负责保存代表性 example 四联图 (PNG + npz)
+    - 负责保存 per-(p,σ) 四联图 (PNG + npz)
+    - 负责保存 per-(p,σ) 多尺度 summary 图 (PNG)
 
-    data_cfg, pod_cfg, eval_cfg, train_cfg = load_experiment_yaml(yaml_path)
-
-    if verbose:
-        print("[yaml-experiment] Running full evaluation pipeline ...")
-
-    all_result = run_full_eval_pipeline(
-        data_cfg=data_cfg,
-        pod_cfg=pod_cfg,
-        eval_cfg=eval_cfg,
-        train_cfg=train_cfg,
-        verbose=verbose,
-    )
-
-    save_root = Path(save_root)
-    exp_dir = save_root / experiment_name
+    返回:
+        fig_paths: { key(str) -> Path 或 List[Path] }
+        其中 key 的命名保持与旧版 run_experiment_from_yaml 大体兼容,
+        新增:
+        - "example_linear_npz" / "example_mlp_npz"
+        - "examples_linear_npz/{cfg_name}"
+        - "examples_mlp_npz/{cfg_name}"
+    """
     ensure_dir(exp_dir)
-
     fig_paths: Dict[str, Any] = {}
 
-    # === 保存 4 张全局 NMSE 曲线图，直接放在 exp_dir 根目录 ===
-    fig_mask_linear = all_result.get("fig_nmse_vs_mask_linear", None)
+    # 方便后面取 examples / mask
+    lin_res = eval_results.get("linear", None)
+    mlp_res = eval_results.get("mlp", None)
+
+    lin_examples_all = (lin_res or {}).get("examples", []) or []
+    mlp_examples_all = (mlp_res or {}).get("examples", []) or []
+
+    lin_mask_map = (lin_res or {}).get("mask_hw_map", {}) or {}
+    mlp_mask_map = (mlp_res or {}).get("mask_hw_map", {}) or {}
+
+    def _build_ex_index(examples: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """按 (p,σ) -> cfg_name 分组 examples."""
+        idx: dict[str, list[dict[str, Any]]] = {}
+        for ex in examples:
+            try:
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
+            except Exception:
+                continue
+            cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
+            idx.setdefault(cfg_name, []).append(ex)
+        return idx
+
+    lin_ex_index = _build_ex_index(lin_examples_all)
+    mlp_ex_index = _build_ex_index(mlp_examples_all)
+
+    # === 1) 4 张全局 NMSE 曲线图 ===
+    fig_mask_linear = figs.get("fig_nmse_vs_mask_linear", None)
     if fig_mask_linear is not None:
         p = exp_dir / "nmse_vs_mask_linear.png"
         fig_mask_linear.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_mask_linear"] = p
+        # 给 report.md 也塞一个通用键（用 linear 版）
+        fig_paths.setdefault("fig_nmse_vs_mask", p)
         if verbose:
-            print(f"[yaml-experiment] Saved figure: {p}")
+            print(f"[yaml-extract] Saved figure: {p}")
 
-    fig_mask_mlp = all_result.get("fig_nmse_vs_mask_mlp", None)
+    fig_mask_mlp = figs.get("fig_nmse_vs_mask_mlp", None)
     if fig_mask_mlp is not None:
         p = exp_dir / "nmse_vs_mask_mlp.png"
         fig_mask_mlp.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_mask_mlp"] = p
         if verbose:
-            print(f"[yaml-experiment] Saved figure: {p}")
+            print(f"[yaml-extract] Saved figure: {p}")
 
-    fig_noise_linear = all_result.get("fig_nmse_vs_noise_linear", None)
+    fig_noise_linear = figs.get("fig_nmse_vs_noise_linear", None)
     if fig_noise_linear is not None:
         p = exp_dir / "nmse_vs_noise_linear.png"
         fig_noise_linear.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_noise_linear"] = p
+        fig_paths.setdefault("fig_nmse_vs_noise", p)
         if verbose:
-            print(f"[yaml-experiment] Saved figure: {p}")
+            print(f"[yaml-extract] Saved figure: {p}")
 
-    fig_noise_mlp = all_result.get("fig_nmse_vs_noise_mlp", None)
+    fig_noise_mlp = figs.get("fig_nmse_vs_noise_mlp", None)
     if fig_noise_mlp is not None:
         p = exp_dir / "nmse_vs_noise_mlp.png"
         fig_noise_mlp.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_noise_mlp"] = p
         if verbose:
-            print(f"[yaml-experiment] Saved figure: {p}")
+            print(f"[yaml-extract] Saved figure: {p}")
 
-    # === 不再保存 example_linear / example_mlp 到磁盘 ===
-    # （fig_example_* 仍然保留在 all_result 里用于交互式 notebook 使用）
+    # === 2) 代表性 example 四联图（各 1 张），PNG + npz，供 report.md / debug 使用 ===
+    fig_example_linear = figs.get("fig_example_linear", None)
+    if fig_example_linear is not None:
+        p_png = exp_dir / "example_linear.png"
+        fig_example_linear.savefig(p_png, dpi=300, bbox_inches="tight")
+        fig_paths["fig_example_linear"] = p_png
+        if verbose:
+            print(f"[yaml-extract] Saved example_linear PNG: {p_png}")
 
-    # 四联图 per-(p,σ)：依然按配置名单独保存，便于局部排查
-    fig_examples_linear = all_result.get("fig_examples_linear") or {}
-    fig_examples_mlp = all_result.get("fig_examples_mlp") or {}
+        ex_lin = (lin_res or {}).get("example_recon", None)
+        if ex_lin is not None:
+            # 从 meta 里恢复 mask
+            mask_hw = None
+            try:
+                p_val = float(ex_lin["mask_rate"])
+                mask_key = f"{p_val:.6g}"
+                if mask_key in lin_mask_map:
+                    mask_hw = np.asarray(lin_mask_map[mask_key], dtype=bool)
+            except Exception:
+                pass
+
+            p_npz = exp_dir / "example_linear.npz"
+            kwargs = dict(
+                x_true=np.asarray(ex_lin["x_true"]),
+                x_hat=np.asarray(ex_lin["x_lin"]),
+                x_interp=np.asarray(ex_lin["x_interp"]),
+                mask_rate=float(ex_lin.get("mask_rate", 0.0)),
+                noise_sigma=float(ex_lin.get("noise_sigma", 0.0)),
+                frame_idx=int(ex_lin.get("frame_idx", -1)),
+                model_type="linear",
+            )
+            if mask_hw is not None:
+                kwargs["mask_hw"] = mask_hw
+            np.savez_compressed(p_npz, **kwargs)
+            fig_paths["example_linear_npz"] = p_npz
+            if verbose:
+                print(f"[yaml-extract] Saved example_linear NPZ: {p_npz}")
+
+    fig_example_mlp = figs.get("fig_example_mlp", None)
+    if fig_example_mlp is not None:
+        p_png = exp_dir / "example_mlp.png"
+        fig_example_mlp.savefig(p_png, dpi=300, bbox_inches="tight")
+        fig_paths["fig_example_mlp"] = p_png
+        if verbose:
+            print(f"[yaml-extract] Saved example_mlp PNG: {p_png}")
+
+        ex_mlp = (mlp_res or {}).get("example_recon", None)
+        if ex_mlp is not None:
+            mask_hw = None
+            try:
+                p_val = float(ex_mlp["mask_rate"])
+                mask_key = f"{p_val:.6g}"
+                if mask_key in mlp_mask_map:
+                    mask_hw = np.asarray(mlp_mask_map[mask_key], dtype=bool)
+            except Exception:
+                pass
+
+            p_npz = exp_dir / "example_mlp.npz"
+            kwargs = dict(
+                x_true=np.asarray(ex_mlp["x_true"]),
+                x_hat=np.asarray(ex_mlp["x_mlp"]),
+                x_interp=np.asarray(ex_mlp["x_interp"]),
+                mask_rate=float(ex_mlp.get("mask_rate", 0.0)),
+                noise_sigma=float(ex_mlp.get("noise_sigma", 0.0)),
+                frame_idx=int(ex_mlp.get("frame_idx", -1)),
+                model_type="mlp",
+            )
+            if mask_hw is not None:
+                kwargs["mask_hw"] = mask_hw
+            np.savez_compressed(p_npz, **kwargs)
+            fig_paths["example_mlp_npz"] = p_npz
+            if verbose:
+                print(f"[yaml-extract] Saved example_mlp NPZ: {p_npz}")
+
+    # === 3) per-(p,σ) 四联图：PNG + npz ===
+    fig_examples_linear = figs.get("fig_examples_linear") or {}
+    fig_examples_mlp = figs.get("fig_examples_mlp") or {}
 
     if fig_examples_linear or fig_examples_mlp:
         if verbose:
-            print("[yaml-experiment] Saving per-(p,σ) quadruple figures ...")
+            print("[yaml-extract] Saving per-(p,σ) quadruple figures and npz ...")
 
-    all_cfg_names = set(fig_examples_linear.keys()) | set(fig_examples_mlp.keys())
+    all_cfg_names = set(fig_examples_linear.keys()) | set(fig_examples_mlp.keys()) \
+        | set(lin_ex_index.keys()) | set(mlp_ex_index.keys())
 
     for cfg_name in sorted(all_cfg_names):
         cfg_dir = exp_dir / cfg_name
         ensure_dir(cfg_dir)
 
+        # --- 3.1 linear: PNG ---
         lin_figs = fig_examples_linear.get(cfg_name, []) or []
         for idx, fig in enumerate(lin_figs):
-            p = cfg_dir / f"linear_example_{idx:02d}.png"
-            fig.savefig(p, dpi=300, bbox_inches="tight")
-            fig_paths.setdefault(f"fig_examples_linear/{cfg_name}", [])
-            fig_paths[f"fig_examples_linear/{cfg_name}"].append(p)
+            p_png = cfg_dir / f"linear_example_{idx:02d}.png"
+            fig.savefig(p_png, dpi=300, bbox_inches="tight")
+            key = f"fig_examples_linear/{cfg_name}"
+            fig_paths.setdefault(key, [])
+            fig_paths[key].append(p_png)
             if verbose:
-                print(f"[yaml-experiment] Saved figure: {p}")
+                print(f"[yaml-extract] Saved figure: {p_png}")
 
+        # --- 3.2 linear: NPZ (原始数据) ---
+        lin_ex_list = lin_ex_index.get(cfg_name, []) or []
+        for idx, ex in enumerate(lin_ex_list):
+            # 对应 p,σ 的 mask
+            mask_hw = None
+            try:
+                p_val = float(ex["mask_rate"])
+                mask_key = f"{p_val:.6g}"
+                if mask_key in lin_mask_map:
+                    mask_hw = np.asarray(lin_mask_map[mask_key], dtype=bool)
+            except Exception:
+                pass
+
+            p_npz = cfg_dir / f"linear_example_{idx:02d}.npz"
+            kwargs = dict(
+                x_true=np.asarray(ex["x_true"]),
+                x_hat=np.asarray(ex["x_lin"]),
+                x_interp=np.asarray(ex["x_interp"]),
+                mask_rate=float(ex.get("mask_rate", 0.0)),
+                noise_sigma=float(ex.get("noise_sigma", 0.0)),
+                frame_idx=int(ex.get("frame_idx", -1)),
+                model_type="linear",
+            )
+            if mask_hw is not None:
+                kwargs["mask_hw"] = mask_hw
+            np.savez_compressed(p_npz, **kwargs)
+
+            key = f"examples_linear_npz/{cfg_name}"
+            fig_paths.setdefault(key, [])
+            fig_paths[key].append(p_npz)
+            if verbose:
+                print(f"[yaml-extract] Saved linear NPZ: {p_npz}")
+
+        # --- 3.3 mlp: PNG ---
         mlp_figs = fig_examples_mlp.get(cfg_name, []) or []
         for idx, fig in enumerate(mlp_figs):
-            p = cfg_dir / f"mlp_example_{idx:02d}.png"
-            fig.savefig(p, dpi=300, bbox_inches="tight")
-            fig_paths.setdefault(f"fig_examples_mlp/{cfg_name}", [])
-            fig_paths[f"fig_examples_mlp/{cfg_name}"].append(p)
+            p_png = cfg_dir / f"mlp_example_{idx:02d}.png"
+            fig.savefig(p_png, dpi=300, bbox_inches="tight")
+            key = f"fig_examples_mlp/{cfg_name}"
+            fig_paths.setdefault(key, [])
+            fig_paths[key].append(p_png)
             if verbose:
-                print(f"[yaml-experiment] Saved figure: {p}")
+                print(f"[yaml-extract] Saved figure: {p_png}")
 
-    # ===== 多尺度 “四合一” 图：linear 和 mlp 分开画（按每个 (p,σ)） =====
-    lin_res = all_result.get("linear", None)
-    mlp_res = all_result.get("mlp", None)
+        # --- 3.4 mlp: NPZ ---
+        mlp_ex_list = mlp_ex_index.get(cfg_name, []) or []
+        for idx, ex in enumerate(mlp_ex_list):
+            mask_hw = None
+            try:
+                p_val = float(ex["mask_rate"])
+                mask_key = f"{p_val:.6g}"
+                if mask_key in mlp_mask_map:
+                    mask_hw = np.asarray(mlp_mask_map[mask_key], dtype=bool)
+            except Exception:
+                pass
 
-    if lin_res is not None and mlp_res is not None:
-        lin_entries = lin_res.get("entries", []) or []
-        mlp_entries = mlp_res.get("entries", []) or []
+            p_npz = cfg_dir / f"mlp_example_{idx:02d}.npz"
+            kwargs = dict(
+                x_true=np.asarray(ex["x_true"]),
+                x_hat=np.asarray(ex["x_mlp"]),
+                x_interp=np.asarray(ex["x_interp"]),
+                mask_rate=float(ex.get("mask_rate", 0.0)),
+                noise_sigma=float(ex.get("noise_sigma", 0.0)),
+                frame_idx=int(ex.get("frame_idx", -1)),
+                model_type="mlp",
+            )
+            if mask_hw is not None:
+                kwargs["mask_hw"] = mask_hw
+            np.savez_compressed(p_npz, **kwargs)
 
+            key = f"examples_mlp_npz/{cfg_name}"
+            fig_paths.setdefault(key, [])
+            fig_paths[key].append(p_npz)
+            if verbose:
+                print(f"[yaml-extract] Saved mlp NPZ: {p_npz}")
+
+    # === 4) per-(p,σ) 多尺度 summary 图 ===
+    lin_entries = lin_res.get("entries", []) if lin_res is not None else []
+    mlp_entries = mlp_res.get("entries", []) if mlp_res is not None else []
+
+    if lin_entries or mlp_entries:
         if verbose:
-            print("[yaml-experiment] Generating multiscale summary figures for each (p,σ) ...")
+            print("[yaml-extract] Generating multiscale summary figures for each (p,σ) ...")
 
         def _build_index(entries):
             m = {}
@@ -1581,8 +1944,8 @@ def run_experiment_from_yaml(
         mlp_idx = _build_index(mlp_entries)
 
         energy_cum = (
-            mlp_res.get("meta", {}).get("energy_cum")
-            or lin_res.get("meta", {}).get("energy_cum")
+            (mlp_res or {}).get("meta", {}).get("energy_cum")
+            or (lin_res or {}).get("meta", {}).get("energy_cum")
         )
 
         all_ps = sorted(set(lin_idx.keys()) | set(mlp_idx.keys()))
@@ -1606,10 +1969,13 @@ def run_experiment_from_yaml(
                 )
                 out_lin = cfg_dir / "multiscale_linear.png"
                 fig_lin.savefig(out_lin, dpi=300, bbox_inches="tight")
-                fig_paths.setdefault(f"multiscale_linear/{cfg_name}", [])
-                fig_paths[f"multiscale_linear/{cfg_name}"].append(out_lin)
+                key = f"multiscale_linear/{cfg_name}"
+                fig_paths.setdefault(key, [])
+                fig_paths[key].append(out_lin)
+                # 拿第一张 linear 多尺度图给 report.md 用
+                fig_paths.setdefault("fig_multiscale_example", out_lin)
                 if verbose:
-                    print(f"[yaml-experiment] Saved multiscale linear: {out_lin}")
+                    print(f"[yaml-extract] Saved multiscale linear: {out_lin}")
 
             # MLP 模型的多尺度图
             if entry_mlp is not None:
@@ -1622,22 +1988,112 @@ def run_experiment_from_yaml(
                 )
                 out_mlp = cfg_dir / "multiscale_mlp.png"
                 fig_mlp.savefig(out_mlp, dpi=300, bbox_inches="tight")
-                fig_paths.setdefault(f"multiscale_mlp/{cfg_name}", [])
-                fig_paths[f"multiscale_mlp/{cfg_name}"].append(out_mlp)
+                key = f"multiscale_mlp/{cfg_name}"
+                fig_paths.setdefault(key, [])
+                fig_paths[key].append(out_mlp)
                 if verbose:
-                    print(f"[yaml-experiment] Saved multiscale mlp: {out_mlp}")
+                    print(f"[yaml-extract] Saved multiscale mlp: {out_mlp}")
 
-    # 保存数值结果（JSON / CSV 等）
-    saved_paths = save_full_experiment_results(
-        all_result,
+    return fig_paths
+
+def run_experiment_from_yaml(
+    yaml_path: str | Path,
+    *,
+    experiment_name: str | None = None,
+    save_root: str | Path = "artifacts/experiments",
+    generate_report: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    从 YAML 配置运行一轮完整实验，并将结果与图像全部落盘。
+
+    v1.08 结构：
+    1) compute_full_eval_results -> eval_results (只含 linear/mlp/df_*)
+    2) build_eval_figures        -> figs (只含 Figure 对象)
+    3) extract_and_save_figures  -> fig_paths (图像路径)
+    4) save_full_experiment_results(eval_results, ...) -> numeric_paths (JSON/CSV)
+    5) 将 numeric_paths + fig_paths 合并写入 all_result['saved_paths']
+       供 generate_experiment_report_md 使用。
+    """
+    yaml_path = Path(yaml_path)
+    if experiment_name is None:
+        experiment_name = yaml_path.stem
+
+    if verbose:
+        print(f"[yaml-experiment] Loading configs from {yaml_path} ...")
+
+    data_cfg, pod_cfg, eval_cfg, train_cfg = load_experiment_yaml(yaml_path)
+
+    if verbose:
+        print("[yaml-experiment] Running full evaluation (compute only) ...")
+
+    # 1) 只做数值实验
+    eval_results = compute_full_eval_results(
+        data_cfg=data_cfg,
+        pod_cfg=pod_cfg,
+        eval_cfg=eval_cfg,
+        train_cfg=train_cfg,
+        verbose=verbose,
+    )
+
+    save_root = Path(save_root)
+    exp_dir = save_root / experiment_name
+    ensure_dir(exp_dir)
+
+    # 2) 画出所有需要的 Figure（仅在内存中）
+    if verbose:
+        print("[yaml-experiment] Building figures from eval results ...")
+    figs = build_eval_figures(
+        linear_results=eval_results["linear"],
+        mlp_results=eval_results.get("mlp"),
+        df_linear=eval_results.get("df_linear"),
+        df_mlp=eval_results.get("df_mlp"),
+        verbose=verbose,
+    )
+
+    # 3) 保存所有图像到磁盘
+    if verbose:
+        print(f"[yaml-experiment] Saving figures under {exp_dir} ...")
+    fig_paths = extract_and_save_figures(
+        eval_results=eval_results,
+        figs=figs,
+        exp_dir=exp_dir,
+        verbose=verbose,
+    )
+
+    # 4) 保存数值结果（JSON / CSV 等）——不再把 Figure 塞进保存用 dict
+    if verbose:
+        print("[yaml-experiment] Saving numeric results (JSON/CSV) ...")
+    from .eval.reports import save_full_experiment_results  # 避免循环导入顶部
+
+    numeric_paths = save_full_experiment_results(
+        eval_results,
         base_dir=save_root,
         experiment_name=experiment_name,
     )
-    saved_paths.update(fig_paths)
-    all_result["saved_paths"] = saved_paths
 
+    saved_paths = {}
+    saved_paths.update(numeric_paths)
+    saved_paths.update(fig_paths)
+
+    # 5) 组装 all_result：给后续 report.md 使用
+    all_result: Dict[str, Any] = {
+        "linear": eval_results["linear"],
+        "mlp": eval_results.get("mlp"),
+        "df_linear": eval_results.get("df_linear"),
+        "df_mlp": eval_results.get("df_mlp"),
+        "saved_paths": saved_paths,
+        "exp_dir": exp_dir,
+        "yaml_path": yaml_path,
+    }
+
+    # 6) （可选）生成 report.md
     report_path = None
     if generate_report:
+        if verbose:
+            print("[yaml-experiment] Generating report.md ...")
+        from .eval.reports import generate_experiment_report_md
+
         report_path = generate_experiment_report_md(
             all_result,
             out_path=exp_dir / "report.md",

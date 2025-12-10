@@ -121,6 +121,26 @@ def save_results_csv(df: pd.DataFrame, path: Path | str) -> None:
     df.to_csv(path, index=False)
 
 
+def _strip_heavy_fields(result: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """
+    从单个 model 结果 dict 中移除体积巨大的字段（如 examples / example_recon），
+    只保留 entries + meta 等数值型摘要，避免 JSON 爆炸到上百 MB。
+
+    若传入 None，则原样返回 None。
+    """
+    if result is None:
+        return None
+
+    # 浅拷贝顶层，避免原 dict 被就地修改
+    out = dict(result)
+
+    # 这里视你后续需求可以继续加别的 heavy 字段
+    out.pop("examples", None)
+    out.pop("example_recon", None)
+
+    return out
+
+
 def save_full_experiment_results(
     all_result: Dict[str, Any],
     base_dir: Path | str,
@@ -129,35 +149,39 @@ def save_full_experiment_results(
     """
     将一次完整实验（linear + mlp）的结果全部保存下来，便于后续复查。
 
-    约定 all_result 的结构为 run_full_eval_pipeline / quick_full_experiment 返回的形式：
+    v1.08 说明：
+    - 这里的 all_result 推荐传入“数值结果 dict”，即 compute_full_eval_results 的返回：
         {
             "linear": {...},
             "mlp": {... or None},
             "df_linear": DataFrame,
             "df_mlp": DataFrame or None,
-            ...
         }
-
-    保存内容：
-    - {base_dir}/{experiment_name}/linear_results.json
-    - {base_dir}/{experiment_name}/mlp_results.json (若存在)
-    - {base_dir}/{experiment_name}/linear_results.csv
-    - {base_dir}/{experiment_name}/mlp_results.csv (若存在)
+    - 为避免 JSON 体积过大，在保存 JSON 时会自动剥离 examples / example_recon 等大字段，
+      只保留 entries + meta 等摘要数据。
+    - DataFrame 仍然完整保存为 CSV。
+    最终会在 {base_dir}/{experiment_name} 下创建：
+        - linear_results.json
+        - mlp_results.json        (若存在)
+        - linear_results.csv
+        - mlp_results.csv         (若存在)
     """
     base_dir = Path(base_dir) / experiment_name
     base_dir.mkdir(parents=True, exist_ok=True)
 
     paths: Dict[str, Path] = {}
 
-    # 1) JSON 原始结果
-    linear_res = all_result.get("linear", None)
+    # 1) JSON 原始结果（已瘦身）
+    linear_res_full = all_result.get("linear", None)
+    linear_res = _strip_heavy_fields(linear_res_full)
     if linear_res is not None:
         p_json = base_dir / "linear_results.json"
         with p_json.open("w", encoding="utf-8") as f:
             json.dump(linear_res, f, indent=2, ensure_ascii=False)
         paths["linear_json"] = p_json
 
-    mlp_res = all_result.get("mlp", None)
+    mlp_res_full = all_result.get("mlp", None)
+    mlp_res = _strip_heavy_fields(mlp_res_full)
     if mlp_res is not None:
         p_json = base_dir / "mlp_results.json"
         with p_json.open("w", encoding="utf-8") as f:
@@ -178,6 +202,75 @@ def save_full_experiment_results(
         paths["mlp_csv"] = p_csv
 
     return paths
+
+
+def load_full_experiment_results(
+    base_dir: Path | str,
+    experiment_name: str | None = None,
+) -> Dict[str, Any]:
+    """
+    从磁盘加载一次完整实验（linear + mlp）的数值结果，供后续绘图 / 报告使用。
+
+    使用约定与 save_full_experiment_results 保持一致：
+    - 若 experiment_name 不为 None，则结果目录为 base_dir/experiment_name
+    - 若 experiment_name 为 None，则 base_dir 本身就是单次实验目录
+
+    预期文件结构:
+    - {exp_dir}/linear_results.json
+    - {exp_dir}/mlp_results.json          (若存在)
+    - {exp_dir}/linear_results.csv
+    - {exp_dir}/mlp_results.csv           (若存在)
+
+    返回:
+    {
+        "exp_dir": Path,
+        "linear": Dict[str, Any] | None,
+        "mlp": Dict[str, Any] | None,
+        "df_linear": pd.DataFrame | None,
+        "df_mlp": pd.DataFrame | None,
+    }
+    """
+    base_dir = Path(base_dir)
+    if experiment_name is not None:
+        exp_dir = base_dir / experiment_name
+    else:
+        exp_dir = base_dir
+
+    if not exp_dir.exists():
+        raise FileNotFoundError(f"Experiment directory not found: {exp_dir}")
+
+    linear_res: Dict[str, Any] | None = None
+    mlp_res: Dict[str, Any] | None = None
+    df_lin = None
+    df_mlp = None
+
+    # JSON
+    p_lin_json = exp_dir / "linear_results.json"
+    if p_lin_json.exists():
+        with p_lin_json.open("r", encoding="utf-8") as f:
+            linear_res = json.load(f)
+
+    p_mlp_json = exp_dir / "mlp_results.json"
+    if p_mlp_json.exists():
+        with p_mlp_json.open("r", encoding="utf-8") as f:
+            mlp_res = json.load(f)
+
+    # CSV
+    p_lin_csv = exp_dir / "linear_results.csv"
+    if p_lin_csv.exists():
+        df_lin = pd.read_csv(p_lin_csv)
+
+    p_mlp_csv = exp_dir / "mlp_results.csv"
+    if p_mlp_csv.exists():
+        df_mlp = pd.read_csv(p_mlp_csv)
+
+    return {
+        "exp_dir": exp_dir,
+        "linear": linear_res,
+        "mlp": mlp_res,
+        "df_linear": df_lin,
+        "df_mlp": df_mlp,
+    }
 
 # ----------------------------------------------------------------------
 # 2. Markdown 实验报告生成
