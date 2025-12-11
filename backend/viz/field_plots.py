@@ -2,6 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from pathlib import Path
 from ..dataio.io_utils import ensure_dir
 from typing import Dict
@@ -116,8 +117,17 @@ def plot_recon_quadruple(
     title: str | None = None,
     cmap: str = "RdBu_r",
 ) -> plt.Figure:
-    """绘制 input / output / target / error 的四联图，并在 input 上标采样点。"""
+    """
+    绘制 input / output / target / error 的四联图，并在 input 上标采样点。
 
+    - 对 input/output/target 做「减 target 空间均值」的中心化，只用于可视化，
+      让背景接近 0（白色），突出扰动结构；
+    - 主场色标按 target 扰动的分布设定，对称于 0；
+    - 误差色标不再按“自己最大值”算，而是与主场共用同一尺度（同一帧内），
+      这样同一帧上不同模型的误差可直接拿来比较。
+    """
+
+    # ---------- 数据预处理 ----------
     x_in = _to_2d(x_input_hw)
     x_out = _to_2d(x_output_hw)
     x_tg = _to_2d(x_target_hw)
@@ -127,25 +137,38 @@ def plot_recon_quadruple(
     else:
         x_err = _to_2d(x_error_hw)
 
+    # 只用于可视化的中心化：围绕 target 均值的扰动
+    mu_tg = float(np.mean(x_tg))
+    x_in_c = x_in - mu_tg
+    x_out_c = x_out - mu_tg
+    x_tg_c = x_tg - mu_tg
+
     fields = [
-        ("Input (observed)", x_in),
-        ("Output (reconstructed)", x_out),
-        ("Target (reference)", x_tg),
+        ("Input (observed)", x_in_c),
+        ("Output (reconstructed)", x_out_c),
+        ("Target (reference)", x_tg_c),
         ("Error (output - target)", x_err),
     ]
 
-    # 统一主场色标
-    vals = np.concatenate([f.ravel() for _, f in fields[:3]], axis=0)
-    vmin_main = float(vals.min())
-    vmax_main = float(vals.max())
+    # ---------- 主场色标：target 扰动 + 对称于 0 ----------
+    vals_tg = x_tg_c.ravel()
+    # 稍微用个稳健分位数，防止极端点把色标拉爆
+    max_abs_main = float(np.percentile(np.abs(vals_tg), 99.5))
+    if max_abs_main == 0.0:
+        max_abs_main = 1.0
+    vmin_main, vmax_main = -max_abs_main, max_abs_main
 
-    # 误差用对称色标
-    err_abs = float(np.max(np.abs(x_err))) or 1.0
-    vmin_err, vmax_err = -err_abs, err_abs
+    # ---------- 误差色标：跟主场用同一尺度（单帧统一标尺） ----------
+    # 你也可以改成 factor * max_abs_main，比如 1.5 * max_abs_main
+    err_scale = 1.0
+    max_abs_err = max_abs_main * err_scale
+    vmin_err, vmax_err = -max_abs_err, max_abs_err
 
-    fig, axes = plt.subplots(1, 4, figsize=(14, 3))
+    # ---------- 上面一行：四个等高子图 ----------
+    fig, axes = plt.subplots(1, 4, figsize=(12, 2.4))
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.78, bottom=0.32, wspace=0.25)
+
     ims = []
-
     for ax, (name, field) in zip(axes, fields, strict=False):
         if name.startswith("Error"):
             im = ax.imshow(
@@ -168,10 +191,10 @@ def plot_recon_quadruple(
         ax.set_xticks([])
         ax.set_yticks([])
 
-    # === 在 input 子图上标出采样点 ===
+    # ---------- 在 input 子图上标采样点 ----------
     if mask_hw is not None:
         mask_hw = np.asarray(mask_hw, dtype=bool)
-        yy, xx = np.where(mask_hw)      # 注意：yy 是行，xx 是列
+        yy, xx = np.where(mask_hw)
         axes[0].scatter(
             xx,
             yy,
@@ -182,30 +205,30 @@ def plot_recon_quadruple(
             zorder=2,
         )
 
-    # 统一 colorbar（主场一个，误差一个）
-    cbar_main = fig.colorbar(
-        ims[0],
-        ax=axes[:3],
-        orientation="horizontal",
-        fraction=0.046,
-        pad=0.10,
-    )
-    cbar_main.ax.set_xlabel("Field value", fontsize=8)
+    # ---------- 底部两条短而细的 colorbar ----------
+    # 主场 colorbar：挂在第 2 个子图下面
+    pos_main = axes[1].get_position()
+    cbar_width = pos_main.width * 0.75
+    cbar_height = pos_main.height * 0.25
+    cbar_left = pos_main.x0 + (pos_main.width - cbar_width) / 2
+    cbar_bottom = pos_main.y0 - 0.75 * pos_main.height
 
-    cbar_err = fig.colorbar(
-        ims[3],
-        ax=axes[3],
-        orientation="horizontal",
-        fraction=0.046,
-        pad=0.10,
-    )
-    cbar_err.ax.set_xlabel("Error", fontsize=8)
+    cax_main = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+    cbar_main = fig.colorbar(ims[1], cax=cax_main, orientation="horizontal")
 
+    # 误差 colorbar：挂在第 4 个子图下面，使用「统一误差尺度」
+    pos_err = axes[3].get_position()
+    cbar_width_err = pos_err.width * 0.75
+    cbar_height_err = pos_err.height * 0.25
+    cbar_left_err = pos_err.x0 + (pos_err.width - cbar_width_err) / 2
+    cbar_bottom_err = pos_err.y0 - 0.75 * pos_err.height
+
+    cax_err = fig.add_axes([cbar_left_err, cbar_bottom_err, cbar_width_err, cbar_height_err])
+    cbar_err = fig.colorbar(ims[3], cax=cax_err, orientation="horizontal")
+
+    # ---------- 标题 ----------
     if title:
-        fig.suptitle(title, fontsize=11)
-        fig.tight_layout(rect=[0, 0, 1, 0.92])
-    else:
-        fig.tight_layout()
+        fig.suptitle(title, fontsize=12, y=0.96)
 
     return fig
 
