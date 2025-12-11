@@ -7,7 +7,7 @@ POD 能量谱相关可视化 + 模态自身可视化。
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-
+import matplotlib.gridspec as gridspec
 
 def plot_energy_spectrum(
     singular_values: np.ndarray,
@@ -186,6 +186,7 @@ def plot_pod_mode_groups(
     group_size: int = 16,
     channel: int = 0,
     cmap: str = "RdBu_r",
+    robust_percentile: float = 99.5,  # 新增：稳健缩放的分位数（0~100）
 ) -> plt.Figure:
     """
     将前 max_modes 个 POD 模态按 group_size 分组叠加可视化。
@@ -198,6 +199,13 @@ def plot_pod_mode_groups(
         4: q49 + ... + q64
 
     这里的 qk 是第 k 个 POD 空间模态（Ur 的第 k 列，reshape 成 H×W×C 后取指定 channel）。
+
+    参数
+    ----
+    robust_percentile:
+        用于确定全局色标上限的绝对值分位数（例如 99.5 表示 |值| 的 99.5% 分位数），
+        用来抑制少量极端 outlier 对色标的“拉爆”效应。
+        若不想用稳健缩放，可以传 100.0 退化为全局 max_abs。
 
     返回
     ----
@@ -231,33 +239,93 @@ def plot_pod_mode_groups(
         field = vec_group.reshape(H, W, C)[..., channel]
         group_fields.append(field)
 
-    # 统一色标
-    max_abs = max(float(np.max(np.abs(f))) for f in group_fields) or 1.0
+    # ========= 统一色标（改成稳健缩放） =========
+    # 把所有 panel 拼在一起，按绝对值分位数定 vmax
+    all_vals = np.stack(group_fields, axis=0)  # [n_groups, H, W]
+    abs_vals = np.abs(all_vals)
 
-    # 画成一行 n_groups 子图（一般也就 3~4 组）
-    fig, axes = plt.subplots(1, n_groups, figsize=(4 * n_groups, 3))
-    if n_groups == 1:
-        axes = [axes]
+    # 允许通过 robust_percentile 调节：比如 99, 99.5, 99.9 ...
+    p = float(robust_percentile)
+    if not (0 < p <= 100):
+        raise ValueError("robust_percentile 必须在 (0, 100] 内")
+    max_abs = float(np.percentile(abs_vals, p))
+    if max_abs == 0.0:
+        max_abs = 1.0  # 全 0 的退路，防止除以 0
 
-    for ax, field, (start, end) in zip(axes, group_fields, group_ranges, strict=False):
+    vmin, vmax = -max_abs, max_abs
+
+    # ========= 布局：每行最多 4 个 panel =========
+    max_cols = 4
+    n_cols = min(n_groups, max_cols)
+    n_rows = (n_groups + max_cols - 1) // max_cols  # 画图的行数（不含 colorbar）
+
+    # 每行不用太高，长条数据更适合扁一点
+    row_height = 1.8          # 每行子图大概 1.8 inch 高
+    extra_bottom = 0.8        # 给 colorbar 和 x 轴留一点空间
+    fig = plt.figure(figsize=(4 * n_cols, row_height * n_rows + extra_bottom))
+
+    # 上面 n_rows 行放子图，最下面一行放一个细 colorbar
+    cbar_height = 0.08        # colorbar 相当于 0.08 行的高度，很薄
+    gs = gridspec.GridSpec(
+        n_rows + 1,
+        n_cols,
+        height_ratios=[1] * n_rows + [cbar_height],
+        hspace=0.4,           # 行间距，适当留一点但不要太大
+    )
+
+    # ---- 子图 axes ----
+    axes = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            ax = fig.add_subplot(gs[i, j])
+            axes.append(ax)
+
+    axes = np.array(axes)
+    axes_used = axes[:n_groups]
+
+    last_im = None
+    for ax, field, (start, end) in zip(axes_used, group_fields, group_ranges, strict=False):
         im = ax.imshow(
             field,
             origin="lower",
             cmap=cmap,
-            vmin=-max_abs,
-            vmax=max_abs,
+            vmin=vmin,
+            vmax=vmax,
         )
-        # +1 变成人类序号
+        last_im = im
         k1, k2 = start + 1, end
         ax.set_title(f"Modes {k1}–{k2} sum")
         ax.set_xticks([])
         ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
+    # 隐藏多余子图
+    for ax in axes[n_groups:]:
+        ax.set_visible(False)
+
+    # ---- colorbar：细 + 不占满整行宽度 ----
+    if last_im is not None:
+        # n_cols >= 3 时，用中间几列，让 colorbar 稍微短一点
+        if n_cols >= 3:
+            cax = fig.add_subplot(gs[-1, 1:-1])   # 去掉最左最右一列
+        else:
+            cax = fig.add_subplot(gs[-1, :])      # 列数少时就全宽
+
+        cbar = fig.colorbar(last_im, cax=cax, orientation="horizontal")
+        cbar.ax.tick_params(labelsize=8)
+
+    # ---- 标题与整体排版 ----
     fig.suptitle(
         f"POD mode groups (sum of {group_size} modes per panel, up to {K})",
-        fontsize=12,
+        fontsize=20,
+        y=0.98,   # 明确指定标题位置，避免被后面调整挤乱
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+    # 用 subplots_adjust 控整体边距，比 tight_layout 更可控
+    fig.subplots_adjust(
+        top=0.90,
+        bottom=0.18,   # 给 colorbar 和标签留出空间
+        left=0.05,
+        right=0.98,
+    )
 
     return fig

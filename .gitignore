@@ -2,3 +2,5 @@ data
 all_code.*
 __pycache__
 artifacts
+*.pptx
+*.pdf

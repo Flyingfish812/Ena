@@ -94,9 +94,11 @@ def plot_error_map(
     t = _to_2d(x_true_hw)
     h = _to_2d(x_hat_hw)
     err = np.abs(h - t)
+    err_abs = float(np.max(np.abs(err))) or 1.0
+    vmin_err, vmax_err = -err_abs, err_abs
 
     fig, ax = plt.subplots(1, 1, figsize=(4, 3))
-    im = ax.imshow(err, origin="lower", cmap="RdBu_r")
+    im = ax.imshow(err, origin="lower", cmap="RdBu_r", vmin=vmin_err, vmax=vmax_err)
     ax.set_title(title or "Absolute error")
     ax.set_xticks([])
     ax.set_yticks([])
