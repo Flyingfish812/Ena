@@ -89,10 +89,12 @@ def default_eval_config() -> EvalConfig:
         "M": (16, 64),
         "H": (64, 128),
     }
+    centered_pod = True
 
     return EvalConfig(
         mask_rates=mask_rates,
         noise_sigmas=noise_sigmas,
         pod_bands=pod_bands,
+        centered_pod=centered_pod,
         save_dir=Path("artifacts/eval"),
     )

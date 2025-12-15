@@ -296,6 +296,8 @@ def run_linear_baseline_experiment(
                 # mask + 噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
                 y_noisy = add_gaussian_noise(y, sigma=noise_sigma)
+                if eval_cfg.centered_pod:
+                    y_noisy -= apply_mask_flat(mean_flat, mask_flat)
 
                 # 线性最小二乘在 POD 空间求系数
                 a_lin = solve_pod_coeffs_least_squares(y_noisy, Ur_masked)  # [r_eff]
@@ -612,6 +614,8 @@ def run_mlp_experiment(
                 # 观测 + 测试噪声
                 y = apply_mask_flat(x_flat, mask_flat)  # [M]
                 y_noisy = add_gaussian_noise(y, sigma=noise_sigma)
+                if eval_cfg.centered_pod:
+                    y_noisy -= apply_mask_flat(mean_flat, mask_flat)
 
                 # MLP 预测系数
                 y_tensor = torch.from_numpy(y_noisy.astype(np.float32)).to(device)

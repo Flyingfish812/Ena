@@ -18,6 +18,7 @@ eval:
     H1: [80, 96]
     H2: [96, 112]
     H3: [112, 128]
+  centered_pod: true
   save_dir: artifacts/eval
 train:
   mask_rate: 0.0004

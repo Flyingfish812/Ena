@@ -597,6 +597,7 @@ def quick_test_linear_baseline(
     save_dir: str | Path | None = None,
     fig_prefix: str = "quick_linear",
     save_dpi: int = 300,
+    centered_pod: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -718,6 +719,9 @@ def quick_test_linear_baseline(
 
     y = apply_mask_flat(x_flat, mask_flat)
     y_noisy = add_gaussian_noise(y, sigma=noise_sigma, seed=0)
+    if centered_pod:
+        mean_obs = apply_mask_flat(mean_flat, mask_flat)
+        y_noisy = y_noisy - mean_obs
 
     # 6) 线性最小二乘重建 + 误差
     if verbose:
@@ -842,6 +846,7 @@ def quick_test_mlp_baseline(
     save_dir: str | Path | None = None,
     fig_prefix: str = "quick_mlp",
     save_dpi: int = 300,
+    centered_pod: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -974,6 +979,9 @@ def quick_test_mlp_baseline(
 
     y_true = apply_mask_flat(x_flat, mask_flat)        # [M]
     y_true_noisy = add_gaussian_noise(y_true, sigma=noise_sigma, seed=0)
+    if centered_pod:
+        mean_obs = apply_mask_flat(mean_flat, mask_flat)
+        y_true_noisy = y_true_noisy - mean_obs
 
     Ur_masked = Ur_eff[mask_flat, :]                   # [M,r_eff]
     a_lin = solve_pod_coeffs_least_squares(y_true_noisy, Ur_masked)
@@ -1023,6 +1031,9 @@ def quick_test_mlp_baseline(
 
     y_frame = apply_mask_flat(x_flat, mask_flat)               # [M]
     y_frame_noisy = add_gaussian_noise(y_frame, sigma=noise_sigma, seed=123)
+    if centered_pod:
+        mean_obs = apply_mask_flat(mean_flat, mask_flat)
+        y_frame_noisy = y_frame_noisy - mean_obs
 
     y_tensor = torch.from_numpy(y_frame_noisy.astype(np.float32)).to(device)
     with torch.no_grad():

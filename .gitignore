@@ -1,6 +1,8 @@
 data
 all_code.*
+all_skeleton.*
 __pycache__
 artifacts
 *.pptx
 *.pdf
+instructions*

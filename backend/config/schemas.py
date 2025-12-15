@@ -102,4 +102,5 @@ class EvalConfig:
     mask_rates: Sequence[float]
     noise_sigmas: Sequence[float]
     pod_bands: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    centered_pod: bool = True
     save_dir: Path = Path("artifacts/eval")

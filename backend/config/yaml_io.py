@@ -143,12 +143,14 @@ def load_experiment_yaml(
             name: (int(v[0]), int(v[1]))
             for name, v in pod_bands_raw.items()
         }
+    centered_pod = bool(eval_raw.get("centered_pod", True))
 
     eval_save_dir = Path(eval_raw.get("save_dir", "artifacts/eval"))
     eval_cfg = EvalConfig(
         mask_rates=mask_rates,
         noise_sigmas=noise_sigmas,
         pod_bands=pod_bands,
+        centered_pod=centered_pod,
         save_dir=eval_save_dir,
     )
 
