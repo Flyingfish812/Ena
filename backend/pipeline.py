@@ -32,7 +32,11 @@ from .viz.curves import plot_eval_nmse_curves
 from .viz.fourier_plots import (
     plot_kstar_heatmap,
     plot_fourier_band_nrmse_curves,
+    plot_kstar_curve_from_entry,
+    plot_spatial_fourier_band_decomposition,
+    plot_energy_spectrum_with_band_edges,
 )
+
 from .models.train_mlp import train_mlp_on_observations
 import numpy as np
 import json
@@ -111,187 +115,294 @@ def build_eval_figures(
 ) -> Dict[str, Any]:
     """
     只做“画图”：基于 eval 结果构建所有用于论文/报告的 Figure。
-
-    这里不再直接用 plt 写细节，而是转调 viz 层中更细分的工具：
-    - 全局 NMSE 曲线 -> backend.viz.curves.plot_eval_nmse_curves
-    - 单个 / 多个 example 四联图 -> backend.viz.field_plots.plot_recon_quadruple
-
-    参数:
-    - linear_results, mlp_results: run_linear_baseline_experiment / run_mlp_experiment 的原始 dict
-    - df_linear, df_mlp: 对应的 DataFrame；若为 None 则自动通过 results_to_dataframe 构造
-
-    返回:
-    {
-        "fig_nmse_vs_mask_linear": Figure | None,
-        "fig_nmse_vs_mask_mlp": Figure | None,
-        "fig_nmse_vs_noise_linear": Figure | None,
-        "fig_nmse_vs_noise_mlp": Figure | None,
-        "fig_example_linear": Figure | None,
-        "fig_example_mlp": Figure | None,
-        "fig_examples_linear": Dict[str, List[Figure]] | None,
-        "fig_examples_mlp": Dict[str, List[Figure]] | None,
-    }
     """
-    # ========= 0) 保证有 DataFrame =========
-    if df_linear is None:
-        df_linear = results_to_dataframe(linear_results)
-    if mlp_results is not None and df_mlp is None:
-        df_mlp = results_to_dataframe(mlp_results)
+    # -----------------------------
+    # 0) helpers（只在本函数内部用）
+    # -----------------------------
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg)
 
-    # ========= 1) 全局 NMSE 曲线：交给 viz.curves =========
-    curve_figs = {}
-    try:
-        curve_figs = plot_eval_nmse_curves(df_linear, df_mlp)
-        if verbose:
-            print("[build-figs] Global NMSE curves built via viz.curves.plot_eval_nmse_curves")
-    except Exception as e:
-        if verbose:
-            print(f"[build-figs] WARNING: failed to build global NMSE curves: {e}")
+    def _safe_build(name: str, fn):
+        try:
+            out = fn()
+            if out is not None:
+                _log(f"[build-figs] {name}")
+            return out
+        except Exception as e:
+            _log(f"[build-figs] WARNING: {name} failed: {e}")
+            return None
+
+    def _cfg_name(p: float, s: float) -> str:
+        return f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
+
+    def _parse_cfg_name(cfg_name: str) -> tuple[float | None, float | None]:
+        try:
+            p_part, s_part = cfg_name.split("_sigma")
+            p_str = p_part[1:].replace("-", ".")
+            s_str = s_part.replace("-", ".")
+            return float(p_str), float(s_str)
+        except Exception:
+            return None, None
+
+    def _ensure_df(results: Dict[str, Any], df: Any | None) -> Any:
+        return df if df is not None else results_to_dataframe(results)
+
+    def _get_examples(results: Dict[str, Any] | None) -> list[Dict[str, Any]]:
+        if results is None:
+            return []
+        return results.get("examples", []) or []
+
+    def _index_entries(results: Dict[str, Any] | None) -> Dict[tuple[float, float], Dict[str, Any]]:
+        idx: Dict[tuple[float, float], Dict[str, Any]] = {}
+        if results is None:
+            return idx
+        for e in (results.get("entries", []) or []):
+            try:
+                p = float(e.get("mask_rate"))
+                s = float(e.get("noise_sigma"))
+            except Exception:
+                continue
+            idx[(p, s)] = e
+        return idx
+
+    def _first_example_by_cfg(examples: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        m: Dict[str, Dict[str, Any]] = {}
+        for ex in examples or []:
+            try:
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
+            except Exception:
+                continue
+            cfg = _cfg_name(p, s)
+            if cfg not in m:
+                m[cfg] = ex
+        return m
+
+    def _plot_quadruple_from_ex(ex: Dict[str, Any], *, model_key: str, title_prefix: str) -> Any | None:
+        """
+        model_key: "x_lin" or "x_mlp"
+        """
+        try:
+            p = float(ex["mask_rate"])
+            s = float(ex["noise_sigma"])
+            x_true = np.asarray(ex["x_true"])
+            x_out = np.asarray(ex[model_key])
+            x_in = np.asarray(ex["x_interp"])
+            mask_hw = np.asarray(ex["mask_hw"]) if "mask_hw" in ex else None
+            title = f"{title_prefix} (frame={ex['frame_idx']}, p={p:.3g}, σ={s:.3g})"
+            return plot_recon_quadruple(
+                x_input_hw=x_in,
+                x_output_hw=x_out,
+                x_target_hw=x_true,
+                mask_hw=mask_hw,
+                title=title,
+            )
+        except Exception as e:
+            _log(f"[build-figs] WARNING: quadruple plot failed ({title_prefix}): {e}")
+            return None
+
+    def _band_names_from_df(df: Any) -> tuple[str, ...]:
+        try:
+            cols = [c for c in df.columns if str(c).startswith("fourier_band_nrmse_")]
+            names = tuple(str(c).replace("fourier_band_nrmse_", "") for c in cols)
+            return names if len(names) > 0 else ("L", "M", "H")
+        except Exception:
+            return ("L", "M", "H")
+
+    # -----------------------------
+    # 1) DataFrame 准备
+    # -----------------------------
+    df_linear = _ensure_df(linear_results, df_linear)
+    df_mlp = _ensure_df(mlp_results, df_mlp) if mlp_results is not None else None
+
+    # -----------------------------
+    # 2) 全局 NMSE 曲线
+    # -----------------------------
+    curve_figs = _safe_build(
+        "Global NMSE curves built via viz.curves.plot_eval_nmse_curves",
+        lambda: plot_eval_nmse_curves(df_linear, df_mlp),
+    ) or {}
 
     fig_mask_linear = curve_figs.get("fig_nmse_vs_mask_linear")
     fig_mask_mlp = curve_figs.get("fig_nmse_vs_mask_mlp")
     fig_noise_linear = curve_figs.get("fig_nmse_vs_noise_linear")
     fig_noise_mlp = curve_figs.get("fig_nmse_vs_noise_mlp")
 
-    # ========= 2) 单个代表性 example 的四联图 =========
+    # -----------------------------
+    # 3) 单个代表性 example 四联图
+    # -----------------------------
     fig_example_linear = None
-    fig_example_mlp = None
-
-    # ---- linear example ----
     ex_lin = linear_results.get("example_recon", None)
     if ex_lin is not None:
-        x_true = np.asarray(ex_lin["x_true"])
-        x_lin = np.asarray(ex_lin["x_lin"])
-        x_interp = np.asarray(ex_lin["x_interp"])
-        mask_hw = np.asarray(ex_lin["mask_hw"]) if "mask_hw" in ex_lin else None
+        fig_example_linear = _plot_quadruple_from_ex(ex_lin, model_key="x_lin", title_prefix="Linear example")
 
-        title = (
-            f"Linear example (frame={ex_lin['frame_idx']}, "
-            f"p={ex_lin['mask_rate']:.3g}, σ={ex_lin['noise_sigma']:.3g})"
-        )
-        fig_example_linear = plot_recon_quadruple(
-            x_input_hw=x_interp,
-            x_output_hw=x_lin,
-            x_target_hw=x_true,
-            mask_hw=mask_hw,
-            title=title,
-        )
-
-    # ---- mlp example ----
+    fig_example_mlp = None
     if mlp_results is not None:
         ex_mlp = mlp_results.get("example_recon", None)
         if ex_mlp is not None:
-            x_true = np.asarray(ex_mlp["x_true"])
-            x_mlp = np.asarray(ex_mlp["x_mlp"])
-            x_interp = np.asarray(ex_mlp["x_interp"])
-            mask_hw = np.asarray(ex_mlp["mask_hw"]) if "mask_hw" in ex_mlp else None
+            fig_example_mlp = _plot_quadruple_from_ex(ex_mlp, model_key="x_mlp", title_prefix="MLP example")
 
-            title = (
-                f"MLP example (frame={ex_mlp['frame_idx']}, "
-                f"p={ex_mlp['mask_rate']:.3g}, σ={ex_mlp['noise_sigma']:.3g})"
-            )
-            fig_example_mlp = plot_recon_quadruple(
-                x_input_hw=x_interp,
-                x_output_hw=x_mlp,
-                x_target_hw=x_true,
-                mask_hw=mask_hw,
-                title=title,
-            )
+    # -----------------------------
+    # 4) per-(p,σ) 四联图（按 cfg 分组）
+    # -----------------------------
+    lin_examples = _get_examples(linear_results)
+    mlp_examples = _get_examples(mlp_results)
 
-    # ========= 3) 为每个 (p,σ) 生成多张四联图 =========
     fig_examples_linear: Dict[str, list[Any]] = {}
     fig_examples_mlp: Dict[str, list[Any]] = {}
 
-    # ---- linear: per-(p,σ) ----
-    lin_examples = linear_results.get("examples", []) or []
     if lin_examples:
-        if verbose:
-            print("[build-figs] Generating per-(p,σ) linear quadruple figures via viz.field_plots ...")
-
+        _log("[build-figs] Generating per-(p,σ) linear quadruple figures via viz.field_plots ...")
         for ex in lin_examples:
-            p = float(ex["mask_rate"])
-            s = float(ex["noise_sigma"])
-            cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
+            try:
+                p = float(ex["mask_rate"]); s = float(ex["noise_sigma"])
+                cfg = _cfg_name(p, s)
+            except Exception:
+                continue
+            fig = _plot_quadruple_from_ex(ex, model_key="x_lin", title_prefix="Linear")
+            if fig is not None:
+                fig_examples_linear.setdefault(cfg, []).append(fig)
 
-            x_true = np.asarray(ex["x_true"])
-            x_lin = np.asarray(ex["x_lin"])
-            x_interp = np.asarray(ex["x_interp"])
-            mask_hw = np.asarray(ex["mask_hw"]) if "mask_hw" in ex else None
+    if mlp_examples:
+        _log("[build-figs] Generating per-(p,σ) MLP quadruple figures via viz.field_plots ...")
+        for ex in mlp_examples:
+            try:
+                p = float(ex["mask_rate"]); s = float(ex["noise_sigma"])
+                cfg = _cfg_name(p, s)
+            except Exception:
+                continue
+            fig = _plot_quadruple_from_ex(ex, model_key="x_mlp", title_prefix="MLP")
+            if fig is not None:
+                fig_examples_mlp.setdefault(cfg, []).append(fig)
 
-            title = (
-                f"Linear (frame={ex['frame_idx']}, "
-                f"p={p:.3g}, σ={s:.3g})"
-            )
-            fig = plot_recon_quadruple(
-                x_input_hw=x_interp,
-                x_output_hw=x_lin,
-                x_target_hw=x_true,
-                mask_hw=mask_hw,
-                title=title,
-            )
-
-            fig_examples_linear.setdefault(cfg_name, []).append(fig)
-
-    # ---- mlp: per-(p,σ) ----
-    if mlp_results is not None:
-        mlp_examples = mlp_results.get("examples", []) or []
-        if mlp_examples:
-            if verbose:
-                print("[build-figs] Generating per-(p,σ) MLP quadruple figures via viz.field_plots ...")
-
-            for ex in mlp_examples:
-                p = float(ex["mask_rate"])
-                s = float(ex["noise_sigma"])
-                cfg_name = f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
-
-                x_true = np.asarray(ex["x_true"])
-                x_mlp = np.asarray(ex["x_mlp"])
-                x_interp = np.asarray(ex["x_interp"])
-                mask_hw = np.asarray(ex["mask_hw"]) if "mask_hw" in ex else None
-
-                title = (
-                    f"MLP (frame={ex['frame_idx']}, "
-                    f"p={p:.3g}, σ={s:.3g})"
-                )
-                fig = plot_recon_quadruple(
-                    x_input_hw=x_interp,
-                    x_output_hw=x_mlp,
-                    x_target_hw=x_true,
-                    mask_hw=mask_hw,
-                    title=title,
-                )
-
-                fig_examples_mlp.setdefault(cfg_name, []).append(fig)
-
-    # ========= 4) Fourier 多尺度可视化（Batch 4） =========
-    fig_kstar_linear = None
+    # -----------------------------
+    # 5) Fourier 多尺度可视化（汇总 + per-cfg 解释图）
+    # -----------------------------
+    # 5.1 k* heatmap
+    fig_kstar_linear = _safe_build(
+        "k* heatmap (linear)",
+        lambda: plot_kstar_heatmap(df_linear, df_mlp, model="linear", title="k* heatmap"),
+    )
     fig_kstar_mlp = None
-    fourier_curve_figs: Dict[str, Any] = {}
+    if mlp_results is not None:
+        fig_kstar_mlp = _safe_build(
+            "k* heatmap (mlp)",
+            lambda: plot_kstar_heatmap(df_linear, df_mlp, model="mlp", title="k* heatmap"),
+        )
 
-    # (1) k* heatmap（如果 df 里有 k_star 列才会画出来）
-    try:
-        fig_kstar_linear = plot_kstar_heatmap(df_linear, df_mlp, model="linear", title="k* heatmap")
-        if mlp_results is not None:
-            fig_kstar_mlp = plot_kstar_heatmap(df_linear, df_mlp, model="mlp", title="k* heatmap")
-    except Exception as e:
-        if verbose:
-            print(f"[build-figs] WARNING: failed to build k* heatmap: {e}")
+    # 5.2 Fourier band NRMSE curves（L/M/H 随 p/σ 的曲线）
+    band_names = _band_names_from_df(df_linear)
+    fourier_curve_figs = _safe_build(
+        "Fourier band curves",
+        lambda: plot_fourier_band_nrmse_curves(df_linear, df_mlp, band_names=band_names),
+    ) or {}
 
-    # (2) Fourier band NRMSE 曲线（自动从 df 列名推断 band 名）
-    try:
-        band_cols = [c for c in df_linear.columns if c.startswith("fourier_band_nrmse_")]
-        band_names = tuple(c.replace("fourier_band_nrmse_", "") for c in band_cols)
-        if len(band_names) == 0:
-            # 兜底（防止 df 没有列或 band 命名不同）
-            band_names = ("L", "M", "H")
+    # 5.3 per-(p,σ) Fourier 解释图（k* 曲线 + 空间分解）
+    lin_entry_idx = _index_entries(linear_results)
+    mlp_entry_idx = _index_entries(mlp_results)
+    lin_ex_first = _first_example_by_cfg(lin_examples)
+    mlp_ex_first = _first_example_by_cfg(mlp_examples)
 
-        fourier_curve_figs = plot_fourier_band_nrmse_curves(df_linear, df_mlp, band_names=band_names)
-    except Exception as e:
-        if verbose:
-            print(f"[build-figs] WARNING: failed to build Fourier band curves: {e}")
-        fourier_curve_figs = {}
+    all_cfg_names = set(lin_ex_first.keys()) | set(mlp_ex_first.keys())
+    for (p, s) in set(lin_entry_idx.keys()) | set(mlp_entry_idx.keys()):
+        all_cfg_names.add(_cfg_name(p, s))
 
+    fig_fourier_kstar_curves_linear: Dict[str, Any] = {}
+    fig_fourier_kstar_curves_mlp: Dict[str, Any] = {}
+    fig_fourier_decomp_linear: Dict[str, Any] = {}
+    fig_fourier_decomp_mlp: Dict[str, Any] = {}
 
+    for cfg in sorted(all_cfg_names):
+        p_val, s_val = _parse_cfg_name(cfg)
+        if p_val is None or s_val is None:
+            continue
+
+        # k* curve
+        e_lin = lin_entry_idx.get((p_val, s_val))
+        if e_lin and e_lin.get("fourier_curve") is not None:
+            fig = _safe_build(
+                f"k* curve (linear) {cfg}",
+                lambda e=e_lin: plot_kstar_curve_from_entry(e, title_prefix="NRMSE(k) [linear]"),
+            )
+            if fig is not None:
+                fig_fourier_kstar_curves_linear[cfg] = fig
+
+        e_mlp = mlp_entry_idx.get((p_val, s_val))
+        if e_mlp and e_mlp.get("fourier_curve") is not None:
+            fig = _safe_build(
+                f"k* curve (mlp) {cfg}",
+                lambda e=e_mlp: plot_kstar_curve_from_entry(e, title_prefix="NRMSE(k) [mlp]"),
+            )
+            if fig is not None:
+                fig_fourier_kstar_curves_mlp[cfg] = fig
+
+        # spatial decomposition（需要 example + k_edges）
+        ex_lin = lin_ex_first.get(cfg)
+        if ex_lin is not None and e_lin is not None:
+            k_edges = (e_lin.get("fourier_curve") or {}).get("k_edges")
+            if k_edges is not None:
+                fig = _safe_build(
+                    f"Fourier decomp (linear) {cfg}",
+                    lambda ex=ex_lin, ke=k_edges: plot_spatial_fourier_band_decomposition(
+                        x_true_hw=np.asarray(ex["x_true"]),
+                        x_pred_hw=np.asarray(ex["x_lin"]),
+                        k_edges=ke,
+                        band_names=("L", "M", "H"),
+                        channel=0,
+                        title=f"Fourier bands spatial view (linear) | {cfg}",
+                    ),
+                )
+                if fig is not None:
+                    fig_fourier_decomp_linear[cfg] = fig
+
+        ex_mlp = mlp_ex_first.get(cfg)
+        if ex_mlp is not None and e_mlp is not None:
+            k_edges = (e_mlp.get("fourier_curve") or {}).get("k_edges")
+            if k_edges is not None:
+                fig = _safe_build(
+                    f"Fourier decomp (mlp) {cfg}",
+                    lambda ex=ex_mlp, ke=k_edges: plot_spatial_fourier_band_decomposition(
+                        x_true_hw=np.asarray(ex["x_true"]),
+                        x_pred_hw=np.asarray(ex["x_mlp"]),
+                        k_edges=ke,
+                        band_names=("L", "M", "H"),
+                        channel=0,
+                        title=f"Fourier bands spatial view (mlp) | {cfg}",
+                    ),
+                )
+                if fig is not None:
+                    fig_fourier_decomp_mlp[cfg] = fig
+
+    # 5.4 全局 band 定义图（E(k)+edges）：依赖 meta（有则画，没有就 None）
+    def _pick_meta() -> Dict[str, Any]:
+        meta = (mlp_results.get("meta", {}) if mlp_results is not None else {}) or {}
+        if not meta:
+            meta = (linear_results.get("meta", {}) or {})
+        return meta
+
+    fig_energy_spectrum = _safe_build(
+        "Energy spectrum definition figure",
+        lambda: (
+            plot_energy_spectrum_with_band_edges(
+                k_centers=np.asarray(_pick_meta().get("fourier_k_centers")),
+                energy_k=np.asarray(_pick_meta().get("fourier_energy_k")),
+                k_edges=_pick_meta().get("fourier_k_edges"),
+                band_names=("L", "M", "H"),
+                title="Energy spectrum E(k) with band edges (definition of L/M/H)",
+            )
+            if (
+                _pick_meta().get("fourier_k_centers") is not None
+                and _pick_meta().get("fourier_energy_k") is not None
+                and _pick_meta().get("fourier_k_edges") is not None
+            )
+            else None
+        ),
+    )
+
+    # -----------------------------
+    # 6) assemble return
+    # -----------------------------
     return {
         "fig_nmse_vs_mask_linear": fig_mask_linear,
         "fig_nmse_vs_mask_mlp": fig_mask_mlp,
@@ -303,6 +414,11 @@ def build_eval_figures(
         "fig_examples_mlp": fig_examples_mlp or None,
         "fig_kstar_linear": fig_kstar_linear,
         "fig_kstar_mlp": fig_kstar_mlp,
+        "fig_fourier_kstar_curves_linear": fig_fourier_kstar_curves_linear or None,
+        "fig_fourier_kstar_curves_mlp": fig_fourier_kstar_curves_mlp or None,
+        "fig_fourier_decomp_linear": fig_fourier_decomp_linear or None,
+        "fig_fourier_decomp_mlp": fig_fourier_decomp_mlp or None,
+        "fig_fourier_energy_spectrum": fig_energy_spectrum,
         **fourier_curve_figs,
     }
 
@@ -1736,6 +1852,67 @@ def extract_and_save_figures(
         fig_paths[k] = p
         if verbose:
             print(f"[yaml-extract] Saved figure: {p}")
+    
+    # 5.3 per-(p,σ) Fourier 解释图保存
+    # 5.3.1 全局定义图：E(k) + edges
+    fig_energy = figs.get("fig_fourier_energy_spectrum", None)
+    if fig_energy is not None:
+        out = exp_dir / "fourier_energy_spectrum_definition.png"
+        fig_energy.savefig(out, dpi=300, bbox_inches="tight")
+        fig_paths["fig_fourier_energy_spectrum"] = out
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {out}")
+
+    # 5.3.2 per-cfg：k* 曲线解释图
+    curves_lin = figs.get("fig_fourier_kstar_curves_linear") or {}
+    curves_mlp = figs.get("fig_fourier_kstar_curves_mlp") or {}
+
+    # 5.3.3 per-cfg：空间域 L/M/H 分解解释图
+    decomp_lin = figs.get("fig_fourier_decomp_linear") or {}
+    decomp_mlp = figs.get("fig_fourier_decomp_mlp") or {}
+
+    all_cfg = set(curves_lin.keys()) | set(curves_mlp.keys()) | set(decomp_lin.keys()) | set(decomp_mlp.keys())
+
+    if all_cfg and verbose:
+        print("[yaml-extract] Saving per-(p,σ) Fourier explanatory figures ...")
+
+    for cfg_name in sorted(all_cfg):
+        cfg_dir = exp_dir / cfg_name
+        ensure_dir(cfg_dir)
+
+        # k* curve
+        fig = curves_lin.get(cfg_name, None)
+        if fig is not None:
+            out = cfg_dir / "fourier_kstar_curve_linear.png"
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            fig_paths.setdefault(f"fourier_kstar_curve_linear/{cfg_name}", out)
+            if verbose:
+                print(f"[yaml-extract] Saved figure: {out}")
+
+        fig = curves_mlp.get(cfg_name, None)
+        if fig is not None:
+            out = cfg_dir / "fourier_kstar_curve_mlp.png"
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            fig_paths.setdefault(f"fourier_kstar_curve_mlp/{cfg_name}", out)
+            if verbose:
+                print(f"[yaml-extract] Saved figure: {out}")
+
+        # spatial decomposition
+        fig = decomp_lin.get(cfg_name, None)
+        if fig is not None:
+            out = cfg_dir / "fourier_band_decomp_linear.png"
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            fig_paths.setdefault(f"fourier_band_decomp_linear/{cfg_name}", out)
+            if verbose:
+                print(f"[yaml-extract] Saved figure: {out}")
+
+        fig = decomp_mlp.get(cfg_name, None)
+        if fig is not None:
+            out = cfg_dir / "fourier_band_decomp_mlp.png"
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            fig_paths.setdefault(f"fourier_band_decomp_mlp/{cfg_name}", out)
+            if verbose:
+                print(f"[yaml-extract] Saved figure: {out}")
 
     return fig_paths
 

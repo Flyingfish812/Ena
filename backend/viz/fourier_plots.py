@@ -6,6 +6,312 @@ from typing import Dict, Any, Iterable, Sequence, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 
+def _ensure_hw(x: np.ndarray, *, channel: int = 0) -> np.ndarray:
+    """
+    将输入转成 [H,W] 单通道数组：
+    - x: [H,W] or [H,W,C]
+    """
+    x = np.asarray(x)
+    if x.ndim == 2:
+        return x
+    if x.ndim == 3:
+        if channel < 0 or channel >= x.shape[2]:
+            raise ValueError(f"channel {channel} out of range for x shape {x.shape}")
+        return x[..., channel]
+    raise ValueError(f"Expected x.ndim in {{2,3}}, got {x.ndim} with shape {x.shape}")
+
+
+def _radial_k_grid(
+    H: int,
+    W: int,
+    *,
+    dx: float = 1.0,
+    dy: float = 1.0,
+) -> np.ndarray:
+    """
+    构造以 FFT 频率为基础的 radial wavenumber 网格 k(y,x)。
+    这里的单位是 cycles / length（即频率），不是角频率。
+    """
+    ky = np.fft.fftfreq(H, d=dy)  # cycles/len
+    kx = np.fft.fftfreq(W, d=dx)
+    KX, KY = np.meshgrid(kx, ky)
+    return np.sqrt(KX**2 + KY**2)
+
+
+def _fft_bandpass_2d(
+    x_hw: np.ndarray,
+    *,
+    k_low: float | None,
+    k_high: float | None,
+    dx: float = 1.0,
+    dy: float = 1.0,
+) -> np.ndarray:
+    """
+    在频域做一个“radial band-pass”并 iFFT 回空间域。
+    - k_low=None 表示 0
+    - k_high=None 表示 +inf
+    """
+    x_hw = np.asarray(x_hw, dtype=float)
+    H, W = x_hw.shape
+    K = _radial_k_grid(H, W, dx=dx, dy=dy)
+
+    X = np.fft.fft2(x_hw)
+    mask = np.ones_like(K, dtype=bool)
+    if k_low is not None:
+        mask &= (K >= float(k_low))
+    if k_high is not None:
+        mask &= (K < float(k_high))
+
+    X_f = X * mask
+    x_f = np.fft.ifft2(X_f).real
+    return x_f
+
+
+def plot_energy_spectrum_with_band_edges(
+    k_centers: np.ndarray,
+    energy_k: np.ndarray,
+    *,
+    k_edges: Sequence[float] | None = None,
+    band_names: Sequence[str] = ("L", "M", "H"),
+    title: str = "Energy spectrum E(k) with band edges",
+    xlabel: str = "k (cycles / length)",
+    ylabel: str = "E(k)",
+    loglog: bool = True,
+) -> Optional[plt.Figure]:
+    """
+    【解释图-A1】E(k) + band edges：用来回答“L/M/H 到底是什么”。
+    你可以用：
+      - k_centers: 径向频率 bin center
+      - energy_k: 对应能量谱
+      - k_edges: [k1, k2, ...]（把频带分段）
+    """
+    k = np.asarray(k_centers, dtype=float).reshape(-1)
+    e = np.asarray(energy_k, dtype=float).reshape(-1)
+    if k.size == 0 or e.size == 0 or k.size != e.size:
+        return None
+
+    fig, ax = plt.subplots(1, 1, figsize=(7.2, 3.8))
+    ax.plot(k, e, linewidth=2.0)
+
+    if loglog:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # 画分界线 + 标注 band
+    if k_edges is not None:
+        edges = [float(v) for v in k_edges]
+        for ke in edges:
+            ax.axvline(ke, linestyle="--", linewidth=1.0)
+
+        # band 名字写在区间中点（用 x 轴对数坐标更稳）
+        # 区间：[0, e1], [e1, e2], ..., [elast, +inf]
+        # 我们只在可视范围内放文字
+        x_min, x_max = ax.get_xlim()
+        segs = [0.0] + edges + [np.inf]
+        for i in range(len(segs) - 1):
+            a, b = segs[i], segs[i + 1]
+            name = band_names[i] if i < len(band_names) else f"band{i}"
+            # 选择一个“落在图内”的标注 x
+            if np.isinf(b):
+                x_text = max(edges[-1] * 1.5, x_min * 1.5)
+            elif a <= 0:
+                x_text = max(b / 2.0, x_min * 1.5)
+            else:
+                # 几何均值在 log 轴上更自然
+                x_text = np.sqrt(a * b)
+
+            if x_text > x_min and x_text < x_max:
+                ax.text(x_text, ax.get_ylim()[1], f" {name}", va="top", ha="left", fontsize=10)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_kstar_curve_from_entry(
+    entry: Dict[str, Any],
+    *,
+    title_prefix: str = "NRMSE(k)",
+    show_edges: bool = True,
+    show_kstar: bool = True,
+) -> Optional[plt.Figure]:
+    """
+    【解释图-A2/B1】单个配置的 NRMSE(k) + k* 标注图。
+    需要 entry["fourier_curve"] 至少包含:
+      - k_centers, nrmse_k
+    可选:
+      - k_edges: 用虚线画 band 边界
+      - k_star: 用竖线画 k*
+      - k_star_threshold 或 nrmse_threshold: 用水平线画阈值
+    """
+    curve = entry.get("fourier_curve", None)
+    if curve is None:
+        return None
+
+    k = np.asarray(curve.get("k_centers", []), dtype=float)
+    y = np.asarray(curve.get("nrmse_k", []), dtype=float)
+    if k.size == 0 or y.size == 0 or k.size != y.size:
+        return None
+
+    p = entry.get("mask_rate", None)
+    s = entry.get("noise_sigma", None)
+    suffix = []
+    if p is not None:
+        suffix.append(f"p={float(p):.3g}")
+    if s is not None:
+        suffix.append(f"σ={float(s):.3g}")
+    suffix = (", " + ", ".join(suffix)) if suffix else ""
+
+    fig, ax = plt.subplots(1, 1, figsize=(7.2, 3.8))
+    ax.plot(k, y, linewidth=2.0)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("k (cycles / length)")
+    ax.set_ylabel("NRMSE(k) (log)")
+    ax.set_title(f"{title_prefix}{suffix}")
+    ax.grid(True, which="both", alpha=0.3)
+
+    if show_edges:
+        k_edges = curve.get("k_edges", None)
+        if k_edges is not None:
+            for ke in k_edges:
+                try:
+                    ax.axvline(float(ke), linestyle="--", linewidth=1.0)
+                except Exception:
+                    pass
+
+    # k* + threshold
+    if show_kstar:
+        k_star = curve.get("k_star", entry.get("k_star", None))
+        if k_star is not None:
+            try:
+                ax.axvline(float(k_star), linestyle="-.", linewidth=1.5)
+                ax.text(float(k_star), ax.get_ylim()[0], " k*", va="bottom", ha="left")
+            except Exception:
+                pass
+
+        thr = curve.get("k_star_threshold", curve.get("nrmse_threshold", None))
+        if thr is not None:
+            try:
+                ax.axhline(float(thr), linestyle=":", linewidth=1.2)
+                ax.text(ax.get_xlim()[0], float(thr), " threshold ", va="bottom", ha="left")
+            except Exception:
+                pass
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_spatial_fourier_band_decomposition(
+    x_true_hw: np.ndarray,
+    x_pred_hw: np.ndarray,
+    *,
+    k_edges: Sequence[float],
+    band_names: Sequence[str] = ("L", "M", "H"),
+    dx: float = 1.0,
+    dy: float = 1.0,
+    channel: int = 0,
+    title: str = "Spatial decomposition by Fourier bands",
+) -> Optional[plt.Figure]:
+    """
+    【解释图-A3/B2】空间域“多尺度解释图”：
+    行：True / Pred / Error
+    列：Full / L / M / H（按 k_edges 划分）
+
+    注意：
+    - 这里的 band-pass 是对单帧单通道做径向频带滤波（radial band-pass）。
+    - k_edges 的单位必须与 fftfreq 构造的 k 一致（cycles/length）。
+    """
+    xT = _ensure_hw(x_true_hw, channel=channel)
+    xP = _ensure_hw(x_pred_hw, channel=channel)
+    if xT.shape != xP.shape:
+        raise ValueError(f"x_true shape {xT.shape} != x_pred shape {xP.shape}")
+
+    edges = [float(v) for v in k_edges]
+    if len(edges) == 0:
+        return None
+
+    # 构造 bands: [0,e1], [e1,e2], ..., [elast, inf]
+    segs = [None] + edges + [None]
+    # 但我们更明确：low/high 数值
+    lows = [None] + edges
+    highs = edges + [None]
+
+    # Full + bands
+    cols = ["Full"] + list(band_names[: (len(lows))])  # 最多匹配到 edges+1 个 band
+    # 实际 band 数 = len(edges)+1
+    nb = len(edges) + 1
+    cols = ["Full"] + list(band_names[:nb])
+    if len(cols) < nb + 1:
+        # 如果 band_names 不够，补默认名
+        for i in range(len(cols) - 1, nb):
+            cols.append(f"B{i}")
+
+    # 预计算分量
+    true_comps = [xT]
+    pred_comps = [xP]
+    for lo, hi in zip(lows[:nb], highs[:nb], strict=False):
+        true_comps.append(_fft_bandpass_2d(xT, k_low=lo, k_high=hi, dx=dx, dy=dy))
+        pred_comps.append(_fft_bandpass_2d(xP, k_low=lo, k_high=hi, dx=dx, dy=dy))
+    err_comps = [p - t for p, t in zip(pred_comps, true_comps, strict=False)]
+
+    # 颜色范围：True/Pred 用同一范围；Error 用以 0 为中心的对称范围
+    vmin = float(np.min(xT))
+    vmax = float(np.max(xT))
+    emax = float(np.max(np.abs(err_comps[0])))
+
+    nrows = 3
+    ncols = 1 + nb  # Full + nb bands
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows))
+
+    row_titles = ["True", "Pred", "Error"]
+    for j in range(ncols):
+        axes[0, j].set_title(cols[j])
+
+    # True row
+    ims = []
+    for j in range(ncols):
+        ax = axes[0, j]
+        im = ax.imshow(true_comps[j], origin="lower", vmin=vmin, vmax=vmax, cmap="RdBu_r")
+        ims.append(im)
+        ax.set_xticks([]); ax.set_yticks([])
+        if j == 0:
+            ax.set_ylabel("True")
+
+    # Pred row
+    for j in range(ncols):
+        ax = axes[1, j]
+        im = ax.imshow(pred_comps[j], origin="lower", vmin=vmin, vmax=vmax, cmap="RdBu_r")
+        ax.set_xticks([]); ax.set_yticks([])
+        if j == 0:
+            ax.set_ylabel("Pred")
+
+    # Error row (0-center)
+    for j in range(ncols):
+        ax = axes[2, j]
+        im = ax.imshow(err_comps[j], origin="lower", vmin=-emax, vmax=emax, cmap="RdBu_r")
+        ax.set_xticks([]); ax.set_yticks([])
+        if j == 0:
+            ax.set_ylabel("Error")
+
+    # 每行一个 colorbar（横向，覆盖该行全部子图）
+    cb0 = fig.colorbar(axes[0, 0].images[0], ax=axes[0, :], orientation="horizontal", fraction=0.046, pad=0.06)
+    cb0.set_label("value (True)")
+
+    cb1 = fig.colorbar(axes[1, 0].images[0], ax=axes[1, :], orientation="horizontal", fraction=0.046, pad=0.06)
+    cb1.set_label("value (Pred)")
+
+    cb2 = fig.colorbar(axes[2, 0].images[0], ax=axes[2, :], orientation="horizontal", fraction=0.046, pad=0.06)
+    cb2.set_label("error (Pred - True)")
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
 
 def plot_kstar_heatmap(
     df_lin,
@@ -155,35 +461,12 @@ def plot_fourier_curve_from_entry(
     title: str = "NRMSE(k)",
 ) -> Optional[plt.Figure]:
     """
-    可选：如果 entry["fourier_curve"] 存在，就画 NRMSE(k)。
-    需要 fourier_curve 结构：
-      {k_centers, nrmse_k, k_edges(optional), band_names(optional)}
+    兼容旧接口：仍然叫 plot_fourier_curve_from_entry，
+    但升级为“解释型”曲线图：NRMSE(k) + (可选) k* + (可选) threshold + (可选) band edges。
     """
-    curve = entry.get("fourier_curve", None)
-    if curve is None:
-        return None
-
-    k = np.asarray(curve.get("k_centers", []), dtype=float)
-    y = np.asarray(curve.get("nrmse_k", []), dtype=float)
-    if k.size == 0 or y.size == 0:
-        return None
-
-    fig, ax = plt.subplots(1, 1, figsize=(7.0, 3.6))
-    ax.plot(k, y, linewidth=2.0)
-    ax.set_yscale("log")
-    ax.set_xlabel("k (rad/len or cycles/len)")
-    ax.set_ylabel("NRMSE(k) (log)")
-    ax.set_title(title)
-    ax.grid(True, which="both", alpha=0.3)
-
-    # optionally draw band edges
-    k_edges = curve.get("k_edges", None)
-    if k_edges is not None:
-        for ke in k_edges:
-            try:
-                ax.axvline(float(ke), linestyle="--", linewidth=1.0)
-            except Exception:
-                pass
-
-    fig.tight_layout()
-    return fig
+    return plot_kstar_curve_from_entry(
+        entry,
+        title_prefix=title,
+        show_edges=True,
+        show_kstar=True,
+    )

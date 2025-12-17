@@ -304,19 +304,25 @@ def generate_experiment_report_md(
     fig_example_mlp = saved_paths.get("fig_example_mlp", None)
     fig_multiscale_example = saved_paths.get("fig_multiscale_example", None)
 
-    # Fourier figs (Batch 4)
+    # Fourier figs
     fig_kstar_linear = saved_paths.get("fig_kstar_linear", None)
     fig_kstar_mlp = saved_paths.get("fig_kstar_mlp", None)
     fig_fourier_band_vs_mask_linear = saved_paths.get("fig_fourier_band_vs_mask_linear", None)
     fig_fourier_band_vs_mask_mlp = saved_paths.get("fig_fourier_band_vs_mask_mlp", None)
     fig_fourier_band_vs_noise_linear = saved_paths.get("fig_fourier_band_vs_noise_linear", None)
     fig_fourier_band_vs_noise_mlp = saved_paths.get("fig_fourier_band_vs_noise_mlp", None)
+    fig_fourier_energy_spectrum = saved_paths.get("fig_fourier_energy_spectrum", None)
 
     # ------------------------------------------------------------------
     # 1) summary 统计
     # ------------------------------------------------------------------
     best_lin = df_lin.loc[df_lin["nmse_mean"].idxmin()]
     worst_lin = df_lin.loc[df_lin["nmse_mean"].idxmax()]
+
+    def _cfg_dir_from_row(row: pd.Series) -> str:
+        p = float(row["mask_rate"])
+        s = float(row["noise_sigma"])
+        return f"p{p:.4f}_sigma{s:.3g}".replace(".", "-")
 
     summary_lines: list[str] = []
     summary_lines.append(
@@ -498,6 +504,14 @@ def generate_experiment_report_md(
 
     lines.append("## 7. 多尺度分析：Fourier 频域（新版）")
     lines.append("")
+    lines.append("### 7.0 Fourier 频域尺度的定义图（L/M/H 是什么）")
+    lines.append("")
+    if fig_fourier_energy_spectrum is not None:
+        lines.append(f"- Energy spectrum + band edges: `{Path(fig_fourier_energy_spectrum)}`")
+    else:
+        lines.append("- （无）说明：当前结果未提供 meta['fourier_k_centers/energy_k/k_edges'] 或未生成保存。")
+    lines.append("")
+
     if fourier_lines:
         lines.extend(fourier_lines)
     else:
@@ -530,6 +544,53 @@ def generate_experiment_report_md(
         and fig_fourier_band_vs_noise_mlp is None
     ):
         lines.append("- （无）")
+    lines.append("")
+
+    lines.append("### 7.3 per-(p,σ) 解释图索引（示例：最好/最差两格）")
+    lines.append("")
+
+    exp_dir = all_result.get("exp_dir", None)
+    if exp_dir is None:
+        exp_dir = saved_paths.get("exp_dir", None)
+    exp_dir = Path(exp_dir) if exp_dir is not None else None
+
+    def _append_cfg_explain_block(tag: str, row: pd.Series):
+        cfg = _cfg_dir_from_row(row)
+        lines.append(f"- {tag}: cfg=`{cfg}` (p={row['mask_rate']:.3g}, σ={row['noise_sigma']:.3g})")
+        if exp_dir is None:
+            lines.append("  - （无法定位实验目录 exp_dir）")
+            return
+        cfg_dir = exp_dir / cfg
+
+        candidates = [
+            cfg_dir / "fourier_kstar_curve_linear.png",
+            cfg_dir / "fourier_band_decomp_linear.png",
+            cfg_dir / "fourier_kstar_curve_mlp.png",
+            cfg_dir / "fourier_band_decomp_mlp.png",
+        ]
+        any_found = False
+        for pth in candidates:
+            if pth.exists():
+                lines.append(f"  - `{pth}`")
+                any_found = True
+        if not any_found:
+            lines.append("  - （该 cfg 未找到解释图文件，可能该轮未生成或该 cfg 没有 example/k_edges）")
+
+    try:
+        _append_cfg_explain_block("Linear best NMSE", best_lin)
+        _append_cfg_explain_block("Linear worst NMSE", worst_lin)
+    except Exception:
+        lines.append("- （无法从 df 中抽取示例行）")
+
+    if df_mlp is not None and len(df_mlp) > 0:
+        try:
+            best_mlp = df_mlp.loc[df_mlp["nmse_mean"].idxmin()]
+            worst_mlp = df_mlp.loc[df_mlp["nmse_mean"].idxmax()]
+            _append_cfg_explain_block("MLP best NMSE", best_mlp)
+            _append_cfg_explain_block("MLP worst NMSE", worst_mlp)
+        except Exception:
+            pass
+
     lines.append("")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")

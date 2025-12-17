@@ -27,7 +27,7 @@ eval:
     sample_frames: 8
     kstar_threshold: 1.0
     mean_mode_true: global
-    save_curve: false
+    save_curve: true
     auto_edges_quantiles: [0.8, 0.95]
     band_names: [L, M, H]
 train:

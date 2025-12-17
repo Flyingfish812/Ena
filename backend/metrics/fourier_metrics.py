@@ -73,6 +73,23 @@ def energy_spectrum(
     grid = _infer_grid_from_meta(H, W, grid_meta)
     F = _fft_for_metric(x_true, mean_mode=mean_mode)
     k_centers, E_k, k_edges = radial_bin_spectrum(F, grid, num_bins=num_bins, k_max=k_max, return_edges=True)
+
+    # remove k=0 bin for log-scale friendly plots
+    k_centers = np.asarray(k_centers)
+    E_k = np.asarray(E_k)
+    k_edges = np.asarray(k_edges)
+
+    if k_centers.size > 0 and np.isclose(k_centers[0], 0.0):
+        # drop the first bin (k=0) to make loglog plots stable
+        k_centers = k_centers[1:]
+        E_k = E_k[1:]
+        # edges length = bins+1; drop the first edge as well
+        if k_edges.size == (k_centers.size + 2):  # original edges
+            k_edges = k_edges[1:]
+        elif k_edges.size == (k_centers.size + 1):
+            # already consistent, no-op
+            pass
+
     return k_centers, E_k, k_edges
 
 
