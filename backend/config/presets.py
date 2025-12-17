@@ -97,4 +97,17 @@ def default_eval_config() -> EvalConfig:
         pod_bands=pod_bands,
         centered_pod=centered_pod,
         save_dir=Path("artifacts/eval"),
+        fourier_enabled=True,
+        fourier_grid={"dx": 1.0, "dy": 1.0, "angular": True},
+        fourier_num_bins=64,
+        fourier_k_max=None,
+        fourier_k_edges=None,  # None -> auto pick by quantiles
+        fourier_band_names=("L", "M", "H"),
+        fourier_auto_edges_quantiles=(0.80, 0.95),
+        fourier_soft_transition=0.0,
+        fourier_kstar_threshold=1.0,
+        fourier_monotone_envelope=True,
+        fourier_sample_frames=8,
+        fourier_save_curve=False,
+        fourier_mean_mode_true="global",
     )

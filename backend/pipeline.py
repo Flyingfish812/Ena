@@ -29,6 +29,10 @@ from .metrics.errors import (
 from .viz.field_plots import plot_field_comparison, plot_error_map, plot_recon_quadruple, plot_example_from_npz
 from .viz.pod_plots import plot_pod_mode_groups
 from .viz.curves import plot_eval_nmse_curves
+from .viz.fourier_plots import (
+    plot_kstar_heatmap,
+    plot_fourier_band_nrmse_curves,
+)
 from .models.train_mlp import train_mlp_on_observations
 import numpy as np
 import json
@@ -41,7 +45,6 @@ from .eval.reconstruction import (
 from .eval.reports import results_to_dataframe
 from .viz.multiscale_plots import plot_multiscale_bar, plot_multiscale_summary
 from .config.yaml_io import load_experiment_yaml, save_experiment_yaml  # 可选用
-from .eval.reports import results_to_dataframe
 
 def compute_full_eval_results(
     data_cfg: DataConfig,
@@ -260,6 +263,35 @@ def build_eval_figures(
 
                 fig_examples_mlp.setdefault(cfg_name, []).append(fig)
 
+    # ========= 4) Fourier 多尺度可视化（Batch 4） =========
+    fig_kstar_linear = None
+    fig_kstar_mlp = None
+    fourier_curve_figs: Dict[str, Any] = {}
+
+    # (1) k* heatmap（如果 df 里有 k_star 列才会画出来）
+    try:
+        fig_kstar_linear = plot_kstar_heatmap(df_linear, df_mlp, model="linear", title="k* heatmap")
+        if mlp_results is not None:
+            fig_kstar_mlp = plot_kstar_heatmap(df_linear, df_mlp, model="mlp", title="k* heatmap")
+    except Exception as e:
+        if verbose:
+            print(f"[build-figs] WARNING: failed to build k* heatmap: {e}")
+
+    # (2) Fourier band NRMSE 曲线（自动从 df 列名推断 band 名）
+    try:
+        band_cols = [c for c in df_linear.columns if c.startswith("fourier_band_nrmse_")]
+        band_names = tuple(c.replace("fourier_band_nrmse_", "") for c in band_cols)
+        if len(band_names) == 0:
+            # 兜底（防止 df 没有列或 band 命名不同）
+            band_names = ("L", "M", "H")
+
+        fourier_curve_figs = plot_fourier_band_nrmse_curves(df_linear, df_mlp, band_names=band_names)
+    except Exception as e:
+        if verbose:
+            print(f"[build-figs] WARNING: failed to build Fourier band curves: {e}")
+        fourier_curve_figs = {}
+
+
     return {
         "fig_nmse_vs_mask_linear": fig_mask_linear,
         "fig_nmse_vs_mask_mlp": fig_mask_mlp,
@@ -269,6 +301,9 @@ def build_eval_figures(
         "fig_example_mlp": fig_example_mlp,
         "fig_examples_linear": fig_examples_linear or None,
         "fig_examples_mlp": fig_examples_mlp or None,
+        "fig_kstar_linear": fig_kstar_linear,
+        "fig_kstar_mlp": fig_kstar_mlp,
+        **fourier_curve_figs,
     }
 
 def run_build_pod_pipeline(
@@ -1646,6 +1681,61 @@ def extract_and_save_figures(
                 fig_paths[key].append(out_mlp)
                 if verbose:
                     print(f"[yaml-extract] Saved multiscale mlp: {out_mlp}")
+
+    # === 5) Fourier figs（Batch 4）保存 ===
+    # 5.1 k* heatmap
+    fig_kstar_linear = figs.get("fig_kstar_linear", None)
+    if fig_kstar_linear is not None:
+        p = exp_dir / "kstar_heatmap_linear.png"
+        fig_kstar_linear.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_kstar_linear"] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
+
+    fig_kstar_mlp = figs.get("fig_kstar_mlp", None)
+    if fig_kstar_mlp is not None:
+        p = exp_dir / "kstar_heatmap_mlp.png"
+        fig_kstar_mlp.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths["fig_kstar_mlp"] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
+
+    # 5.2 Fourier band curves
+    k = "fig_fourier_band_vs_mask_linear"
+    fig_ = figs.get(k, None)
+    if fig_ is not None:
+        p = exp_dir / "fourier_band_vs_mask_linear.png"
+        fig_.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths[k] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
+
+    k = "fig_fourier_band_vs_mask_mlp"
+    fig_ = figs.get(k, None)
+    if fig_ is not None:
+        p = exp_dir / "fourier_band_vs_mask_mlp.png"
+        fig_.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths[k] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
+
+    k = "fig_fourier_band_vs_noise_linear"
+    fig_ = figs.get(k, None)
+    if fig_ is not None:
+        p = exp_dir / "fourier_band_vs_noise_linear.png"
+        fig_.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths[k] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
+
+    k = "fig_fourier_band_vs_noise_mlp"
+    fig_ = figs.get(k, None)
+    if fig_ is not None:
+        p = exp_dir / "fourier_band_vs_noise_mlp.png"
+        fig_.savefig(p, dpi=300, bbox_inches="tight")
+        fig_paths[k] = p
+        if verbose:
+            print(f"[yaml-extract] Saved figure: {p}")
 
     return fig_paths
 

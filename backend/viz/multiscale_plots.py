@@ -650,6 +650,10 @@ def save_multiscale_summary_figures_from_dir(
     }
     """
     from backend.eval.reports import load_full_experiment_results
+    from backend.viz.fourier_plots import (
+        plot_kstar_heatmap,
+        plot_fourier_band_nrmse_curves,
+    )
 
     exp_dir = Path(exp_dir)
     # 这里 experiment_name=None，表示 exp_dir 本身就是单次实验目录
@@ -663,6 +667,7 @@ def save_multiscale_summary_figures_from_dir(
 
     per_band_figs: Dict[float, Path] = {}
     cutoff_figs: Dict[str, Path] = {}
+    fourier_figs: Dict[str, Path] = {}
 
     # 1) per-band NRMSE vs p（按 σ 分面）
     figs_sigma = plot_per_band_nrmse_vs_p(
@@ -689,8 +694,62 @@ def save_multiscale_summary_figures_from_dir(
         plt.close(fig)
         cutoff_figs[model_name] = out_path
 
+    # 3) ===== Batch 6: Fourier figs from CSV (no recompute) =====
+    df_lin = loaded.get("df_linear", None)
+    df_mlp = loaded.get("df_mlp", None)
+
+    # 3.1 k* heatmap
+    try:
+        fig = plot_kstar_heatmap(df_lin, df_mlp, model="linear", title="k* heatmap")
+        if fig is not None:
+            out_path = exp_dir / "kstar_heatmap_linear.png"
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            fourier_figs["kstar_linear"] = out_path
+    except Exception:
+        pass
+
+    try:
+        fig = plot_kstar_heatmap(df_lin, df_mlp, model="mlp", title="k* heatmap")
+        if fig is not None:
+            out_path = exp_dir / "kstar_heatmap_mlp.png"
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            fourier_figs["kstar_mlp"] = out_path
+    except Exception:
+        pass
+
+    # 3.2 Fourier band curves
+    try:
+        # 自动推断 band 名（按列名 fourier_band_nrmse_*）
+        band_cols = []
+        if df_lin is not None:
+            band_cols = [c for c in df_lin.columns if c.startswith("fourier_band_nrmse_")]
+        band_names = tuple(c.replace("fourier_band_nrmse_", "") for c in band_cols) if band_cols else ("L", "M", "H")
+
+        figs_fourier = plot_fourier_band_nrmse_curves(df_lin, df_mlp, band_names=band_names)
+
+        # 逐个保存（None 就跳过）
+        name_to_file = {
+            "fig_fourier_band_vs_mask_linear": "fourier_band_vs_mask_linear.png",
+            "fig_fourier_band_vs_mask_mlp": "fourier_band_vs_mask_mlp.png",
+            "fig_fourier_band_vs_noise_linear": "fourier_band_vs_noise_linear.png",
+            "fig_fourier_band_vs_noise_mlp": "fourier_band_vs_noise_mlp.png",
+        }
+        for k, fname in name_to_file.items():
+            fig = figs_fourier.get(k, None)
+            if fig is None:
+                continue
+            out_path = exp_dir / fname
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            fourier_figs[k] = out_path
+    except Exception:
+        pass
+
     return {
         "exp_dir": exp_dir,
         "per_band_figs": per_band_figs,
         "cutoff_figs": cutoff_figs,
+        "fourier_figs": fourier_figs,
     }

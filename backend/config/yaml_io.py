@@ -146,12 +146,76 @@ def load_experiment_yaml(
     centered_pod = bool(eval_raw.get("centered_pod", True))
 
     eval_save_dir = Path(eval_raw.get("save_dir", "artifacts/eval"))
+    
+    # ===== Fourier (v1.12+) =====
+    fourier_raw: Dict[str, Any] = eval_raw.get("fourier", {}) or {}
+
+    fourier_enabled = bool(fourier_raw.get("enabled", True))
+    fourier_grid = dict(fourier_raw.get("grid", {}))
+
+    fourier_num_bins = int(fourier_raw.get("num_bins", 64))
+
+    fourier_k_max = fourier_raw.get("k_max", None)
+    if fourier_k_max is not None:
+        fourier_k_max = float(fourier_k_max)
+
+    fourier_k_edges = fourier_raw.get("k_edges", None)
+    if fourier_k_edges is not None:
+        fourier_k_edges = [float(v) for v in fourier_k_edges]
+
+    fourier_band_names = tuple(
+        fourier_raw.get("band_names", ("L", "M", "H"))
+    )
+
+    fourier_auto_edges_quantiles = tuple(
+        fourier_raw.get("auto_edges_quantiles", (0.80, 0.95))
+    )
+
+    fourier_soft_transition = float(
+        fourier_raw.get("soft_transition", 0.0)
+    )
+
+    fourier_kstar_threshold = float(
+        fourier_raw.get("kstar_threshold", 1.0)
+    )
+
+    fourier_monotone_envelope = bool(
+        fourier_raw.get("monotone_envelope", True)
+    )
+
+    fourier_sample_frames = int(
+        fourier_raw.get("sample_frames", 8)
+    )
+
+    fourier_save_curve = bool(
+        fourier_raw.get("save_curve", False)
+    )
+
+    fourier_mean_mode_true = str(
+        fourier_raw.get("mean_mode_true", "global")
+    )
+
     eval_cfg = EvalConfig(
         mask_rates=mask_rates,
         noise_sigmas=noise_sigmas,
         pod_bands=pod_bands,
         centered_pod=centered_pod,
         save_dir=eval_save_dir,
+
+        # ===== Fourier =====
+        fourier_enabled=fourier_enabled,
+        fourier_grid=fourier_grid,
+        fourier_num_bins=fourier_num_bins,
+        fourier_k_max=fourier_k_max,
+        fourier_k_edges=fourier_k_edges,
+        fourier_band_names=fourier_band_names,
+        fourier_auto_edges_quantiles=fourier_auto_edges_quantiles,
+        fourier_soft_transition=fourier_soft_transition,
+        fourier_kstar_threshold=fourier_kstar_threshold,
+        fourier_monotone_envelope=fourier_monotone_envelope,
+        fourier_sample_frames=fourier_sample_frames,
+        fourier_save_curve=fourier_save_curve,
+        fourier_mean_mode_true=fourier_mean_mode_true,
     )
 
     # train（可选）

@@ -9,7 +9,7 @@
 - 计算全场与多尺度误差
 """
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 
@@ -30,6 +30,13 @@ from ..metrics.metrics import (
     nrmse_per_band,
     partial_recon_nmse,
 )
+from ..metrics.fourier_metrics import (
+    fourier_radial_nrmse_curve,
+    kstar_from_radial_curve,
+    fourier_band_nrmse,
+    energy_spectrum,
+)
+from ..fourier.filters import auto_pick_k_edges_from_energy
 
 def _load_pod_aux_info(
     pod_cfg: PodConfig,
@@ -109,7 +116,6 @@ def _compute_interp_baseline(
 
     return x_interp
 
-
 def _load_or_build_pod(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
@@ -136,7 +142,6 @@ def _load_or_build_pod(
     mean_flat = load_numpy(mean_path)  # [D]
     meta = load_json(meta_path)
     return Ur, mean_flat, meta
-
 
 def _prepare_snapshots(
     data_cfg: DataConfig,
@@ -176,6 +181,23 @@ def _prepare_snapshots(
         print("  -> Projected all snapshots to POD space: A_true shape =", A_true.shape)
 
     return X_thwc, A_true
+
+def _select_sample_frames(T: int, n: int) -> list[int]:
+    """Pick n frame indices uniformly from [0, T-1]."""
+    if T <= 0:
+        return []
+    n = int(n)
+    if n <= 0:
+        return []
+    n = min(n, T)
+    return [int(x) for x in np.linspace(0, T - 1, num=n, dtype=int)]
+
+def _infer_fourier_grid_meta(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
+    """Map eval_cfg.fourier_grid to grid_meta consumed by fourier_metrics."""
+    g = dict(getattr(eval_cfg, "fourier_grid", {}) or {})
+    # If user gives Lx/Ly but not dx/dy, metrics will compute dx=Lx/W, dy=Ly/H
+    # Also allow angular flag
+    return g
 
 def run_linear_baseline_experiment(
     data_cfg: DataConfig,
@@ -421,6 +443,108 @@ def run_linear_baseline_experiment(
                     effective_band = names[eff_idx]
                     effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
+            # ===== 傅里叶尺度分析 =====
+            fourier_band_nrmse_out = None
+            k_star_out = None
+            fourier_curve_out = None
+
+            if getattr(eval_cfg, "fourier_enabled", False):
+                grid_meta = _infer_fourier_grid_meta(eval_cfg, H=H, W=W)
+                mean_mode_true = getattr(eval_cfg, "fourier_mean_mode_true", "global")
+                num_bins = int(getattr(eval_cfg, "fourier_num_bins", 64))
+                k_max = getattr(eval_cfg, "fourier_k_max", None)
+                kstar_thr = float(getattr(eval_cfg, "fourier_kstar_threshold", 1.0))
+                mono_env = bool(getattr(eval_cfg, "fourier_monotone_envelope", True))
+                sample_frames = int(getattr(eval_cfg, "fourier_sample_frames", 8))
+                save_curve = bool(getattr(eval_cfg, "fourier_save_curve", False))
+
+                t_samples = _select_sample_frames(T, sample_frames)
+
+                # accumulate energies in bins across sampled frames
+                Et_sum = None
+                Ee_sum = None
+                k_centers_ref = None
+
+                # optional: also store per-sample spectra? (not needed; sum is enough)
+                for t_s in t_samples:
+                    x_true = X_thwc[t_s]  # [H,W,C]
+                    # reconstruct again from saved coefficients (no extra solver)
+                    a_lin = A_lin_all[t_s]
+                    x_hat_flat = reconstruct_from_pod(a_lin, Ur_eff, mean_flat)
+                    x_hat = x_hat_flat.reshape(H, W, C)
+
+                    k_centers, Et, Ee, nrmse_k = fourier_radial_nrmse_curve(
+                        x_hat=x_hat,
+                        x_true=x_true,
+                        num_bins=num_bins,
+                        k_max=k_max,
+                        grid_meta=grid_meta,
+                        mean_mode=mean_mode_true,
+                    )
+                    if k_centers_ref is None:
+                        k_centers_ref = k_centers
+                        Et_sum = np.zeros_like(Et)
+                        Ee_sum = np.zeros_like(Ee)
+                    Et_sum += Et
+                    Ee_sum += Ee
+
+                if k_centers_ref is not None:
+                    nrmse_k_mean = np.sqrt(Ee_sum / (Et_sum + 1e-12))
+                    k_star_out = kstar_from_radial_curve(
+                        k_centers_ref, nrmse_k_mean, threshold=kstar_thr, monotone_enforce=mono_env
+                    )
+
+                    # determine band edges
+                    k_edges_cfg = getattr(eval_cfg, "fourier_k_edges", None)
+                    if k_edges_cfg is None:
+                        qtls = getattr(eval_cfg, "fourier_auto_edges_quantiles", (0.80, 0.95))
+                        k_edges = auto_pick_k_edges_from_energy(k_centers_ref, Et_sum, quantiles=qtls)
+                    else:
+                        k_edges = [float(v) for v in k_edges_cfg]
+
+                    band_names = list(getattr(eval_cfg, "fourier_band_names", ("L", "M", "H")))
+                    # ensure names length matches bands
+                    if len(band_names) != (len(k_edges) - 1):
+                        band_names = [f"band_{i}" for i in range(len(k_edges) - 1)]
+
+                    # compute band nrmse using energy masks (use one representative frame set averaged by taking mean over samples)
+                    # Here: compute band NRMSE on the same sampled frames and average in energy sense
+                    # => band NRMSE computed from summed energies is more consistent
+                    band_num = {name: 0.0 for name in band_names}
+                    band_den = {name: 0.0 for name in band_names}
+
+                    # To avoid reimplementing masks here, reuse fourier_band_nrmse per sample and average in energy sense is "approx".
+                    # A cleaner way: compute band_nrmse for each sample and take mean; good enough for Batch 3.
+                    band_vals = []
+                    for t_s in t_samples:
+                        x_true = X_thwc[t_s]
+                        a_lin = A_lin_all[t_s]
+                        x_hat = reconstruct_from_pod(a_lin, Ur_eff, mean_flat).reshape(H, W, C)
+                        b = fourier_band_nrmse(
+                            x_hat=x_hat,
+                            x_true=x_true,
+                            k_edges=k_edges,
+                            grid_meta=grid_meta,
+                            mean_mode=mean_mode_true,
+                            band_names=band_names,
+                        )
+                        band_vals.append(b)
+
+                    # average bands across samples
+                    fourier_band_nrmse_out = {
+                        name: float(np.mean([bv[name] for bv in band_vals])) for name in band_names
+                    }
+
+                    if save_curve:
+                        fourier_curve_out = {
+                            "k_centers": k_centers_ref.tolist(),
+                            "E_true_k": Et_sum.tolist(),
+                            "E_err_k": Ee_sum.tolist(),
+                            "nrmse_k": nrmse_k_mean.tolist(),
+                            "k_edges": [float(v) for v in k_edges],
+                            "band_names": band_names,
+                        }
+
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
@@ -449,6 +573,11 @@ def run_linear_baseline_experiment(
 
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
+
+                # 傅里叶多尺度等级
+                "fourier_band_nrmse": fourier_band_nrmse_out,
+                "k_star": None if k_star_out is None else float(k_star_out),
+                "fourier_curve": fourier_curve_out,
             }
             entries.append(entry)
 
@@ -740,6 +869,108 @@ def run_mlp_experiment(
                     effective_band = names[eff_idx]
                     effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
+            # ===== Fourier multiscale =====
+            fourier_band_nrmse_out = None
+            k_star_out = None
+            fourier_curve_out = None
+
+            if getattr(eval_cfg, "fourier_enabled", False):
+                grid_meta = _infer_fourier_grid_meta(eval_cfg, H=H, W=W)
+                mean_mode_true = getattr(eval_cfg, "fourier_mean_mode_true", "global")
+                num_bins = int(getattr(eval_cfg, "fourier_num_bins", 64))
+                k_max = getattr(eval_cfg, "fourier_k_max", None)
+                kstar_thr = float(getattr(eval_cfg, "fourier_kstar_threshold", 1.0))
+                mono_env = bool(getattr(eval_cfg, "fourier_monotone_envelope", True))
+                sample_frames = int(getattr(eval_cfg, "fourier_sample_frames", 8))
+                save_curve = bool(getattr(eval_cfg, "fourier_save_curve", False))
+
+                t_samples = _select_sample_frames(T, sample_frames)
+
+                # accumulate energies in bins across sampled frames
+                Et_sum = None
+                Ee_sum = None
+                k_centers_ref = None
+
+                # optional: also store per-sample spectra? (not needed; sum is enough)
+                for t_s in t_samples:
+                    x_true = X_thwc[t_s]  # [H,W,C]
+                    # reconstruct again from saved coefficients (no extra solver)
+                    a_mlp = A_mlp_all[t_s]
+                    x_hat_flat = reconstruct_from_pod(a_mlp, Ur_eff, mean_flat)
+                    x_hat = x_hat_flat.reshape(H, W, C)
+
+                    k_centers, Et, Ee, nrmse_k = fourier_radial_nrmse_curve(
+                        x_hat=x_hat,
+                        x_true=x_true,
+                        num_bins=num_bins,
+                        k_max=k_max,
+                        grid_meta=grid_meta,
+                        mean_mode=mean_mode_true,
+                    )
+                    if k_centers_ref is None:
+                        k_centers_ref = k_centers
+                        Et_sum = np.zeros_like(Et)
+                        Ee_sum = np.zeros_like(Ee)
+                    Et_sum += Et
+                    Ee_sum += Ee
+
+                if k_centers_ref is not None:
+                    nrmse_k_mean = np.sqrt(Ee_sum / (Et_sum + 1e-12))
+                    k_star_out = kstar_from_radial_curve(
+                        k_centers_ref, nrmse_k_mean, threshold=kstar_thr, monotone_enforce=mono_env
+                    )
+
+                    # determine band edges
+                    k_edges_cfg = getattr(eval_cfg, "fourier_k_edges", None)
+                    if k_edges_cfg is None:
+                        qtls = getattr(eval_cfg, "fourier_auto_edges_quantiles", (0.80, 0.95))
+                        k_edges = auto_pick_k_edges_from_energy(k_centers_ref, Et_sum, quantiles=qtls)
+                    else:
+                        k_edges = [float(v) for v in k_edges_cfg]
+
+                    band_names = list(getattr(eval_cfg, "fourier_band_names", ("L", "M", "H")))
+                    # ensure names length matches bands
+                    if len(band_names) != (len(k_edges) - 1):
+                        band_names = [f"band_{i}" for i in range(len(k_edges) - 1)]
+
+                    # compute band nrmse using energy masks (use one representative frame set averaged by taking mean over samples)
+                    # Here: compute band NRMSE on the same sampled frames and average in energy sense
+                    # => band NRMSE computed from summed energies is more consistent
+                    band_num = {name: 0.0 for name in band_names}
+                    band_den = {name: 0.0 for name in band_names}
+
+                    # To avoid reimplementing masks here, reuse fourier_band_nrmse per sample and average in energy sense is "approx".
+                    # A cleaner way: compute band_nrmse for each sample and take mean; good enough for Batch 3.
+                    band_vals = []
+                    for t_s in t_samples:
+                        x_true = X_thwc[t_s]
+                        a_mlp = A_mlp_all[t_s]
+                        x_hat = reconstruct_from_pod(a_mlp, Ur_eff, mean_flat).reshape(H, W, C)
+                        b = fourier_band_nrmse(
+                            x_hat=x_hat,
+                            x_true=x_true,
+                            k_edges=k_edges,
+                            grid_meta=grid_meta,
+                            mean_mode=mean_mode_true,
+                            band_names=band_names,
+                        )
+                        band_vals.append(b)
+
+                    # average bands across samples
+                    fourier_band_nrmse_out = {
+                        name: float(np.mean([bv[name] for bv in band_vals])) for name in band_names
+                    }
+
+                    if save_curve:
+                        fourier_curve_out = {
+                            "k_centers": k_centers_ref.tolist(),
+                            "E_true_k": Et_sum.tolist(),
+                            "E_err_k": Ee_sum.tolist(),
+                            "nrmse_k": nrmse_k_mean.tolist(),
+                            "k_edges": [float(v) for v in k_edges],
+                            "band_names": band_names,
+                        }
+
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
@@ -769,6 +1000,11 @@ def run_mlp_experiment(
                 # 数据规模 / 观测数
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
+
+                # 傅里叶多尺度等级
+                "fourier_band_nrmse": fourier_band_nrmse_out,
+                "k_star": None if k_star_out is None else float(k_star_out),
+                "fourier_curve": fourier_curve_out,
 
                 # 训练信息（保持原来的结构）
                 "train_info": train_info,

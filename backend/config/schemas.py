@@ -88,19 +88,51 @@ class EvalConfig:
     """
     评估阶段配置。
 
-    Attributes
-    ----------
-    mask_rates:
-        需要评估的一组观测点比例。
-    noise_sigmas:
-        需要评估的一组噪声强度。
-    pod_bands:
-        POD 多尺度分段定义，例如 {"L": (0,10), "M": (10,40), "S": (40,128)}。
-    save_dir:
-        保存评估结果与报告的目录。
+    POD 多尺度（legacy）：
+      - pod_bands / centered_pod
+
+    Fourier 频域多尺度（v1.12+）：
+      - fourier_enabled: 是否启用频域尺度分析
+      - fourier_grid: 指定 dx/dy 或 Lx/Ly（用于构造 k 网格）
+      - fourier_num_bins: 径向谱分箱数量
+      - fourier_k_edges: 频带边界（None 则按能量分位数自动选）
+      - fourier_kstar_threshold: k* 的阈值（NRMSE(k) <= threshold）
+      - fourier_sample_frames: 频域统计抽样帧数（控制开销）
+      - fourier_save_curve: 是否把谱曲线存进 entry（很大，默认 False）
     """
     mask_rates: Sequence[float]
     noise_sigmas: Sequence[float]
     pod_bands: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     centered_pod: bool = True
     save_dir: Path = Path("artifacts/eval")
+
+    # ===== Fourier frequency-space multiscale (Batch 3/6) =====
+    fourier_enabled: bool = True
+
+    # grid meta: user may provide:
+    #   {"dx":..., "dy":..., "angular": True/False}
+    # or {"Lx":..., "Ly":..., "angular": True/False}  (dx=Lx/W, dy=Ly/H inferred later)
+    fourier_grid: Dict[str, Any] = field(default_factory=dict)
+
+    # radial spectrum bins
+    fourier_num_bins: int = 64
+    fourier_k_max: float | None = None  # None -> max(k)
+
+    # band partition
+    fourier_k_edges: Sequence[float] | None = None
+    fourier_band_names: Tuple[str, ...] = ("L", "M", "H")
+    fourier_auto_edges_quantiles: Tuple[float, ...] = (0.80, 0.95)
+
+    # optional weak split (soft weights); 0 => hard split
+    fourier_soft_transition: float = 0.0
+
+    # k* definition
+    fourier_kstar_threshold: float = 1.0
+    fourier_monotone_envelope: bool = True
+
+    # compute cost control
+    fourier_sample_frames: int = 8
+    fourier_save_curve: bool = False
+
+    # mean removal mode in FFT of x_true
+    fourier_mean_mode_true: str = "global"
