@@ -381,6 +381,8 @@ def build_eval_figures(
             meta = (linear_results.get("meta", {}) or {})
         return meta
 
+    print("meta的值：" + str(_pick_meta()))
+
     fig_energy_spectrum = _safe_build(
         "Energy spectrum definition figure",
         lambda: (

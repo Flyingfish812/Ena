@@ -117,6 +117,7 @@ def plot_energy_spectrum_with_band_edges(
 
     # optional: if obstacle diameter is known, also show λ/D as a small note
     g = dict(grid_meta or {})
+    print(g)
     D = g.get("obstacle_diameter", None)
     if D is not None and float(D) > 0:
         secax.set_xlabel("wavelength λ (length unit)   [λ/D shown in band labels]")

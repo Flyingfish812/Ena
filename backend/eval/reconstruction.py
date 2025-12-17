@@ -200,34 +200,56 @@ def _infer_fourier_grid_meta(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
     return g
 
 def _get_fourier_settings(eval_cfg: EvalConfig) -> dict:
-    """Collect Fourier-related settings from eval_cfg with defaults."""
+    """Collect Fourier-related settings from eval_cfg with defaults.
+    Support both legacy flat fields (fourier_enabled, fourier_grid, ...)
+    and nested YAML block (eval_cfg.fourier.enabled, eval_cfg.fourier.grid_meta, ...).
+    """
+    f = getattr(eval_cfg, "fourier", None)
+
+    def _f_get(key: str, default=None):
+        if f is None:
+            return default
+        if isinstance(f, dict):
+            return f.get(key, default)
+        return getattr(f, key, default)
+
+    # enabled: prefer legacy flat field if present, else nested
+    enabled_flat = getattr(eval_cfg, "fourier_enabled", None)
+    enabled = bool(enabled_flat) if enabled_flat is not None else bool(_f_get("enabled", False))
+
+    # grid_meta: legacy flat field name is fourier_grid; nested uses fourier.grid_meta
+    grid_flat = getattr(eval_cfg, "fourier_grid", None)
+    grid_meta = grid_flat if grid_flat is not None else _f_get("grid_meta", {})
+    grid_meta = dict(grid_meta or {})
+
+    # band scheme: legacy flat field fourier_band_scheme; nested fourier.band_scheme
+    band_scheme_flat = getattr(eval_cfg, "fourier_band_scheme", None)
+    band_scheme = band_scheme_flat if band_scheme_flat is not None else _f_get("band_scheme", "energy_quantile")
+
+    # lambda_edges: legacy flat field fourier_lambda_edges; nested fourier.lambda_edges
+    lambda_edges_flat = getattr(eval_cfg, "fourier_lambda_edges", None)
+    lambda_edges = lambda_edges_flat if lambda_edges_flat is not None else _f_get("lambda_edges", None)
+
     return {
-        "enabled": bool(getattr(eval_cfg, "fourier_enabled", False)),
-        "grid_meta": dict(getattr(eval_cfg, "fourier_grid", {}) or {}),
+        "enabled": enabled,
+        "grid_meta": grid_meta,
 
-        "mean_mode_true": getattr(eval_cfg, "fourier_mean_mode_true", "global"),
-        "num_bins": int(getattr(eval_cfg, "fourier_num_bins", 64)),
-        "k_max": getattr(eval_cfg, "fourier_k_max", None),
+        "mean_mode_true": getattr(eval_cfg, "fourier_mean_mode_true", _f_get("mean_mode_true", "global")),
+        "num_bins": int(getattr(eval_cfg, "fourier_num_bins", _f_get("num_bins", 64))),
+        "k_max": getattr(eval_cfg, "fourier_k_max", _f_get("k_max", None)),
 
-        "kstar_thr": float(getattr(eval_cfg, "fourier_kstar_threshold", 1.0)),
-        "mono_env": bool(getattr(eval_cfg, "fourier_monotone_envelope", True)),
-        "sample_frames": int(getattr(eval_cfg, "fourier_sample_frames", 8)),
-        "save_curve": bool(getattr(eval_cfg, "fourier_save_curve", False)),
+        "kstar_thr": float(getattr(eval_cfg, "fourier_kstar_threshold", _f_get("kstar_threshold", 1.0))),
+        "mono_env": bool(getattr(eval_cfg, "fourier_monotone_envelope", _f_get("monotone_envelope", True))),
+        "sample_frames": int(getattr(eval_cfg, "fourier_sample_frames", _f_get("sample_frames", 8))),
+        "save_curve": bool(getattr(eval_cfg, "fourier_save_curve", _f_get("save_curve", False))),
 
         # band edges
-        "k_edges_cfg": getattr(eval_cfg, "fourier_k_edges", None),
-        "auto_edges_quantiles": getattr(eval_cfg, "fourier_auto_edges_quantiles", (0.80, 0.95)),
-        "band_names_cfg": tuple(getattr(eval_cfg, "fourier_band_names", ("L", "M", "H"))),
+        "k_edges_cfg": getattr(eval_cfg, "fourier_k_edges", _f_get("k_edges", None)),
+        "auto_edges_quantiles": getattr(eval_cfg, "fourier_auto_edges_quantiles", _f_get("auto_edges_quantiles", (0.80, 0.95))),
+        "band_names_cfg": tuple(getattr(eval_cfg, "fourier_band_names", _f_get("band_names", ("L", "M", "H")))),
 
-        # NEW: how to define bands
-        # - "energy_quantile": 原来的能量分位数自动切
-        # - "physical": 物理尺度切（推荐用于你要的“0.1cm/0.01cm”叙事）
-        "band_scheme": getattr(eval_cfg, "fourier_band_scheme", "energy_quantile"),
-
-        # NEW: physical scale edges (wavelength λ) in "length unit" of the simulation domain.
-        # Example for cylinder2d (unit = domain length):
-        #   fourier_lambda_edges = [1.0, 0.25]  # λ_LM=1.0, λ_MH=0.25  -> k=[1,4]
-        "lambda_edges": getattr(eval_cfg, "fourier_lambda_edges", None),
+        "band_scheme": band_scheme,
+        "lambda_edges": lambda_edges,
     }
 
 def _compute_fourier_for_setting(
@@ -731,6 +753,7 @@ def run_linear_baseline_experiment(
             "fourier_k_centers": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_centers"),
             "fourier_energy_k": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_energy_k"),
             "fourier_k_edges": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_edges"),
+            "fourier_grid_meta": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_grid_meta"),
         },
         "entries": entries,
         "example_recon": example_recon,
@@ -1094,6 +1117,7 @@ def run_mlp_experiment(
             "fourier_k_centers": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_centers"),
             "fourier_energy_k": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_energy_k"),
             "fourier_k_edges": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_edges"),
+            "fourier_grid_meta": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_grid_meta"),
         },
         "entries": entries,
         "example_recon": example_recon,

@@ -27,7 +27,6 @@ eval:
       Lx: 8.0
       Ly: 1.0
       obstacle_diameter: 0.125
-    grid:
       dx: 0.0125
       dy: 0.0125
       angular: false      # angular: true 表示 rad/length，需要 2π 的换算，除非全链路都统一用角波数
