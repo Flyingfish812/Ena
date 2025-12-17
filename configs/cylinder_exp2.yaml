@@ -22,14 +22,22 @@ eval:
   save_dir: artifacts/eval
   fourier:
     enabled: true
-    grid: {dx: 1.0, dy: 1.0, angular: true}
+    band_scheme: physical
+    grid_meta:
+      Lx: 8.0
+      Ly: 1.0
+      obstacle_diameter: 0.125
+    grid:
+      dx: 0.0125
+      dy: 0.0125
+      angular: false      # angular: true 表示 rad/length，需要 2π 的换算，除非全链路都统一用角波数
     num_bins: 64
     sample_frames: 8
     kstar_threshold: 1.0
     mean_mode_true: global
     save_curve: true
-    auto_edges_quantiles: [0.8, 0.95]
     band_names: [L, M, H]
+    lambda_edges: [1.0, 0.25]   # 物理尺度切分：用波长 λ 的分界（length unit）.例：λ_LM=1.0（一个通道高度级别），λ_MH=0.25（约 2D）
 train:
   mask_rate: 0.0004
   noise_sigma: 0.01

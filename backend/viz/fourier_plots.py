@@ -71,26 +71,25 @@ def plot_energy_spectrum_with_band_edges(
     k_centers: np.ndarray,
     energy_k: np.ndarray,
     *,
-    k_edges: Sequence[float] | None = None,
+    k_edges: Sequence[float] | None = None,          # interior edges: [k1,k2,...]
     band_names: Sequence[str] = ("L", "M", "H"),
+    grid_meta: dict | None = None,                   # NEW: for physical annotation
     title: str = "Energy spectrum E(k) with band edges",
-    xlabel: str = "k (cycles / length)",
+    xlabel: str = "wavenumber k (cycles / length unit)",
     ylabel: str = "E(k)",
     loglog: bool = True,
 ) -> Optional[plt.Figure]:
     """
-    【解释图-A1】E(k) + band edges：用来回答“L/M/H 到底是什么”。
-    你可以用：
-      - k_centers: 径向频率 bin center
-      - energy_k: 对应能量谱
-      - k_edges: [k1, k2, ...]（把频带分段）
+    解释图：E(k) + band edges。
+    - k 单位：cycles / length unit（与 np.fft.fftfreq 的 d=dx/dy 一致）
+    - 顶轴显示波长 λ=1/k，帮助把“频域划分”翻译成“空间尺度划分”
     """
     k = np.asarray(k_centers, dtype=float).reshape(-1)
     e = np.asarray(energy_k, dtype=float).reshape(-1)
     if k.size == 0 or e.size == 0 or k.size != e.size:
         return None
 
-    fig, ax = plt.subplots(1, 1, figsize=(7.2, 3.8))
+    fig, ax = plt.subplots(1, 1, figsize=(7.6, 4.1))
     ax.plot(k, e, linewidth=2.0)
 
     if loglog:
@@ -102,31 +101,74 @@ def plot_energy_spectrum_with_band_edges(
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
 
-    # 画分界线 + 标注 band
+    # ---- top axis: wavelength λ = 1/k ----
+    eps = 1e-12
+
+    def k_to_lam(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    def lam_to_k(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    secax = ax.secondary_xaxis("top", functions=(k_to_lam, lam_to_k))
+    secax.set_xlabel("wavelength λ (length unit)")
+
+    # optional: if obstacle diameter is known, also show λ/D as a small note
+    g = dict(grid_meta or {})
+    D = g.get("obstacle_diameter", None)
+    if D is not None and float(D) > 0:
+        secax.set_xlabel("wavelength λ (length unit)   [λ/D shown in band labels]")
+
+    # ---- band edges + labels ----
     if k_edges is not None:
-        edges = [float(v) for v in k_edges]
+        edges = sorted([float(v) for v in k_edges if v is not None and np.isfinite(v) and v > 0])
+        # vertical lines
         for ke in edges:
             ax.axvline(ke, linestyle="--", linewidth=1.0)
 
-        # band 名字写在区间中点（用 x 轴对数坐标更稳）
-        # 区间：[0, e1], [e1, e2], ..., [elast, +inf]
-        # 我们只在可视范围内放文字
+        # segments: [0,k1],[k1,k2],...,[klast, inf] (use view range to place text)
         x_min, x_max = ax.get_xlim()
-        segs = [0.0] + edges + [np.inf]
-        for i in range(len(segs) - 1):
-            a, b = segs[i], segs[i + 1]
-            name = band_names[i] if i < len(band_names) else f"band{i}"
-            # 选择一个“落在图内”的标注 x
-            if np.isinf(b):
-                x_text = max(edges[-1] * 1.5, x_min * 1.5)
-            elif a <= 0:
-                x_text = max(b / 2.0, x_min * 1.5)
-            else:
-                # 几何均值在 log 轴上更自然
-                x_text = np.sqrt(a * b)
+        segs = [max(x_min, eps)] + [ke for ke in edges if x_min < ke < x_max] + [x_max]
 
-            if x_text > x_min and x_text < x_max:
-                ax.text(x_text, ax.get_ylim()[1], f" {name}", va="top", ha="left", fontsize=10)
+        # build labels per visible segment
+        nb = max(1, len(segs) - 1)
+        for i in range(nb):
+            a, b = segs[i], segs[i + 1]
+            if not (np.isfinite(a) and np.isfinite(b) and a > 0 and b > 0 and b > a):
+                continue
+
+            # geometric mid (log-axis friendly)
+            xm = np.sqrt(a * b)
+            name = band_names[i] if i < len(band_names) else f"B{i}"
+
+            lam_hi = 1.0 / max(a, eps)  # larger wavelength at smaller k
+            lam_lo = 1.0 / max(b, eps)
+
+            # text: include λ range
+            if i == 0:
+                lam_text = f"λ ≥ {lam_lo:.3g}"
+            elif i == nb - 1:
+                lam_text = f"λ < {lam_hi:.3g}"
+            else:
+                lam_text = f"{lam_lo:.3g} ≤ λ < {lam_hi:.3g}"
+
+            if D is not None and float(D) > 0:
+                # show λ/D (dimensionless) as extra cue
+                if i == 0:
+                    lamD_text = f"λ/D ≥ {lam_lo/float(D):.3g}"
+                elif i == nb - 1:
+                    lamD_text = f"λ/D < {lam_hi/float(D):.3g}"
+                else:
+                    lamD_text = f"{lam_lo/float(D):.3g} ≤ λ/D < {lam_hi/float(D):.3g}"
+                label = f"{name}\n({lam_text})\n({lamD_text})"
+            else:
+                label = f"{name}\n({lam_text})"
+
+            # place near the top inside axes
+            y_top = ax.get_ylim()[1]
+            ax.text(xm, y_top, label, ha="center", va="top")
 
     fig.tight_layout()
     return fig

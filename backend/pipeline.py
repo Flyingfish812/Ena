@@ -389,6 +389,7 @@ def build_eval_figures(
                 energy_k=np.asarray(_pick_meta().get("fourier_energy_k")),
                 k_edges=_pick_meta().get("fourier_k_edges"),
                 band_names=("L", "M", "H"),
+                grid_meta=_pick_meta().get("fourier_grid_meta", None),
                 title="Energy spectrum E(k) with band edges (definition of L/M/H)",
             )
             if (

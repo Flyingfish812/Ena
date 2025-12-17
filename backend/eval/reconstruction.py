@@ -204,16 +204,30 @@ def _get_fourier_settings(eval_cfg: EvalConfig) -> dict:
     return {
         "enabled": bool(getattr(eval_cfg, "fourier_enabled", False)),
         "grid_meta": dict(getattr(eval_cfg, "fourier_grid", {}) or {}),
+
         "mean_mode_true": getattr(eval_cfg, "fourier_mean_mode_true", "global"),
         "num_bins": int(getattr(eval_cfg, "fourier_num_bins", 64)),
         "k_max": getattr(eval_cfg, "fourier_k_max", None),
+
         "kstar_thr": float(getattr(eval_cfg, "fourier_kstar_threshold", 1.0)),
         "mono_env": bool(getattr(eval_cfg, "fourier_monotone_envelope", True)),
         "sample_frames": int(getattr(eval_cfg, "fourier_sample_frames", 8)),
         "save_curve": bool(getattr(eval_cfg, "fourier_save_curve", False)),
+
+        # band edges
         "k_edges_cfg": getattr(eval_cfg, "fourier_k_edges", None),
         "auto_edges_quantiles": getattr(eval_cfg, "fourier_auto_edges_quantiles", (0.80, 0.95)),
         "band_names_cfg": tuple(getattr(eval_cfg, "fourier_band_names", ("L", "M", "H"))),
+
+        # NEW: how to define bands
+        # - "energy_quantile": 原来的能量分位数自动切
+        # - "physical": 物理尺度切（推荐用于你要的“0.1cm/0.01cm”叙事）
+        "band_scheme": getattr(eval_cfg, "fourier_band_scheme", "energy_quantile"),
+
+        # NEW: physical scale edges (wavelength λ) in "length unit" of the simulation domain.
+        # Example for cylinder2d (unit = domain length):
+        #   fourier_lambda_edges = [1.0, 0.25]  # λ_LM=1.0, λ_MH=0.25  -> k=[1,4]
+        "lambda_edges": getattr(eval_cfg, "fourier_lambda_edges", None),
     }
 
 def _compute_fourier_for_setting(
@@ -281,18 +295,66 @@ def _compute_fourier_for_setting(
         monotone_enforce=fs["mono_env"],
     )
 
-    # 3) k_edges（配置优先，否则自动）
-    if fs["k_edges_cfg"] is None:
-        k_edges = auto_pick_k_edges_from_energy(
-            k_centers_ref,
-            Et_sum,
-            quantiles=fs["auto_edges_quantiles"],
-        )
+    # 3) k_edges
+    #    内部用 full_edges=[k0,k1,...,kN]（含端点）做统计；
+    #    对外输出 interior_edges=[k1,...,k_{N-1}] 供画图/空间分解，避免多一段 band3。
+    full_edges: list[float] | None = None
+
+    scheme = str(fs.get("band_scheme", "energy_quantile")).lower()
+
+    if scheme == "physical":
+        # 物理尺度：用波长 λ 的分界来定义 bands（k = 1/λ）
+        lam_edges = fs.get("lambda_edges", None)
+        if lam_edges is None:
+            # 给一个稳健默认：如果提供了 obstacle_diameter，用 [8D, 2D]；
+            # 否则退化到 [Ly, Ly/4]
+            g = fs.get("grid_meta", {}) or {}
+            D = g.get("obstacle_diameter", None)
+            Ly = g.get("Ly", None)
+            if D is not None:
+                lam_edges = [8.0 * float(D), 2.0 * float(D)]
+            elif Ly is not None:
+                lam_edges = [float(Ly), float(Ly) / 4.0]
+            else:
+                lam_edges = [1.0, 0.25]
+
+        lam_edges = [float(x) for x in lam_edges]
+        # L/M/H: λ 大 -> k 小；所以要把边界转成递增的 k
+        k_interior = sorted([1.0 / max(le, 1e-12) for le in lam_edges])
+        k0 = 0.0
+        kN = float(np.max(k_centers_ref)) if fs["k_max"] is None else float(fs["k_max"])
+        full_edges = [k0] + k_interior + [kN]
+
     else:
-        k_edges = [float(v) for v in fs["k_edges_cfg"]]
+        # energy_quantile（旧逻辑）或显式 k_edges_cfg
+        if fs["k_edges_cfg"] is None:
+            full_edges = auto_pick_k_edges_from_energy(
+                k_centers_ref,
+                Et_sum,
+                quantiles=fs["auto_edges_quantiles"],
+            )
+        else:
+            # 允许用户传：
+            # - interior edges: [k1,k2]
+            # - full edges: [k0,k1,k2,kN]
+            cfg_edges = [float(v) for v in fs["k_edges_cfg"]]
+            if len(cfg_edges) >= 2 and cfg_edges[0] <= 1e-12:
+                # 看起来像 full edges
+                full_edges = cfg_edges
+            else:
+                # 当作 interior edges
+                k0 = 0.0
+                kN = float(np.max(k_centers_ref)) if fs["k_max"] is None else float(fs["k_max"])
+                full_edges = [k0] + cfg_edges + [kN]
+
+    if full_edges is None or len(full_edges) < 3:
+        return None, None, None, None
+
+    # 对外输出的“内部边界”
+    interior_edges = [float(v) for v in full_edges[1:-1]]
 
     # 4) band names 对齐 band 数
-    nb = len(k_edges) - 1
+    nb = len(full_edges) - 1
     band_names = list(fs["band_names_cfg"])
     if len(band_names) != nb:
         band_names = [f"band_{i}" for i in range(nb)]
@@ -307,7 +369,7 @@ def _compute_fourier_for_setting(
         b = fourier_band_nrmse(
             x_hat=x_hat,
             x_true=x_true,
-            k_edges=k_edges,
+            k_edges=full_edges,
             grid_meta=fs["grid_meta"],
             mean_mode=fs["mean_mode_true"],
             band_names=band_names,
@@ -326,7 +388,7 @@ def _compute_fourier_for_setting(
             "E_true_k": Et_sum.tolist(),
             "E_err_k": Ee_sum.tolist(),
             "nrmse_k": nrmse_k_mean.tolist(),
-            "k_edges": [float(v) for v in k_edges],
+            "k_edges": interior_edges,
             "band_names": band_names,
             "k_star": None if k_star_out is None else float(k_star_out),
             "k_star_threshold": float(fs["kstar_thr"]),
@@ -336,7 +398,8 @@ def _compute_fourier_for_setting(
     meta_hint = {
         "fourier_k_centers": k_centers_ref.tolist(),
         "fourier_energy_k": Et_sum.tolist(),      # 用 “true energy spectrum” 做定义图
-        "fourier_k_edges": [float(v) for v in k_edges],
+        "fourier_k_edges": interior_edges,
+        "fourier_grid_meta": dict(fs.get("grid_meta", {}) or {}),
     }
 
     return fourier_band_nrmse_out, (None if k_star_out is None else float(k_star_out)), fourier_curve_out, meta_hint
