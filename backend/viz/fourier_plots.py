@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Iterable, Sequence, Optional
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -178,72 +179,223 @@ def plot_energy_spectrum_with_band_edges(
 def plot_kstar_curve_from_entry(
     entry: Dict[str, Any],
     *,
-    title_prefix: str = "NRMSE(k)",
+    title_prefix: str = "NRMSE vs spatial scale",
     show_edges: bool = True,
     show_kstar: bool = True,
 ) -> Optional[plt.Figure]:
     """
-    【解释图-A2/B1】单个配置的 NRMSE(k) + k* 标注图。
+    【解释图】单个配置的 NRMSE(k) 曲线，但主 x 轴改为物理尺度 ℓ=1/k（wavelength / characteristic scale）。
+    目标：让读者直接读出“模型能可靠重建到多小的结构”。
+
     需要 entry["fourier_curve"] 至少包含:
       - k_centers, nrmse_k
+
     可选:
-      - k_edges: 用虚线画 band 边界
-      - k_star: 用竖线画 k*
-      - k_star_threshold 或 nrmse_threshold: 用水平线画阈值
+      - k_edges: band 边界（k域） -> 转成 ℓ_edges 并画竖线/阴影
+      - k_star: k* -> 标出 ℓ* = 1/k*
+      - k_star_threshold 或 nrmse_threshold: 阈值线（水平线）
+      - grid_meta: dict, 推荐含 dx,dy 以及（可选）Lx,Ly,obstacle_diameter
+
+    参照信息（如果拿得到）：
+      - Nyquist 尺度: ℓ_Nyq = 2*min(dx,dy)
+      - obstacle diameter D
+      - domain sizes Lx, Ly
     """
     curve = entry.get("fourier_curve", None)
     if curve is None:
         return None
 
-    k = np.asarray(curve.get("k_centers", []), dtype=float)
-    y = np.asarray(curve.get("nrmse_k", []), dtype=float)
+    k = np.asarray(curve.get("k_centers", []), dtype=float).reshape(-1)
+    y = np.asarray(curve.get("nrmse_k", []), dtype=float).reshape(-1)
     if k.size == 0 or y.size == 0 or k.size != y.size:
         return None
 
+    # ---- grid meta (for physical annotation) ----
+    # 兼容不同可能的存放位置
+    grid_meta = (
+        curve.get("grid_meta", None)
+        or entry.get("grid_meta", None)
+        or entry.get("fourier_meta", None)
+        or entry.get("fourier", None)
+        or {}
+    )
+    g = dict(grid_meta or {})
+    dx = float(g.get("dx", 1.0))
+    dy = float(g.get("dy", 1.0))
+    Lx = g.get("Lx", None)
+    Ly = g.get("Ly", None)
+    D = g.get("obstacle_diameter", None)
+
+    # ---- build physical scale ℓ = 1/k ----
+    # k=0 会导致无穷大尺度；解释曲线一般从最小正k开始画
+    eps = 1e-12
+    mask = np.isfinite(k) & np.isfinite(y) & (k > 0)
+    k = k[mask]
+    y = y[mask]
+    if k.size == 0:
+        return None
+
+    ell = 1.0 / np.maximum(k, eps)  # length unit
+    # 为了让 x 轴从“小尺度 -> 大尺度”或反过来更直观，这里选“大尺度在右边”
+    # 即 ell 从小到大递增（k 从大到小）
+    order = np.argsort(ell)
+    ell = ell[order]
+    y = y[order]
+    k_sorted = k[order]
+
+    # ---- title suffix: show p, sigma, model ----
     p = entry.get("mask_rate", None)
     s = entry.get("noise_sigma", None)
-    suffix = []
+    model = entry.get("model", entry.get("name", None))
+
+    suffix_parts = []
+    if model is not None:
+        suffix_parts.append(str(model))
     if p is not None:
-        suffix.append(f"p={float(p):.3g}")
+        suffix_parts.append(f"p={float(p):.3g}")
     if s is not None:
-        suffix.append(f"σ={float(s):.3g}")
-    suffix = (", " + ", ".join(suffix)) if suffix else ""
+        suffix_parts.append(f"σ={float(s):.3g}")
+    suffix = " | " + ", ".join(suffix_parts) if suffix_parts else ""
 
-    fig, ax = plt.subplots(1, 1, figsize=(7.2, 3.8))
-    ax.plot(k, y, linewidth=2.0)
+    # ---- plot ----
+    fig, ax = plt.subplots(1, 1, figsize=(8.2, 4.2))
 
+    # 主曲线：NRMSE vs ℓ
+    ax.plot(ell, y, linewidth=2.2)
+
+    ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("k (cycles / length)")
-    ax.set_ylabel("NRMSE(k) (log)")
+    ax.set_xlabel("spatial scale ℓ (length unit, ℓ = 1/k)")
+    ax.set_ylabel("NRMSE(ℓ) (log)")
     ax.set_title(f"{title_prefix}{suffix}")
     ax.grid(True, which="both", alpha=0.3)
 
+    # ---- top axis: show k as secondary axis (so readers who like k still get it) ----
+    def ell_to_k(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    def k_to_ell(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    secax = ax.secondary_xaxis("top", functions=(ell_to_k, k_to_ell))
+    secax.set_xlabel("wavenumber k (cycles / length unit)")
+
+    # ---- band edges: convert k_edges -> ℓ_edges and annotate ----
     if show_edges:
         k_edges = curve.get("k_edges", None)
+        band_names = curve.get("band_names", None) or ("L", "M", "H")
         if k_edges is not None:
-            for ke in k_edges:
-                try:
-                    ax.axvline(float(ke), linestyle="--", linewidth=1.0)
-                except Exception:
-                    pass
+            # keep only valid positive edges
+            edges_k = sorted([float(v) for v in k_edges if v is not None and np.isfinite(v) and float(v) > 0])
+            edges_ell = [1.0 / max(ke, eps) for ke in edges_k]  # decreasing with ke
+            # in ℓ-axis (increasing), edges should be sorted
+            edges_ell = sorted(edges_ell)
 
-    # k* + threshold
+            # draw vertical lines at ℓ edges
+            for le in edges_ell:
+                ax.axvline(le, linestyle="--", linewidth=1.0)
+
+            # add light shading + labels to make “bands = scale ranges” explicit
+            # segments in ℓ: [ℓ_min, e1], [e1,e2], ... [elast, ℓ_max]
+            x_min, x_max = ax.get_xlim()
+            segs = [x_min] + [le for le in edges_ell if x_min < le < x_max] + [x_max]
+            nb = max(1, len(segs) - 1)
+
+            for i in range(nb):
+                a, b = segs[i], segs[i + 1]
+                if not (np.isfinite(a) and np.isfinite(b) and b > a > 0):
+                    continue
+                # alternate subtle shading
+                if i % 2 == 0:
+                    ax.axvspan(a, b, alpha=0.06)
+
+                name = band_names[i] if i < len(band_names) else f"B{i}"
+                xm = np.sqrt(a * b)  # log-midpoint
+
+                # show ℓ range text
+                if i == 0:
+                    txt = f"{name}\nℓ < {b:.3g}"
+                elif i == nb - 1:
+                    txt = f"{name}\nℓ ≥ {a:.3g}"
+                else:
+                    txt = f"{name}\n{a:.3g} ≤ ℓ < {b:.3g}"
+
+                # place near top
+                y_top = ax.get_ylim()[1]
+                ax.text(xm, y_top, txt, ha="center", va="top", fontsize=9)
+
+    # ---- threshold + meaning ----
+    thr = curve.get("k_star_threshold", curve.get("nrmse_threshold", None))
+    if thr is not None and np.isfinite(float(thr)):
+        thr = float(thr)
+        ax.axhline(thr, linestyle=":", linewidth=1.2)
+        # 更“人话”的解释：NRMSE=1 常被理解为误差能量≈信号能量（当然也取决于你怎么归一化）
+        # 这里不强行解释成唯一物理意义，只写“判据线”
+        ax.text(ax.get_xlim()[0], thr, " criterion (threshold) ", va="bottom", ha="left", fontsize=9)
+
+    # ---- k* -> ℓ* ----
     if show_kstar:
         k_star = curve.get("k_star", entry.get("k_star", None))
-        if k_star is not None:
-            try:
-                ax.axvline(float(k_star), linestyle="-.", linewidth=1.5)
-                ax.text(float(k_star), ax.get_ylim()[0], " k*", va="bottom", ha="left")
-            except Exception:
-                pass
+        if k_star is not None and np.isfinite(float(k_star)) and float(k_star) > 0:
+            k_star = float(k_star)
+            ell_star = 1.0 / max(k_star, eps)
+            ax.axvline(ell_star, linestyle="-.", linewidth=1.6)
+            ax.text(
+                ell_star,
+                ax.get_ylim()[0],
+                f"  ℓ*={ell_star:.3g}  (k*={k_star:.3g})",
+                va="bottom",
+                ha="left",
+                fontsize=9,
+            )
 
-        thr = curve.get("k_star_threshold", curve.get("nrmse_threshold", None))
-        if thr is not None:
-            try:
-                ax.axhline(float(thr), linestyle=":", linewidth=1.2)
-                ax.text(ax.get_xlim()[0], float(thr), " threshold ", va="bottom", ha="left")
-            except Exception:
-                pass
+    # ---- physical reference markers ----
+    # Nyquist scale: smallest resolvable wavelength on grid (~2*dx)
+    try:
+        dmin = float(min(dx, dy))
+        if np.isfinite(dmin) and dmin > 0:
+            ell_nyq = 2.0 * dmin
+            ax.axvline(ell_nyq, linestyle=":", linewidth=1.2)
+            ax.text(
+                ell_nyq,
+                ax.get_ylim()[1],
+                f"Nyquist ℓ≈2Δ ({ell_nyq:.3g})",
+                va="top",
+                ha="left",
+                fontsize=9,
+            )
+    except Exception:
+        pass
+
+    # obstacle diameter D
+    if D is not None:
+        try:
+            D = float(D)
+            if np.isfinite(D) and D > 0:
+                ax.axvline(D, linestyle=":", linewidth=1.2)
+                ax.text(D, ax.get_ylim()[1], f"D={D:.3g}", va="top", ha="left", fontsize=9)
+        except Exception:
+            pass
+
+    # domain scale notes (not vertical lines; just a legend-like note)
+    note_parts = []
+    if (Lx is not None) and np.isfinite(float(Lx)):
+        note_parts.append(f"Lx={float(Lx):.3g}")
+    if (Ly is not None) and np.isfinite(float(Ly)):
+        note_parts.append(f"Ly={float(Ly):.3g}")
+    if note_parts:
+        ax.text(
+            0.99,
+            0.02,
+            " / ".join(note_parts),
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            alpha=0.9,
+        )
 
     fig.tight_layout()
     return fig
@@ -259,7 +411,6 @@ def plot_spatial_fourier_band_decomposition(
     dy: float = 1.0,
     channel: int = 0,
     title: str = "Spatial decomposition by Fourier bands",
-    # NEW:
     center_mode: str = "target_mean",   # "none" | "target_mean"
     robust_q: float = 99.5,             # for vlim
     max_cols: int = 5,                  # wrap columns when bands are many
@@ -270,11 +421,15 @@ def plot_spatial_fourier_band_decomposition(
     列：Full + 各 band（按 k_edges 划分）
     - 支持零中心化：减去 target 的空间均值（仅用于可视化）
     - 支持 band 多时自动换行（wrap），避免图过长/过宽
+    - 上方为 value colorbar（标题下方），下方为 error colorbar，互不重叠
+    - 通过 set_box_aspect(H/W) 让每个子图轴本身呈现条带比例，从根源压缩留白
     """
     xT = _ensure_hw(x_true_hw, channel=channel)
     xP = _ensure_hw(x_pred_hw, channel=channel)
     if xT.shape != xP.shape:
         raise ValueError(f"x_true shape {xT.shape} != x_pred shape {xP.shape}")
+
+    H, W = xT.shape
 
     edges = [float(v) for v in k_edges if v is not None]
     if len(edges) == 0:
@@ -311,12 +466,14 @@ def plot_spatial_fourier_band_decomposition(
     err_comps = [p - t for p, t in zip(pred_comps, true_comps, strict=False)]
 
     # ---- unified, robust color limits ----
+    # main：只用 Full 的 true 来定标（与你现在一致）
     vals = true_comps[0].ravel()
     max_abs_main = float(np.percentile(np.abs(vals), robust_q))
     if max_abs_main == 0.0:
         max_abs_main = 1.0
     vmin_main, vmax_main = -max_abs_main, max_abs_main
 
+    # err：只用 Full 的 error 来定标
     err0 = err_comps[0].ravel()
     max_abs_err = float(np.percentile(np.abs(err0), robust_q))
     if max_abs_err == 0.0:
@@ -324,72 +481,141 @@ def plot_spatial_fourier_band_decomposition(
     vmin_err, vmax_err = -max_abs_err, max_abs_err
 
     # ---- layout with wrapping ----
-    cols_all = ["Full"] + names  # Full + nb bands
-    n_panels = 1 + nb
-    max_cols = max(2, int(max_cols))
-    n_blocks = int(np.ceil(n_panels / max_cols))
+    cols_all = ["Full"] + list(names)        # Full + nb bands
+    n_panels = 1 + nb                        # Full + nb (注意：这里和 true_comps/pred_comps 的索引一致)
 
-    fig = plt.figure(figsize=(3.0 * min(max_cols, n_panels), 2.2 * 3 * n_blocks))
-    gs = fig.add_gridspec(nrows=3 * n_blocks, ncols=max_cols, hspace=0.35, wspace=0.15)
+    max_cols = max(1, int(max_cols))
+    ncols = min(max_cols, n_panels)          # band 少时不留空列
+    n_blocks = int(np.ceil(n_panels / ncols))
 
-    axes = []
+    # 分区：Grid 只占中间区域，上下分别给标题/上 colorbar 和下 colorbar
+    GRID_TOP = 0.78
+    GRID_BOTTOM = 0.18
+
+    # figsize：宽随列数，高随 block 数；这里高度不要太大，否则看起来松
+    fig_w = 2.7 * ncols
+    fig_h = 0.80 * 3 * n_blocks + 1.10
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    # 每一行很扁：height_ratios + hspace 控行距（留白主要靠 set_box_aspect 再压一刀）
+    row_heights = []
+    for _ in range(n_blocks):
+        row_heights.extend([0.16, 0.16, 0.16])
+
+    gs = fig.add_gridspec(
+        nrows=3 * n_blocks,
+        ncols=ncols,
+        height_ratios=row_heights,
+        hspace=0.01,
+        wspace=0.10,
+        left=0.06,
+        right=0.99,
+        top=GRID_TOP,
+        bottom=GRID_BOTTOM,
+    )
+
     first_main_im = None
     first_err_im = None
 
+    # 让轴框也变成条带比例（关键！）：box_aspect = H/W（很小）
+    box_aspect = float(H) / float(W) if W > 0 else 1.0
+
+    def _style_ax(ax: plt.Axes) -> None:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # 关键：把“轴框高度”压成与数据一致的条带比例，空白会显著减少
+        try:
+            ax.set_box_aspect(box_aspect)
+        except Exception:
+            # 老版本 matplotlib 可能没有 set_box_aspect
+            pass
+
     for b in range(n_blocks):
-        start = b * max_cols
-        end = min((b + 1) * max_cols, n_panels)
+        start = b * ncols
+        end = min((b + 1) * ncols, n_panels)
+
         for j, col_idx in enumerate(range(start, end)):
-            # column title on the top row of this block
             col_title = cols_all[col_idx]
 
-            # True / Pred / Error rows inside this block
             for r in range(3):
                 ax = fig.add_subplot(gs[3 * b + r, j])
-                axes.append(ax)
 
                 if r == 0:
-                    im = ax.imshow(true_comps[col_idx], origin="lower", cmap="RdBu_r",
-                                   vmin=vmin_main, vmax=vmax_main)
+                    im = ax.imshow(
+                        true_comps[col_idx],
+                        origin="lower",
+                        cmap="RdBu_r",
+                        vmin=vmin_main,
+                        vmax=vmax_main,
+                        aspect="equal",  # 不拉伸像素
+                    )
                     if first_main_im is None:
                         first_main_im = im
+                    ax.set_title(col_title, fontsize=10)
                     if j == 0:
                         ax.set_ylabel("True")
-                    ax.set_title(col_title, fontsize=10)
+
                 elif r == 1:
-                    im = ax.imshow(pred_comps[col_idx], origin="lower", cmap="RdBu_r",
-                                   vmin=vmin_main, vmax=vmax_main)
+                    ax.imshow(
+                        pred_comps[col_idx],
+                        origin="lower",
+                        cmap="RdBu_r",
+                        vmin=vmin_main,
+                        vmax=vmax_main,
+                        aspect="equal",
+                    )
                     if j == 0:
                         ax.set_ylabel("Pred")
+
                 else:
-                    im = ax.imshow(err_comps[col_idx], origin="lower", cmap="RdBu_r",
-                                   vmin=vmin_err, vmax=vmax_err)
+                    im = ax.imshow(
+                        err_comps[col_idx],
+                        origin="lower",
+                        cmap="RdBu_r",
+                        vmin=vmin_err,
+                        vmax=vmax_err,
+                        aspect="equal",
+                    )
                     if first_err_im is None:
                         first_err_im = im
                     if j == 0:
                         ax.set_ylabel("Error")
 
-                ax.set_xticks([]); ax.set_yticks([])
+                _style_ax(ax)
 
-        # pad empty cells in this block (keep grid tidy)
-        for j in range(end - start, max_cols):
+        # 块内不足 ncols 的空位关掉
+        for j in range(end - start, ncols):
             for r in range(3):
                 ax = fig.add_subplot(gs[3 * b + r, j])
                 ax.axis("off")
 
-    # ---- compact colorbars (like your POD quad style) ----
+    # ---- title ----
+    fig.suptitle(title, fontsize=12, y=0.99)
+
+    # ---- manual colorbars: 与 grid 分区，互不干扰 ----
+    cbar_h = 0.02
+    cbar_w = 0.58
+    cbar_left = 0.5 - cbar_w / 2.0
+
+    # 上方 value colorbar：放在 GRID_TOP 之上，label 在上，不压到网格
     if first_main_im is not None:
-        cbar_main = fig.colorbar(first_main_im, ax=axes, orientation="horizontal",
-                                 fraction=0.02, pad=0.03)
-        cbar_main.set_label("value (centered by target mean)" if center_mode == "target_mean" else "value")
+        cax1 = fig.add_axes([cbar_left, GRID_TOP + 0.075, cbar_w, cbar_h])
+        cb1 = fig.colorbar(first_main_im, cax=cax1, orientation="horizontal")
+        cb1.set_label(
+            "value (centered by target mean)" if center_mode == "target_mean" else "value",
+            labelpad=4,
+        )
+        cb1.ax.xaxis.set_label_position("top")
+        cb1.ax.xaxis.set_ticks_position("bottom")
 
+    # 下方 error colorbar：放在 GRID_BOTTOM 之下
     if first_err_im is not None:
-        cbar_err = fig.colorbar(first_err_im, ax=axes, orientation="horizontal",
-                                fraction=0.02, pad=0.10)
-        cbar_err.set_label("error (Pred - True)")
+        cax2 = fig.add_axes([cbar_left, GRID_BOTTOM - 0.08, cbar_w, cbar_h])
+        cb2 = fig.colorbar(first_err_im, cax=cax2, orientation="horizontal")
+        cb2.set_label("error (Pred - True)", labelpad=4)
+        cb2.ax.xaxis.set_label_position("top")
+        cb2.ax.xaxis.set_ticks_position("bottom")
 
-    fig.suptitle(title, fontsize=12, y=0.995)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
     return fig
 
 
@@ -618,3 +844,118 @@ def plot_fourier_curve_from_entry(
         show_edges=True,
         show_kstar=True,
     )
+
+
+def plot_fourier_example_from_npz_data(
+    data: "np.lib.npyio.NpzFile | dict[str, object]",
+    *,
+    title_prefix: str | None = None,
+    # allow override / fallback
+    k_edges: Sequence[float] | None = None,
+    band_names: Sequence[str] | None = None,
+    dx: float | None = None,
+    dy: float | None = None,
+    # passthrough controls
+    center_mode: str = "target_mean",
+    robust_q: float = 99.5,
+    channel: int = 0,
+) -> Optional[plt.Figure]:
+    """
+    从已加载的 example npz 数据对象中恢复一张“傅里叶多尺度空间联图”（不做任何 IO）。
+
+    预期包含（至少）：
+        - x_true, x_hat
+    建议包含（用于保证口径一致）：
+        - fourier_k_edges
+        - fourier_band_names
+        - fourier_dx, fourier_dy
+
+    若上述 fourier_* 字段不存在，会按优先级回退到函数参数（k_edges/band_names/dx/dy）。
+    """
+    files = getattr(data, "files", None)
+    has = (lambda k: (k in files) if files is not None else (k in data))
+    get = (lambda k: data[k])
+
+    x_true = np.asarray(get("x_true"))
+    x_hat = np.asarray(get("x_hat"))
+
+    # --- resolve meta with fallback ---
+    if k_edges is None and has("fourier_k_edges"):
+        k_edges = np.asarray(get("fourier_k_edges")).astype(float).tolist()
+    if band_names is None and has("fourier_band_names"):
+        raw = get("fourier_band_names")
+        band_names = [str(x) for x in np.asarray(raw).tolist()]
+    if dx is None and has("fourier_dx"):
+        dx = float(get("fourier_dx"))
+    if dy is None and has("fourier_dy"):
+        dy = float(get("fourier_dy"))
+
+    if k_edges is None:
+        raise ValueError(
+            "plot_fourier_example_from_npz_data: missing k_edges "
+            "(fourier_k_edges not in npz and k_edges not provided)"
+        )
+    if band_names is None:
+        band_names = ("L", "M", "H")
+    if dx is None:
+        dx = 1.0
+    if dy is None:
+        dy = 1.0
+
+    # title
+    if title_prefix is None:
+        model_name = str(get("model_type")) if has("model_type") else "model"
+
+        parts = [f"Fourier bands spatial view ({model_name})"]
+        if has("mask_rate"):
+            parts.append(f"p={float(get('mask_rate')):.3g}")
+        if has("noise_sigma"):
+            parts.append(f"σ={float(get('noise_sigma')):.3g}")
+        if has("frame_idx"):
+            parts.append(f"frame={int(get('frame_idx'))}")
+        title_prefix = " | ".join(parts)
+
+    return plot_spatial_fourier_band_decomposition(
+        x_true_hw=x_true,
+        x_pred_hw=x_hat,
+        k_edges=k_edges,
+        band_names=band_names,
+        dx=dx,
+        dy=dy,
+        title=title_prefix,
+        channel=channel,
+        center_mode=center_mode,
+        robust_q=robust_q,
+    )
+
+
+def plot_fourier_example_from_npz(
+    npz_path: str | Path,
+    *,
+    title_prefix: str | None = None,
+    k_edges: Sequence[float] | None = None,
+    band_names: Sequence[str] | None = None,
+    dx: float | None = None,
+    dy: float | None = None,
+    center_mode: str = "target_mean",
+    robust_q: float = 99.5,
+    channel: int = 0,
+) -> Optional[plt.Figure]:
+    """
+    从保存的 example npz 文件中恢复一张“傅里叶多尺度空间联图”。
+
+    这是一个薄封装：负责 IO，实际绘制逻辑在 plot_fourier_example_from_npz_data() 内。
+    """
+    npz_path = Path(npz_path)
+    with np.load(npz_path) as data:
+        return plot_fourier_example_from_npz_data(
+            data,
+            title_prefix=title_prefix,
+            k_edges=k_edges,
+            band_names=band_names,
+            dx=dx,
+            dy=dy,
+            center_mode=center_mode,
+            robust_q=robust_q,
+            channel=channel,
+        )

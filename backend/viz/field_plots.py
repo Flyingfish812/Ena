@@ -232,43 +232,43 @@ def plot_recon_quadruple(
 
     return fig
 
-def plot_example_from_npz(
-    npz_path: str | Path,
+def plot_example_from_npz_data(
+    data: "np.lib.npyio.NpzFile | dict[str, object]",
     *,
     model_name: str | None = None,
     title_prefix: str | None = None,
 ) -> plt.Figure:
     """
-    从保存的 example npz 文件中恢复一张四联图。
+    从已加载的 example npz 数据对象中恢复一张 POD 四联图（不做任何 IO）。
 
-    兼容 v1.08 的 npz 格式：
-        - x_true:   [H,W,C]
-        - x_hat:    [H,W,C]
-        - x_interp: [H,W,C]
-      可选:
-        - mask_hw:      [H,W] bool
-        - mask_rate:    float
-        - noise_sigma:  float
-        - frame_idx:    int
-        - model_type:   str
+    预期包含（至少）以下 key：
+        - x_true:      (H, W) 或 (C, H, W) 或 (H, W, C)
+        - x_hat:       同上
+        - x_interp:    同上
+    可选 key：
+        - mask_hw:     (H, W) 的 0/1 采样掩码
+        - mask_rate:   float
+        - noise_sigma: float
+        - frame_idx:   int
+        - model_type:  str
     """
-    npz_path = Path(npz_path)
-    data = np.load(npz_path)
+    files = getattr(data, "files", None)
+    has = (lambda k: (k in files) if files is not None else (k in data))
+    get = (lambda k: data[k])  # NpzFile / dict 都支持 __getitem__
 
-    x_true = np.asarray(data["x_true"])
-    x_hat = np.asarray(data["x_hat"])
-    x_interp = np.asarray(data["x_interp"])
-    mask_hw = np.asarray(data["mask_hw"]) if "mask_hw" in data.files else None
-    mask_rate = float(data["mask_rate"]) if "mask_rate" in data.files else None
-    noise_sigma = float(data["noise_sigma"]) if "noise_sigma" in data.files else None
-    frame_idx = int(data["frame_idx"]) if "frame_idx" in data.files else None
+    x_true = np.asarray(get("x_true"))
+    x_hat = np.asarray(get("x_hat"))
+    x_interp = np.asarray(get("x_interp"))
+    mask_hw = np.asarray(get("mask_hw")) if has("mask_hw") else None
+    mask_rate = float(get("mask_rate")) if has("mask_rate") else None
+    noise_sigma = float(get("noise_sigma")) if has("noise_sigma") else None
+    frame_idx = int(get("frame_idx")) if has("frame_idx") else None
 
-    if model_name is None and "model_type" in data.files:
-        model_name = str(data["model_type"])
+    if model_name is None and has("model_type"):
+        model_name = str(get("model_type"))
     elif model_name is None:
         model_name = "model"
 
-    # 自动生成标题
     if title_prefix is None:
         parts = [model_name]
         if frame_idx is not None:
@@ -279,7 +279,6 @@ def plot_example_from_npz(
             parts.append(f"σ={noise_sigma:.3g}")
         title_prefix = " | ".join(parts)
 
-    # 这里调用的是你现在的四联图函数：注意参数名对应！
     fig = plot_recon_quadruple(
         x_input_hw=x_interp,
         x_output_hw=x_hat,
@@ -288,3 +287,22 @@ def plot_example_from_npz(
         title=title_prefix,
     )
     return fig
+
+def plot_example_from_npz(
+    npz_path: str | Path,
+    *,
+    model_name: str | None = None,
+    title_prefix: str | None = None,
+) -> plt.Figure:
+    """
+    从保存的 example npz 文件中恢复一张 POD 四联图。
+
+    这是一个薄封装：负责 IO，实际绘制逻辑在 plot_example_from_npz_data() 内。
+    """
+    npz_path = Path(npz_path)
+    with np.load(npz_path) as data:
+        return plot_example_from_npz_data(
+            data,
+            model_name=model_name,
+            title_prefix=title_prefix,
+        )
