@@ -785,8 +785,14 @@ def plot_fourier_band_nrmse_curves(
         ax.set_ylabel("Fourier band NRMSE (log)")
         ax.set_title(f"Fourier band NRMSE vs mask_rate ({model})")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend(fontsize=8, ncol=2)
-        fig.tight_layout()
+        ax.legend(
+            fontsize=8,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+        )
+
+        fig.subplots_adjust(right=0.78)
         return fig
 
     def _plot_vs_noise(df, model: str) -> Optional[plt.Figure]:
@@ -814,8 +820,14 @@ def plot_fourier_band_nrmse_curves(
         ax.set_ylabel("Fourier band NRMSE (log)")
         ax.set_title(f"Fourier band NRMSE vs noise_sigma ({model})")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend(fontsize=8, ncol=2)
-        fig.tight_layout()
+        ax.legend(
+            fontsize=8,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+        )
+
+        fig.subplots_adjust(right=0.78)
         return fig
 
     figs["fig_fourier_band_vs_mask_linear"] = _plot_vs_mask(df_lin, "linear")

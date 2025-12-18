@@ -193,6 +193,17 @@ def plot_eval_nmse_curves(
         arr = np.asarray(values, dtype=float)
         return np.unique(arr[~np.isnan(arr)])
 
+    def _legend_right(ax: plt.Axes, fig: plt.Figure, *, fontsize: int = 7, right: float = 0.78):
+        """把 legend 放到图右侧（图外），并给右侧留空间避免裁剪。"""
+        leg = ax.legend(
+            fontsize=fontsize,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+        )
+        fig.subplots_adjust(right=right)
+        return leg
+
     figs: dict[str, plt.Figure] = {}
 
     # ---------- Helper: 单模型多曲线 ----------
@@ -217,8 +228,7 @@ def plot_eval_nmse_curves(
         ax1.set_ylabel(metric_col)
         ax1.set_title(f"{model_name}: {metric_col} vs {mask_col}")
         ax1.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax1.legend(fontsize=7)
-        fig1.tight_layout()
+        _legend_right(ax1, fig1, fontsize=7, right=0.78)
 
         # 2) metric vs noise_sigma，全 mask 曲线，x/y 均 log
         mask_values = _unique_sorted(df[mask_col])
@@ -240,8 +250,7 @@ def plot_eval_nmse_curves(
         ax2.set_ylabel(metric_col)
         ax2.set_title(f"{model_name}: {metric_col} vs {noise_col}")
         ax2.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax2.legend(fontsize=7)
-        fig2.tight_layout()
+        _legend_right(ax2, fig2, fontsize=7, right=0.78)
 
         return fig1, fig2
 

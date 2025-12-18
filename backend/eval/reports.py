@@ -258,6 +258,15 @@ def load_full_experiment_results(
 # 2. Markdown 实验报告生成
 # ----------------------------------------------------------------------
 
+def _append_path_or_list(lines: list[str], label: str, p):
+    if p is None:
+        return
+    if isinstance(p, (list, tuple)):
+        for pp in p:
+            lines.append(f"- {label}: `{Path(pp)}`")
+    else:
+        lines.append(f"- {label}: `{Path(p)}`")
+
 def generate_experiment_report_md(
     all_result: Dict[str, Any],
     out_path: Path | str,
@@ -465,18 +474,18 @@ def generate_experiment_report_md(
         lines.append("## 3. 全局误差曲线（文件路径）")
         lines.append("")
         if fig_nmse_vs_mask is not None:
-            lines.append(f"- NMSE vs 观测率: `{Path(fig_nmse_vs_mask)}`")
+            _append_path_or_list(lines, "NMSE vs 观测率", fig_nmse_vs_mask)
         if fig_nmse_vs_noise is not None:
-            lines.append(f"- NMSE vs 噪声强度: `{Path(fig_nmse_vs_noise)}`")
+            _append_path_or_list(lines, "NMSE vs 噪声强度", fig_nmse_vs_noise)
         lines.append("")
 
     if (fig_example_linear is not None) or (fig_example_mlp is not None):
         lines.append("## 4. 典型重建可视化（文件路径）")
         lines.append("")
         if fig_example_linear is not None:
-            lines.append(f"- Linear 示例四联图: `{Path(fig_example_linear)}`")
+            _append_path_or_list(lines, "Linear 示例四联图", fig_example_linear)
         if fig_example_mlp is not None:
-            lines.append(f"- MLP 示例四联图: `{Path(fig_example_mlp)}`")
+            _append_path_or_list(lines, "MLP 示例四联图", fig_example_mlp)
         lines.append("")
 
     lines.append("## 5. 量化结果一览（全部组合）")
@@ -499,7 +508,7 @@ def generate_experiment_report_md(
         lines.append("当前结果中未找到可用的 POD band 多尺度统计信息。")
     if fig_multiscale_example is not None:
         lines.append("")
-        lines.append(f"- 典型 POD 多尺度图: `{Path(fig_multiscale_example)}`")
+        _append_path_or_list(lines, "典型 POD 多尺度图", fig_multiscale_example)
     lines.append("")
 
     lines.append("## 7. 多尺度分析：Fourier 频域（新版）")
@@ -507,7 +516,7 @@ def generate_experiment_report_md(
     lines.append("### 7.0 Fourier 频域尺度的定义图（L/M/H 是什么）")
     lines.append("")
     if fig_fourier_energy_spectrum is not None:
-        lines.append(f"- Energy spectrum + band edges: `{Path(fig_fourier_energy_spectrum)}`")
+        _append_path_or_list(lines, "Energy spectrum + band edges", fig_fourier_energy_spectrum)
     else:
         lines.append("- （无）说明：当前结果未提供 meta['fourier_k_centers/energy_k/k_edges'] 或未生成保存。")
     lines.append("")
@@ -520,9 +529,9 @@ def generate_experiment_report_md(
     lines.append("### 7.1 k* 热力图（文件路径）")
     lines.append("")
     if fig_kstar_linear is not None:
-        lines.append(f"- k* heatmap (linear): `{Path(fig_kstar_linear)}`")
+        _append_path_or_list(lines, "k* heatmap (linear)", fig_kstar_linear)
     if fig_kstar_mlp is not None:
-        lines.append(f"- k* heatmap (mlp): `{Path(fig_kstar_mlp)}`")
+        _append_path_or_list(lines, "k* heatmap (mlp)", fig_kstar_mlp)
     if (fig_kstar_linear is None) and (fig_kstar_mlp is None):
         lines.append("- （无）")
     lines.append("")
@@ -530,13 +539,13 @@ def generate_experiment_report_md(
     lines.append("### 7.2 Fourier band NRMSE 曲线（文件路径）")
     lines.append("")
     if fig_fourier_band_vs_mask_linear is not None:
-        lines.append(f"- Fourier band vs mask (linear): `{Path(fig_fourier_band_vs_mask_linear)}`")
+        _append_path_or_list(lines, "Fourier band vs mask (linear)", fig_fourier_band_vs_mask_linear)
     if fig_fourier_band_vs_mask_mlp is not None:
-        lines.append(f"- Fourier band vs mask (mlp): `{Path(fig_fourier_band_vs_mask_mlp)}`")
+        _append_path_or_list(lines, "Fourier band vs mask (mlp)", fig_fourier_band_vs_mask_mlp)
     if fig_fourier_band_vs_noise_linear is not None:
-        lines.append(f"- Fourier band vs noise (linear): `{Path(fig_fourier_band_vs_noise_linear)}`")
+        _append_path_or_list(lines, "Fourier band vs noise (linear)", fig_fourier_band_vs_noise_linear)
     if fig_fourier_band_vs_noise_mlp is not None:
-        lines.append(f"- Fourier band vs noise (mlp): `{Path(fig_fourier_band_vs_noise_mlp)}`")
+        _append_path_or_list(lines, "Fourier band vs noise (mlp)", fig_fourier_band_vs_noise_mlp)
     if (
         fig_fourier_band_vs_mask_linear is None
         and fig_fourier_band_vs_mask_mlp is None

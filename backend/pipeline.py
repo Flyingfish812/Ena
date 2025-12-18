@@ -1716,7 +1716,7 @@ def extract_and_save_figures(
             if k_edges is not None:
                 kwargs["fourier_k_edges"] = np.asarray(k_edges, dtype=float)
             if band_names is not None:
-                kwargs["fourier_band_names"] = np.asarray([str(x) for x in band_names], dtype=object)
+                kwargs["fourier_band_names"] = np.asarray([str(x) for x in band_names], dtype="U32")
 
             np.savez_compressed(p_npz, **kwargs)
             key = f"examples_linear_npz/{cfg_name}"
@@ -1748,7 +1748,7 @@ def extract_and_save_figures(
             if k_edges is not None:
                 kwargs["fourier_k_edges"] = np.asarray(k_edges, dtype=float)
             if band_names is not None:
-                kwargs["fourier_band_names"] = np.asarray([str(x) for x in band_names], dtype=object)
+                kwargs["fourier_band_names"] = np.asarray([str(x) for x in band_names], dtype="U32")
 
             np.savez_compressed(p_npz, **kwargs)
             key = f"examples_mlp_npz/{cfg_name}"
@@ -1820,28 +1820,134 @@ def extract_and_save_figures(
         fig_paths["fig_fourier_energy_spectrum"] = out
         _log(f"[yaml-extract] Saved figure: {out}")
 
-    # 4.4 per-cfg：k* 曲线解释图（保留）
+    # 4.4 per-cfg：k* 曲线解释图（PNG + 原始曲线NPZ）
     curves_lin = figs.get("fig_fourier_kstar_curves_linear") or {}
     curves_mlp = figs.get("fig_fourier_kstar_curves_mlp") or {}
+
+    # --- build entry index (p,s) -> entry, to fetch raw curve data ---
+    def _index_entries(results: Dict[str, Any] | None) -> Dict[tuple[float, float], Dict[str, Any]]:
+        idx: Dict[tuple[float, float], Dict[str, Any]] = {}
+        if results is None:
+            return idx
+        for e in (results.get("entries", []) or []):
+            try:
+                p = float(e.get("mask_rate"))
+                s = float(e.get("noise_sigma"))
+            except Exception:
+                continue
+            idx[(p, s)] = e
+        return idx
+
+    def _parse_cfg_name(cfg: str) -> tuple[float | None, float | None]:
+        # cfg like: "p0-0004_sigma0" or "p0-0004_sigma0-01"
+        try:
+            p_part, s_part = cfg.split("_sigma")
+            p = float(p_part[1:].replace("-", "."))
+            s = float(s_part.replace("-", "."))
+            return p, s
+        except Exception:
+            return None, None
+
+    lin_entry_idx = _index_entries(lin_res)
+    mlp_entry_idx = _index_entries(mlp_res)
+
+    # meta fallback (for grid_meta if not embedded in curve)
+    meta = ((mlp_res or {}).get("meta", {}) or (lin_res or {}).get("meta", {}) or {})
+    grid_meta_fallback = meta.get("fourier_grid_meta", None) or {}
+
+    def _save_kstar_curve_npz(
+        *,
+        out_path: Path,
+        entry: Dict[str, Any],
+        model: str,
+        cfg_name: str,
+    ) -> bool:
+        """
+        Save raw curve data needed to redraw k* curve / ℓ curve.
+        Returns True if saved, False if no curve data.
+        """
+        fc = entry.get("fourier_curve", None)
+        if not isinstance(fc, dict):
+            return False
+
+        # Required for curve plot
+        k_centers = fc.get("k_centers", None)
+        nrmse_k = fc.get("nrmse_k", None)
+        if not isinstance(k_centers, (list, tuple)) or not isinstance(nrmse_k, (list, tuple)):
+            return False
+
+        # Optional fields
+        e_true = fc.get("E_true_k", None)
+        e_err = fc.get("E_err_k", None)
+        k_edges = fc.get("k_edges", None)
+        band_names = fc.get("band_names", None)
+
+        k_star = fc.get("k_star", entry.get("k_star", None))
+        k_thr = fc.get("k_star_threshold", None)
+
+        # grid_meta: prefer embedded (if you add it later), else fallback
+        gm = fc.get("grid_meta", None)
+        if not isinstance(gm, dict):
+            gm = grid_meta_fallback if isinstance(grid_meta_fallback, dict) else {}
+
+        np.savez_compressed(
+            out_path,
+            model_type=str(model),
+            cfg_name=str(cfg_name),
+            mask_rate=float(entry.get("mask_rate", float("nan"))),
+            noise_sigma=float(entry.get("noise_sigma", float("nan"))),
+            k_centers=np.asarray(k_centers, dtype=float),
+            nrmse_k=np.asarray(nrmse_k, dtype=float),
+            E_true_k=np.asarray(e_true, dtype=float) if isinstance(e_true, (list, tuple)) else np.asarray([], dtype=float),
+            E_err_k=np.asarray(e_err, dtype=float) if isinstance(e_err, (list, tuple)) else np.asarray([], dtype=float),
+            k_edges=np.asarray(k_edges, dtype=float) if isinstance(k_edges, (list, tuple)) else np.asarray([], dtype=float),
+            band_names=np.asarray([str(x) for x in band_names], dtype="U32") if isinstance(band_names, (list, tuple)) else np.asarray([], dtype="U32"),
+            k_star=np.nan if k_star is None else float(k_star),
+            k_star_threshold=np.nan if k_thr is None else float(k_thr),
+            grid_meta_json=json.dumps(gm, ensure_ascii=False),
+        )
+        return True
 
     cfg_names = sorted(set(curves_lin.keys()) | set(curves_mlp.keys()))
     for cfg_name in cfg_names:
         cfg_dir = exp_dir / cfg_name
         ensure_dir(cfg_dir)
 
+        p_val, s_val = _parse_cfg_name(cfg_name)
+        # 如果 parse 失败，就只保存 PNG，不保存 NPZ
+        key_lin = (p_val, s_val) if (p_val is not None and s_val is not None) else None
+
+        # ---------- linear ----------
         fig = curves_lin.get(cfg_name, None)
         if fig is not None:
-            out = cfg_dir / "fourier_kstar_curve_linear.png"
-            fig.savefig(out, dpi=300, bbox_inches="tight")
-            fig_paths[f"fourier_kstar_curve_linear/{cfg_name}"] = out
-            _log(f"[yaml-extract] Saved figure: {out}")
+            out_png = cfg_dir / "fourier_kstar_curve_linear.png"
+            fig.savefig(out_png, dpi=300, bbox_inches="tight")
+            fig_paths[f"fourier_kstar_curve_linear/{cfg_name}"] = out_png
+            _log(f"[yaml-extract] Saved figure: {out_png}")
 
+        if key_lin is not None:
+            e_lin = lin_entry_idx.get(key_lin, None)
+            if e_lin is not None:
+                out_npz = cfg_dir / "fourier_kstar_curve_linear.npz"
+                if _save_kstar_curve_npz(out_path=out_npz, entry=e_lin, model="linear", cfg_name=cfg_name):
+                    fig_paths[f"fourier_kstar_curve_linear_npz/{cfg_name}"] = out_npz
+                    _log(f"[yaml-extract] Saved k* curve NPZ: {out_npz}")
+
+        # ---------- mlp ----------
         fig = curves_mlp.get(cfg_name, None)
         if fig is not None:
-            out = cfg_dir / "fourier_kstar_curve_mlp.png"
-            fig.savefig(out, dpi=300, bbox_inches="tight")
-            fig_paths[f"fourier_kstar_curve_mlp/{cfg_name}"] = out
-            _log(f"[yaml-extract] Saved figure: {out}")
+            out_png = cfg_dir / "fourier_kstar_curve_mlp.png"
+            fig.savefig(out_png, dpi=300, bbox_inches="tight")
+            fig_paths[f"fourier_kstar_curve_mlp/{cfg_name}"] = out_png
+            _log(f"[yaml-extract] Saved figure: {out_png}")
+
+        if key_lin is not None:
+            e_mlp = mlp_entry_idx.get(key_lin, None)
+            if e_mlp is not None:
+                out_npz = cfg_dir / "fourier_kstar_curve_mlp.npz"
+                if _save_kstar_curve_npz(out_path=out_npz, entry=e_mlp, model="mlp", cfg_name=cfg_name):
+                    fig_paths[f"fourier_kstar_curve_mlp_npz/{cfg_name}"] = out_npz
+                    _log(f"[yaml-extract] Saved k* curve NPZ: {out_npz}")
 
     # -----------------------------
     # 5) 保存 Fourier 元信息（fourier_meta.json）—— 保留
@@ -1858,7 +1964,6 @@ def extract_and_save_figures(
     }
     if any(v is not None for v in fourier_meta.values()):
         out_json = exp_dir / "fourier_meta.json"
-        import json
         with out_json.open("w", encoding="utf-8") as f:
             json.dump(fourier_meta, f, indent=2, ensure_ascii=False)
         fig_paths["fourier_meta_json"] = out_json
@@ -2072,7 +2177,7 @@ def redraw_all_example_figures_from_npz(
 
     for npz_path in npz_paths:
         try:
-            with np.load(npz_path, allow_pickle=False) as data:
+            with np.load(npz_path, allow_pickle=True) as data:
                 files = set(data.files)
 
                 # 只处理 example npz
