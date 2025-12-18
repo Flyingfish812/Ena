@@ -259,101 +259,206 @@ def plot_spatial_fourier_band_decomposition(
     dy: float = 1.0,
     channel: int = 0,
     title: str = "Spatial decomposition by Fourier bands",
+    # NEW:
+    center_mode: str = "target_mean",   # "none" | "target_mean"
+    robust_q: float = 99.5,             # for vlim
+    max_cols: int = 5,                  # wrap columns when bands are many
 ) -> Optional[plt.Figure]:
     """
-    【解释图-A3/B2】空间域“多尺度解释图”：
+    空间域“多尺度解释图”：
     行：True / Pred / Error
-    列：Full / L / M / H（按 k_edges 划分）
-
-    注意：
-    - 这里的 band-pass 是对单帧单通道做径向频带滤波（radial band-pass）。
-    - k_edges 的单位必须与 fftfreq 构造的 k 一致（cycles/length）。
+    列：Full + 各 band（按 k_edges 划分）
+    - 支持零中心化：减去 target 的空间均值（仅用于可视化）
+    - 支持 band 多时自动换行（wrap），避免图过长/过宽
     """
     xT = _ensure_hw(x_true_hw, channel=channel)
     xP = _ensure_hw(x_pred_hw, channel=channel)
     if xT.shape != xP.shape:
         raise ValueError(f"x_true shape {xT.shape} != x_pred shape {xP.shape}")
 
-    edges = [float(v) for v in k_edges]
+    edges = [float(v) for v in k_edges if v is not None]
     if len(edges) == 0:
         return None
+    nb = len(edges) + 1  # band count
 
-    # 构造 bands: [0,e1], [e1,e2], ..., [elast, inf]
-    segs = [None] + edges + [None]
-    # 但我们更明确：low/high 数值
+    # ---- optional centering (visualization only) ----
+    if center_mode == "target_mean":
+        mu = float(np.mean(xT))
+        xT0 = xT - mu
+        xP0 = xP - mu
+    elif center_mode == "none":
+        xT0 = xT
+        xP0 = xP
+    else:
+        raise ValueError(f"Unknown center_mode={center_mode}")
+
+    # ---- bands: [0,e1], [e1,e2], ... , [elast, inf] ----
     lows = [None] + edges
     highs = edges + [None]
 
-    # Full + bands
-    cols = ["Full"] + list(band_names[: (len(lows))])  # 最多匹配到 edges+1 个 band
-    # 实际 band 数 = len(edges)+1
-    nb = len(edges) + 1
-    cols = ["Full"] + list(band_names[:nb])
-    if len(cols) < nb + 1:
-        # 如果 band_names 不够，补默认名
-        for i in range(len(cols) - 1, nb):
-            cols.append(f"B{i}")
+    # names padding
+    need = nb
+    names = list(band_names[:need])
+    if len(names) < need:
+        names += [f"B{i}" for i in range(len(names), need)]
 
-    # 预计算分量
-    true_comps = [xT]
-    pred_comps = [xP]
+    # ---- compute comps (Full + bands) ----
+    true_comps = [xT0]
+    pred_comps = [xP0]
     for lo, hi in zip(lows[:nb], highs[:nb], strict=False):
-        true_comps.append(_fft_bandpass_2d(xT, k_low=lo, k_high=hi, dx=dx, dy=dy))
-        pred_comps.append(_fft_bandpass_2d(xP, k_low=lo, k_high=hi, dx=dx, dy=dy))
+        true_comps.append(_fft_bandpass_2d(xT0, k_low=lo, k_high=hi, dx=dx, dy=dy))
+        pred_comps.append(_fft_bandpass_2d(xP0, k_low=lo, k_high=hi, dx=dx, dy=dy))
     err_comps = [p - t for p, t in zip(pred_comps, true_comps, strict=False)]
 
-    # 颜色范围：True/Pred 用同一范围；Error 用以 0 为中心的对称范围
-    vmin = float(np.min(xT))
-    vmax = float(np.max(xT))
-    emax = float(np.max(np.abs(err_comps[0])))
+    # ---- unified, robust color limits ----
+    vals = true_comps[0].ravel()
+    max_abs_main = float(np.percentile(np.abs(vals), robust_q))
+    if max_abs_main == 0.0:
+        max_abs_main = 1.0
+    vmin_main, vmax_main = -max_abs_main, max_abs_main
 
-    nrows = 3
-    ncols = 1 + nb  # Full + nb bands
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows))
+    err0 = err_comps[0].ravel()
+    max_abs_err = float(np.percentile(np.abs(err0), robust_q))
+    if max_abs_err == 0.0:
+        max_abs_err = max_abs_main
+    vmin_err, vmax_err = -max_abs_err, max_abs_err
 
-    row_titles = ["True", "Pred", "Error"]
-    for j in range(ncols):
-        axes[0, j].set_title(cols[j])
+    # ---- layout with wrapping ----
+    cols_all = ["Full"] + names  # Full + nb bands
+    n_panels = 1 + nb
+    max_cols = max(2, int(max_cols))
+    n_blocks = int(np.ceil(n_panels / max_cols))
 
-    # True row
-    ims = []
-    for j in range(ncols):
-        ax = axes[0, j]
-        im = ax.imshow(true_comps[j], origin="lower", vmin=vmin, vmax=vmax, cmap="RdBu_r")
-        ims.append(im)
-        ax.set_xticks([]); ax.set_yticks([])
-        if j == 0:
-            ax.set_ylabel("True")
+    fig = plt.figure(figsize=(3.0 * min(max_cols, n_panels), 2.2 * 3 * n_blocks))
+    gs = fig.add_gridspec(nrows=3 * n_blocks, ncols=max_cols, hspace=0.35, wspace=0.15)
 
-    # Pred row
-    for j in range(ncols):
-        ax = axes[1, j]
-        im = ax.imshow(pred_comps[j], origin="lower", vmin=vmin, vmax=vmax, cmap="RdBu_r")
-        ax.set_xticks([]); ax.set_yticks([])
-        if j == 0:
-            ax.set_ylabel("Pred")
+    axes = []
+    first_main_im = None
+    first_err_im = None
 
-    # Error row (0-center)
-    for j in range(ncols):
-        ax = axes[2, j]
-        im = ax.imshow(err_comps[j], origin="lower", vmin=-emax, vmax=emax, cmap="RdBu_r")
-        ax.set_xticks([]); ax.set_yticks([])
-        if j == 0:
-            ax.set_ylabel("Error")
+    for b in range(n_blocks):
+        start = b * max_cols
+        end = min((b + 1) * max_cols, n_panels)
+        for j, col_idx in enumerate(range(start, end)):
+            # column title on the top row of this block
+            col_title = cols_all[col_idx]
 
-    # 每行一个 colorbar（横向，覆盖该行全部子图）
-    cb0 = fig.colorbar(axes[0, 0].images[0], ax=axes[0, :], orientation="horizontal", fraction=0.046, pad=0.06)
-    cb0.set_label("value (True)")
+            # True / Pred / Error rows inside this block
+            for r in range(3):
+                ax = fig.add_subplot(gs[3 * b + r, j])
+                axes.append(ax)
 
-    cb1 = fig.colorbar(axes[1, 0].images[0], ax=axes[1, :], orientation="horizontal", fraction=0.046, pad=0.06)
-    cb1.set_label("value (Pred)")
+                if r == 0:
+                    im = ax.imshow(true_comps[col_idx], origin="lower", cmap="RdBu_r",
+                                   vmin=vmin_main, vmax=vmax_main)
+                    if first_main_im is None:
+                        first_main_im = im
+                    if j == 0:
+                        ax.set_ylabel("True")
+                    ax.set_title(col_title, fontsize=10)
+                elif r == 1:
+                    im = ax.imshow(pred_comps[col_idx], origin="lower", cmap="RdBu_r",
+                                   vmin=vmin_main, vmax=vmax_main)
+                    if j == 0:
+                        ax.set_ylabel("Pred")
+                else:
+                    im = ax.imshow(err_comps[col_idx], origin="lower", cmap="RdBu_r",
+                                   vmin=vmin_err, vmax=vmax_err)
+                    if first_err_im is None:
+                        first_err_im = im
+                    if j == 0:
+                        ax.set_ylabel("Error")
 
-    cb2 = fig.colorbar(axes[2, 0].images[0], ax=axes[2, :], orientation="horizontal", fraction=0.046, pad=0.06)
-    cb2.set_label("error (Pred - True)")
+                ax.set_xticks([]); ax.set_yticks([])
 
-    fig.suptitle(title, fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+        # pad empty cells in this block (keep grid tidy)
+        for j in range(end - start, max_cols):
+            for r in range(3):
+                ax = fig.add_subplot(gs[3 * b + r, j])
+                ax.axis("off")
+
+    # ---- compact colorbars (like your POD quad style) ----
+    if first_main_im is not None:
+        cbar_main = fig.colorbar(first_main_im, ax=axes, orientation="horizontal",
+                                 fraction=0.02, pad=0.03)
+        cbar_main.set_label("value (centered by target mean)" if center_mode == "target_mean" else "value")
+
+    if first_err_im is not None:
+        cbar_err = fig.colorbar(first_err_im, ax=axes, orientation="horizontal",
+                                fraction=0.02, pad=0.10)
+        cbar_err.set_label("error (Pred - True)")
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
     return fig
+
+
+def plot_spatial_fourier_band_decomposition_examples(
+    x_true: np.ndarray,
+    x_pred: np.ndarray,
+    *,
+    k_edges: Sequence[float],
+    band_names: Sequence[str] = ("L", "M", "H"),
+    dx: float = 1.0,
+    dy: float = 1.0,
+    channel: int = 0,
+    frame_indices: Sequence[int] | None = None,
+    title_prefix: str = "Fourier bands spatial view",
+    max_cols: int = 5,
+) -> Dict[int, Optional[plt.Figure]]:
+    """
+    多帧版本：对若干 frame 生成傅里叶 band 空间分解图。
+    支持输入:
+      - [H,W] / [H,W,C]
+      - [T,H,W] / [T,H,W,C]
+    返回: {frame_idx: fig}
+    """
+    x_true = np.asarray(x_true)
+    x_pred = np.asarray(x_pred)
+
+    # 统一成 [T,H,W,C?] 的视角
+    def _as_THW(x: np.ndarray) -> np.ndarray:
+        if x.ndim == 2:          # [H,W]
+            return x[None, ...]
+        if x.ndim == 3:
+            # 可能是 [H,W,C] 或 [T,H,W]
+            if x.shape[-1] <= 4: # 经验：小通道数更像 [H,W,C]
+                return x[..., channel][None, ...]
+            return x             # [T,H,W]
+        if x.ndim == 4:          # [T,H,W,C]
+            return x[..., channel]
+        raise ValueError(f"Unsupported shape {x.shape}")
+
+    XT = _as_THW(x_true)   # [T,H,W]
+    XP = _as_THW(x_pred)   # [T,H,W]
+    if XT.shape != XP.shape:
+        raise ValueError(f"x_true shape {XT.shape} != x_pred shape {XP.shape}")
+
+    T = XT.shape[0]
+    if frame_indices is None:
+        # 默认 3 帧：0 / 中间 / 最后
+        frame_indices = [0, T // 2, T - 1] if T >= 3 else list(range(T))
+
+    figs: Dict[int, Optional[plt.Figure]] = {}
+    for fi in frame_indices:
+        fi = int(fi)
+        if fi < 0 or fi >= T:
+            continue
+        title = f"{title_prefix} | frame={fi}"
+        figs[fi] = plot_spatial_fourier_band_decomposition(
+            XT[fi],
+            XP[fi],
+            k_edges=k_edges,
+            band_names=band_names,
+            dx=dx,
+            dy=dy,
+            channel=0,  # 已经抽出单通道了
+            title=title,
+            max_cols=max_cols,
+            center_mode="target_mean",
+            robust_q=99.5,
+        )
+    return figs
 
 
 def plot_kstar_heatmap(

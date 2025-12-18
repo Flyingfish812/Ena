@@ -34,6 +34,7 @@ from .viz.fourier_plots import (
     plot_fourier_band_nrmse_curves,
     plot_kstar_curve_from_entry,
     plot_spatial_fourier_band_decomposition,
+    plot_spatial_fourier_band_decomposition_examples,
     plot_energy_spectrum_with_band_edges,
 )
 
@@ -118,7 +119,9 @@ def build_eval_figures(
     新版适配点：
     - Fourier band_names / k_edges / grid_meta 从 results['meta'] 或 entry['fourier_curve'] 读取
     - 不再硬编码 ("L","M","H")
+    - example-first：per-(p,σ) 以及 Fourier spatial decomp 默认对每个 cfg 下的所有 example 都出图
     """
+
     # -----------------------------
     # 0) helpers（只在本函数内部用）
     # -----------------------------
@@ -156,6 +159,28 @@ def build_eval_figures(
             return []
         return results.get("examples", []) or []
 
+    def _group_examples_by_cfg(examples: list[Dict[str, Any]]) -> Dict[str, list[Dict[str, Any]]]:
+        g: Dict[str, list[Dict[str, Any]]] = {}
+        for ex in examples or []:
+            try:
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
+            except Exception:
+                continue
+            cfg = _cfg_name(p, s)
+            g.setdefault(cfg, []).append(ex)
+
+        # 让同一 cfg 内按 frame_idx 排序，便于对比复现
+        def _frame_key(ex: Dict[str, Any]) -> int:
+            try:
+                return int(ex.get("frame_idx", 0))
+            except Exception:
+                return 0
+
+        for cfg, lst in g.items():
+            lst.sort(key=_frame_key)
+        return g
+
     def _index_entries(results: Dict[str, Any] | None) -> Dict[tuple[float, float], Dict[str, Any]]:
         idx: Dict[tuple[float, float], Dict[str, Any]] = {}
         if results is None:
@@ -169,19 +194,6 @@ def build_eval_figures(
             idx[(p, s)] = e
         return idx
 
-    def _first_example_by_cfg(examples: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        m: Dict[str, Dict[str, Any]] = {}
-        for ex in examples or []:
-            try:
-                p = float(ex["mask_rate"])
-                s = float(ex["noise_sigma"])
-            except Exception:
-                continue
-            cfg = _cfg_name(p, s)
-            if cfg not in m:
-                m[cfg] = ex
-        return m
-
     def _plot_quadruple_from_ex(ex: Dict[str, Any], *, model_key: str, title_prefix: str) -> Any | None:
         """
         model_key: "x_lin" or "x_mlp"
@@ -193,7 +205,7 @@ def build_eval_figures(
             x_out = np.asarray(ex[model_key])
             x_in = np.asarray(ex["x_interp"])
             mask_hw = np.asarray(ex["mask_hw"]) if "mask_hw" in ex else None
-            title = f"{title_prefix} (frame={ex['frame_idx']}, p={p:.3g}, σ={s:.3g})"
+            title = f"{title_prefix} (frame={ex.get('frame_idx', '?')}, p={p:.3g}, σ={s:.3g})"
             return plot_recon_quadruple(
                 x_input_hw=x_in,
                 x_output_hw=x_out,
@@ -273,7 +285,7 @@ def build_eval_figures(
     fig_noise_mlp = curve_figs.get("fig_nmse_vs_noise_mlp")
 
     # -----------------------------
-    # 3) 单个代表性 example 四联图
+    # 3) 单个代表性 example 四联图（可保留：用于总览/报告首页）
     # -----------------------------
     fig_example_linear = None
     ex_lin = linear_results.get("example_recon", None)
@@ -287,7 +299,7 @@ def build_eval_figures(
             fig_example_mlp = _plot_quadruple_from_ex(ex_mlp, model_key="x_mlp", title_prefix="MLP example")
 
     # -----------------------------
-    # 4) per-(p,σ) 四联图（按 cfg 分组）
+    # 4) per-(p,σ) 四联图（按 cfg 分组：每个 cfg 下所有 example 都出图）
     # -----------------------------
     lin_examples = _get_examples(linear_results)
     mlp_examples = _get_examples(mlp_results)
@@ -299,7 +311,8 @@ def build_eval_figures(
         _log("[build-figs] Generating per-(p,σ) linear quadruple figures via viz.field_plots ...")
         for ex in lin_examples:
             try:
-                p = float(ex["mask_rate"]); s = float(ex["noise_sigma"])
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
                 cfg = _cfg_name(p, s)
             except Exception:
                 continue
@@ -311,7 +324,8 @@ def build_eval_figures(
         _log("[build-figs] Generating per-(p,σ) MLP quadruple figures via viz.field_plots ...")
         for ex in mlp_examples:
             try:
-                p = float(ex["mask_rate"]); s = float(ex["noise_sigma"])
+                p = float(ex["mask_rate"])
+                s = float(ex["noise_sigma"])
                 cfg = _cfg_name(p, s)
             except Exception:
                 continue
@@ -344,17 +358,21 @@ def build_eval_figures(
     # 5.3 per-(p,σ) Fourier 解释图（k* 曲线 + 空间分解）
     lin_entry_idx = _index_entries(linear_results)
     mlp_entry_idx = _index_entries(mlp_results)
-    lin_ex_first = _first_example_by_cfg(lin_examples)
-    mlp_ex_first = _first_example_by_cfg(mlp_examples)
 
-    all_cfg_names = set(lin_ex_first.keys()) | set(mlp_ex_first.keys())
+    # group examples by cfg（用于 spatial decomp）
+    lin_ex_by_cfg = _group_examples_by_cfg(lin_examples)
+    mlp_ex_by_cfg = _group_examples_by_cfg(mlp_examples)
+
+    # all cfg names = union(entries, examples)
+    all_cfg_names: set[str] = set()
     for (p, s) in set(lin_entry_idx.keys()) | set(mlp_entry_idx.keys()):
         all_cfg_names.add(_cfg_name(p, s))
+    all_cfg_names |= set(lin_ex_by_cfg.keys()) | set(mlp_ex_by_cfg.keys())
 
     fig_fourier_kstar_curves_linear: Dict[str, Any] = {}
     fig_fourier_kstar_curves_mlp: Dict[str, Any] = {}
-    fig_fourier_decomp_linear: Dict[str, Any] = {}
-    fig_fourier_decomp_mlp: Dict[str, Any] = {}
+    fig_fourier_decomp_linear: Dict[str, list[Any]] = {}
+    fig_fourier_decomp_mlp: Dict[str, list[Any]] = {}
 
     for cfg in sorted(all_cfg_names):
         p_val, s_val = _parse_cfg_name(cfg)
@@ -381,47 +399,64 @@ def build_eval_figures(
             if fig is not None:
                 fig_fourier_kstar_curves_mlp[cfg] = fig
 
-        # spatial decomposition：需要 example + k_edges + band_names
-        ex_lin0 = lin_ex_first.get(cfg)
-        if ex_lin0 is not None and e_lin is not None:
-            k_edges = _k_edges_from_entry_or_meta(e_lin)
-            bn = _band_names_from_entry_or_meta(e_lin)
+        # spatial decomposition：每个 cfg 下所有 example 都画
+        # 线性：优先用 e_lin 的 band 定义；没有的话用 e_mlp/meta 兜底
+        ex_lin_list = lin_ex_by_cfg.get(cfg, [])
+        if ex_lin_list:
+            k_edges = _k_edges_from_entry_or_meta(e_lin if e_lin is not None else e_mlp)
+            bn = _band_names_from_entry_or_meta(e_lin if e_lin is not None else e_mlp)
             if k_edges is not None:
-                fig = _safe_build(
-                    f"Fourier decomp (linear) {cfg}",
-                    lambda ex=ex_lin0, ke=k_edges, bn_=bn: plot_spatial_fourier_band_decomposition(
-                        x_true_hw=np.asarray(ex["x_true"]),
-                        x_pred_hw=np.asarray(ex["x_lin"]),
-                        k_edges=ke,
-                        band_names=bn_,
-                        channel=0,
-                        title=f"Fourier bands spatial view (linear) | {cfg}",
-                    ),
-                )
-                if fig is not None:
-                    fig_fourier_decomp_linear[cfg] = fig
+                figs_list: list[Any] = []
+                for ex in ex_lin_list:
+                    fi = ex.get("frame_idx", "?")
+                    fig = _safe_build(
+                        f"Fourier decomp (linear) {cfg} frame={fi}",
+                        lambda ex_=ex, ke=k_edges, bn_=bn, cfg_=cfg, fi_=fi: plot_spatial_fourier_band_decomposition(
+                            x_true_hw=np.asarray(ex_["x_true"]),
+                            x_pred_hw=np.asarray(ex_["x_lin"]),
+                            k_edges=ke,
+                            band_names=bn_,
+                            channel=0,
+                            title=f"Fourier bands spatial view (linear) | {cfg_} | frame={fi_}",
+                            center_mode="target_mean",
+                            robust_q=99.5,
+                            max_cols=5,
+                        ),
+                    )
+                    if fig is not None:
+                        figs_list.append(fig)
+                if figs_list:
+                    fig_fourier_decomp_linear[cfg] = figs_list
 
-        ex_mlp0 = mlp_ex_first.get(cfg)
-        if ex_mlp0 is not None and e_mlp is not None:
-            k_edges = _k_edges_from_entry_or_meta(e_mlp)
-            bn = _band_names_from_entry_or_meta(e_mlp)
+        # MLP：优先用 e_mlp 的 band 定义；没有的话用 e_lin/meta 兜底
+        ex_mlp_list = mlp_ex_by_cfg.get(cfg, [])
+        if ex_mlp_list:
+            k_edges = _k_edges_from_entry_or_meta(e_mlp if e_mlp is not None else e_lin)
+            bn = _band_names_from_entry_or_meta(e_mlp if e_mlp is not None else e_lin)
             if k_edges is not None:
-                fig = _safe_build(
-                    f"Fourier decomp (mlp) {cfg}",
-                    lambda ex=ex_mlp0, ke=k_edges, bn_=bn: plot_spatial_fourier_band_decomposition(
-                        x_true_hw=np.asarray(ex["x_true"]),
-                        x_pred_hw=np.asarray(ex["x_mlp"]),
-                        k_edges=ke,
-                        band_names=bn_,
-                        channel=0,
-                        title=f"Fourier bands spatial view (mlp) | {cfg}",
-                    ),
-                )
-                if fig is not None:
-                    fig_fourier_decomp_mlp[cfg] = fig
+                figs_list = []
+                for ex in ex_mlp_list:
+                    fi = ex.get("frame_idx", "?")
+                    fig = _safe_build(
+                        f"Fourier decomp (mlp) {cfg} frame={fi}",
+                        lambda ex_=ex, ke=k_edges, bn_=bn, cfg_=cfg, fi_=fi: plot_spatial_fourier_band_decomposition(
+                            x_true_hw=np.asarray(ex_["x_true"]),
+                            x_pred_hw=np.asarray(ex_["x_mlp"]),
+                            k_edges=ke,
+                            band_names=bn_,
+                            channel=0,
+                            title=f"Fourier bands spatial view (mlp) | {cfg_} | frame={fi_}",
+                            center_mode="target_mean",
+                            robust_q=99.5,
+                            max_cols=5,
+                        ),
+                    )
+                    if fig is not None:
+                        figs_list.append(fig)
+                if figs_list:
+                    fig_fourier_decomp_mlp[cfg] = figs_list
 
     # 5.4 全局 band 定义图（E(k)+edges）
-    # 注意：meta["fourier_k_edges"] 是 interior edges（不含 0/kNyq），plotter 需与之匹配
     meta = _pick_meta()
     fig_energy_spectrum = _safe_build(
         "Energy spectrum definition figure",
@@ -1545,7 +1580,9 @@ def extract_and_save_figures(
         p = exp_dir / "nmse_vs_mask_linear.png"
         fig_mask_linear.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_mask_linear"] = p
-        fig_paths.setdefault("fig_nmse_vs_mask", p)
+        # 兼容旧 key：统一用 list 记录“同类图”
+        fig_paths.setdefault("fig_nmse_vs_mask", [])
+        fig_paths["fig_nmse_vs_mask"].append(p)
         if verbose:
             print(f"[yaml-extract] Saved figure: {p}")
 
@@ -1554,6 +1591,8 @@ def extract_and_save_figures(
         p = exp_dir / "nmse_vs_mask_mlp.png"
         fig_mask_mlp.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_mask_mlp"] = p
+        fig_paths.setdefault("fig_nmse_vs_mask", [])
+        fig_paths["fig_nmse_vs_mask"].append(p)
         if verbose:
             print(f"[yaml-extract] Saved figure: {p}")
 
@@ -1562,7 +1601,8 @@ def extract_and_save_figures(
         p = exp_dir / "nmse_vs_noise_linear.png"
         fig_noise_linear.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_noise_linear"] = p
-        fig_paths.setdefault("fig_nmse_vs_noise", p)
+        fig_paths.setdefault("fig_nmse_vs_noise", [])
+        fig_paths["fig_nmse_vs_noise"].append(p)
         if verbose:
             print(f"[yaml-extract] Saved figure: {p}")
 
@@ -1571,6 +1611,8 @@ def extract_and_save_figures(
         p = exp_dir / "nmse_vs_noise_mlp.png"
         fig_noise_mlp.savefig(p, dpi=300, bbox_inches="tight")
         fig_paths["fig_nmse_vs_noise_mlp"] = p
+        fig_paths.setdefault("fig_nmse_vs_noise", [])
+        fig_paths["fig_nmse_vs_noise"].append(p)
         if verbose:
             print(f"[yaml-extract] Saved figure: {p}")
 
@@ -1671,12 +1713,27 @@ def extract_and_save_figures(
                 continue
             cfg = _cfg_name(p_val, s_val)
             out.setdefault(cfg, []).append(ex)
+
+        # 同一 cfg 内按 frame_idx 排序，确保 png/npz 对齐
+        def _frame_key(ex: Dict[str, Any]) -> int:
+            try:
+                return int(ex.get("frame_idx", 0))
+            except Exception:
+                return 0
+
+        for cfg, lst in out.items():
+            lst.sort(key=_frame_key)
         return out
 
     lin_groups = _group_examples(lin_examples)
     mlp_groups = _group_examples(mlp_examples)
 
-    all_cfg_names = sorted(set(lin_groups.keys()) | set(mlp_groups.keys()) | set(fig_examples_linear.keys()) | set(fig_examples_mlp.keys()))
+    all_cfg_names = sorted(
+        set(lin_groups.keys())
+        | set(mlp_groups.keys())
+        | set(fig_examples_linear.keys())
+        | set(fig_examples_mlp.keys())
+    )
 
     for cfg_name in all_cfg_names:
         cfg_dir = exp_dir / cfg_name
@@ -1790,11 +1847,6 @@ def extract_and_save_figures(
         lin_idx = _build_index(lin_entries)
         mlp_idx = _build_index(mlp_entries)
 
-        energy_cum = (
-            (mlp_res or {}).get("meta", {}).get("energy_cum")
-            or (lin_res or {}).get("meta", {}).get("energy_cum")
-        )
-
         all_ps = sorted(set(lin_idx.keys()) | set(mlp_idx.keys()))
         for (p_val, s_val) in all_ps:
             cfg_name = _cfg_name(p_val, s_val)
@@ -1805,7 +1857,7 @@ def extract_and_save_figures(
             if fig_lin is not None:
                 out = cfg_dir / "multiscale_summary_linear.png"
                 fig_lin.savefig(out, dpi=300, bbox_inches="tight")
-                fig_paths.setdefault(f"multiscale_summary_linear/{cfg_name}", out)
+                fig_paths[f"multiscale_summary_linear/{cfg_name}"] = out
                 if verbose:
                     print(f"[yaml-extract] Saved figure: {out}")
 
@@ -1813,7 +1865,7 @@ def extract_and_save_figures(
             if fig_mlp is not None:
                 out = cfg_dir / "multiscale_summary_mlp.png"
                 fig_mlp.savefig(out, dpi=300, bbox_inches="tight")
-                fig_paths.setdefault(f"multiscale_summary_mlp/{cfg_name}", out)
+                fig_paths[f"multiscale_summary_mlp/{cfg_name}"] = out
                 if verbose:
                     print(f"[yaml-extract] Saved figure: {out}")
 
@@ -1863,11 +1915,15 @@ def extract_and_save_figures(
     decomp_lin = figs.get("fig_fourier_decomp_linear") or {}
     decomp_mlp = figs.get("fig_fourier_decomp_mlp") or {}
 
-    cfg_names = sorted(set(curves_lin.keys()) | set(curves_mlp.keys()) | set(decomp_lin.keys()) | set(decomp_mlp.keys()))
+    cfg_names = sorted(
+        set(curves_lin.keys()) | set(curves_mlp.keys()) | set(decomp_lin.keys()) | set(decomp_mlp.keys())
+    )
+
     for cfg_name in cfg_names:
         cfg_dir = exp_dir / cfg_name
         ensure_dir(cfg_dir)
 
+        # k* curve (single fig per cfg)
         fig = curves_lin.get(cfg_name, None)
         if fig is not None:
             out = cfg_dir / "fourier_kstar_curve_linear.png"
@@ -1884,38 +1940,54 @@ def extract_and_save_figures(
             if verbose:
                 print(f"[yaml-extract] Saved figure: {out}")
 
-        fig = decomp_lin.get(cfg_name, None)
-        if fig is not None:
-            out = cfg_dir / "fourier_band_decomp_linear.png"
-            fig.savefig(out, dpi=300, bbox_inches="tight")
-            fig_paths[f"fourier_band_decomp_linear/{cfg_name}"] = out
-            if verbose:
-                print(f"[yaml-extract] Saved figure: {out}")
+        # spatial decomp (list[fig] per cfg) —— 关键修复点：避免覆盖
+        obj = decomp_lin.get(cfg_name, None)
+        if obj is not None:
+            if isinstance(obj, list):
+                outs: list[Path] = []
+                for idx, fig in enumerate(obj):
+                    out = cfg_dir / f"fourier_band_decomp_linear_{idx:02d}.png"
+                    fig.savefig(out, dpi=300, bbox_inches="tight")
+                    outs.append(out)
+                    if verbose:
+                        print(f"[yaml-extract] Saved figure: {out}")
+                fig_paths[f"fourier_band_decomp_linear/{cfg_name}"] = outs
+            else:
+                out = cfg_dir / "fourier_band_decomp_linear.png"
+                obj.savefig(out, dpi=300, bbox_inches="tight")
+                fig_paths[f"fourier_band_decomp_linear/{cfg_name}"] = out
+                if verbose:
+                    print(f"[yaml-extract] Saved figure: {out}")
 
-        fig = decomp_mlp.get(cfg_name, None)
-        if fig is not None:
-            out = cfg_dir / "fourier_band_decomp_mlp.png"
-            fig.savefig(out, dpi=300, bbox_inches="tight")
-            fig_paths[f"fourier_band_decomp_mlp/{cfg_name}"] = out
-            if verbose:
-                print(f"[yaml-extract] Saved figure: {out}")
+        obj = decomp_mlp.get(cfg_name, None)
+        if obj is not None:
+            if isinstance(obj, list):
+                outs: list[Path] = []
+                for idx, fig in enumerate(obj):
+                    out = cfg_dir / f"fourier_band_decomp_mlp_{idx:02d}.png"
+                    fig.savefig(out, dpi=300, bbox_inches="tight")
+                    outs.append(out)
+                    if verbose:
+                        print(f"[yaml-extract] Saved figure: {out}")
+                fig_paths[f"fourier_band_decomp_mlp/{cfg_name}"] = outs
+            else:
+                out = cfg_dir / "fourier_band_decomp_mlp.png"
+                obj.savefig(out, dpi=300, bbox_inches="tight")
+                fig_paths[f"fourier_band_decomp_mlp/{cfg_name}"] = out
+                if verbose:
+                    print(f"[yaml-extract] Saved figure: {out}")
 
     # 5.5 保存 Fourier 分带/网格/阈值等元信息（用于复现实验图）
-    meta = (
-        (mlp_res or {}).get("meta", {}) or
-        (lin_res or {}).get("meta", {}) or
-        {}
-    )
+    meta = ((mlp_res or {}).get("meta", {}) or (lin_res or {}).get("meta", {}) or {})
     fourier_meta = {
         "fourier_enabled": meta.get("fourier_enabled", None),
         "fourier_band_scheme": meta.get("fourier_band_scheme", None),
         "fourier_band_names": meta.get("fourier_band_names", None),
         "fourier_lambda_edges": meta.get("fourier_lambda_edges", None),
-        "fourier_k_edges": meta.get("fourier_k_edges", None),          # interior edges
+        "fourier_k_edges": meta.get("fourier_k_edges", None),  # interior edges
         "fourier_k_centers": meta.get("fourier_k_centers", None),
         "fourier_grid_meta": meta.get("fourier_grid_meta", None),
     }
-    # 只有存在 Fourier 信息时才落盘（避免干扰无 Fourier 的实验）
     if any(v is not None for v in fourier_meta.values()):
         out_json = exp_dir / "fourier_meta.json"
         import json
@@ -2042,35 +2114,64 @@ def redraw_all_example_figures_from_npz(
     exp_root: str | Path,
     *,
     recursive: bool = True,
+    redraw_fourier: bool = True,
+    fourier_meta_name: str = "fourier_meta.json",
+    fourier_suffix: str = "_fourier",
+    fourier_max_cols: int = 5,
     verbose: bool = True,
 ) -> Dict[str, list[Path]]:
     """
     遍历某个实验根目录下的所有 npz 文件，凡是符合 example 格式的
-    (至少包含 x_true/x_hat/x_interp)，就用 plot_example_from_npz 重新绘制
-    四联图，并覆盖保存对应的 PNG。
+    (至少包含 x_true/x_hat/x_interp)，就重绘四联图 PNG（覆盖保存）。
 
-    约定：
-    - PNG 文件名 = NPZ 文件名去掉后缀再加 .png
-      例如：
-        example_linear.npz      -> example_linear.png
-        linear_example_00.npz   -> linear_example_00.png
-        mlp_example_03.npz      -> mlp_example_03.png
-    - 目录结构不作假设，直接用 glob / rglob 查找所有 .npz，
-      只要键满足就重画，其他一律跳过。
+    新增：
+    - 若 redraw_fourier=True 且能从 exp_root/fourier_meta.json 读取到 k_edges，
+      则同时重绘 Fourier band 空间分解联图，保存为 <stem>_fourier.png
 
     返回:
         {
-            "updated": [Path(...), ...],   # 成功重绘并保存的 PNG 列表
-            "skipped": [Path(...), ...],   # 不是 example 格式而被跳过的 NPZ
-            "failed":  [Path(...), ...],   # 解析或绘制出错的 NPZ
+            "updated": [Path(...), ...],            # 成功重绘并保存的四联图 PNG 列表
+            "updated_fourier": [Path(...), ...],    # 成功保存的 Fourier PNG 列表（若启用）
+            "skipped": [Path(...), ...],            # 不是 example 格式而被跳过的 NPZ
+            "failed":  [Path(...), ...],            # 四联图绘制出错的 NPZ
+            "failed_fourier": [Path(...), ...],     # Fourier 绘制出错的 NPZ（若启用）
         }
     """
     from pathlib import Path
+    import json
 
     exp_root = Path(exp_root)
     if not exp_root.exists():
         raise FileNotFoundError(f"Experiment root not found: {exp_root}")
 
+    # --------- load Fourier meta once ----------
+    fourier_band_names = None
+    fourier_k_edges = None          # interior edges
+    fourier_grid_meta = None
+
+    if redraw_fourier:
+        meta_path = exp_root / fourier_meta_name
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                fourier_band_names = meta.get("fourier_band_names", None)
+                fourier_k_edges = meta.get("fourier_k_edges", None)
+                fourier_grid_meta = meta.get("fourier_grid_meta", None)
+                # 若 k_edges 不存在则禁用 Fourier
+                if not isinstance(fourier_k_edges, (list, tuple)) or len(fourier_k_edges) == 0:
+                    if verbose:
+                        print(f"[redraw] WARNING: {meta_path} has no valid fourier_k_edges; skip Fourier redraw.")
+                    redraw_fourier = False
+            except Exception as e:
+                if verbose:
+                    print(f"[redraw] WARNING: failed to read {meta_path}: {e}")
+                redraw_fourier = False
+        else:
+            if verbose:
+                print(f"[redraw] WARNING: {meta_path} not found; skip Fourier redraw.")
+            redraw_fourier = False
+
+    # --------- collect npz ----------
     if recursive:
         npz_paths = sorted(exp_root.rglob("*.npz"))
     else:
@@ -2082,6 +2183,8 @@ def redraw_all_example_figures_from_npz(
     updated: list[Path] = []
     skipped: list[Path] = []
     failed: list[Path] = []
+    updated_fourier: list[Path] = []
+    failed_fourier: list[Path] = []
 
     for npz_path in npz_paths:
         try:
@@ -2099,12 +2202,11 @@ def redraw_all_example_figures_from_npz(
             skipped.append(npz_path)
             continue
 
+        # --------- 1) redraw quadruple ----------
         try:
-            # 利用已有的单文件绘图函数（会自动处理 mask、标题等细节）
             fig = plot_example_from_npz(npz_path)
 
             png_path = npz_path.with_suffix(".png")
-            # 目录本身应当已存在，这里保险起见再 ensure 一次
             ensure_dir(png_path.parent)
             fig.savefig(png_path, dpi=300, bbox_inches="tight")
             plt.close(fig)
@@ -2117,15 +2219,82 @@ def redraw_all_example_figures_from_npz(
             failed.append(npz_path)
             if verbose:
                 print(f"[redraw] FAILED to redraw: {npz_path}  ({e})")
+            # 四联图失败就不强行继续 Fourier（通常同样会失败）
+            continue
+
+        # --------- 2) redraw Fourier (optional) ----------
+        if redraw_fourier:
+            try:
+                x_true = np.asarray(data["x_true"])
+                x_hat = np.asarray(data["x_hat"])
+
+                model_type = str(data["model_type"]) if "model_type" in files else "model"
+                fi = int(data["frame_idx"]) if "frame_idx" in files else None
+                p_val = float(data["mask_rate"]) if "mask_rate" in files else None
+                s_val = float(data["noise_sigma"]) if "noise_sigma" in files else None
+
+                # 从 meta 取 dx/dy（如果没有就用 1.0）
+                dx = 1.0
+                dy = 1.0
+                try:
+                    if isinstance(fourier_grid_meta, dict):
+                        dx = float(fourier_grid_meta.get("dx", dx))
+                        dy = float(fourier_grid_meta.get("dy", dy))
+                except Exception:
+                    pass
+
+                # title
+                cfg_txt = ""
+                if p_val is not None and s_val is not None:
+                    cfg_txt = f" | p={p_val:.3g}, σ={s_val:.3g}"
+                fi_txt = f" | frame={fi}" if fi is not None else ""
+                title = f"Fourier bands spatial view ({model_type}){cfg_txt}{fi_txt}"
+
+                bn = tuple(str(x) for x in fourier_band_names) if isinstance(fourier_band_names, (list, tuple)) else ("L", "M", "H")
+                ke = [float(v) for v in fourier_k_edges]
+
+                fig_f = plot_spatial_fourier_band_decomposition(
+                    x_true_hw=x_true,
+                    x_pred_hw=x_hat,
+                    k_edges=ke,
+                    band_names=bn,
+                    dx=dx,
+                    dy=dy,
+                    channel=0,
+                    title=title,
+                    center_mode="target_mean",
+                    robust_q=99.5,
+                    max_cols=int(fourier_max_cols),
+                )
+
+                if fig_f is not None:
+                    # <stem>_fourier.png
+                    out = npz_path.with_suffix("")  # 去掉 .npz
+                    png_f = Path(str(out) + f"{fourier_suffix}.png")
+                    ensure_dir(png_f.parent)
+                    fig_f.savefig(png_f, dpi=300, bbox_inches="tight")
+                    plt.close(fig_f)
+
+                    updated_fourier.append(png_f)
+                    if verbose:
+                        print(f"[redraw] Updated Fourier: {png_f}")
+
+            except Exception as e:
+                failed_fourier.append(npz_path)
+                if verbose:
+                    print(f"[redraw] FAILED Fourier: {npz_path}  ({e})")
 
     if verbose:
         print(
             f"[redraw] Done. updated={len(updated)}, "
-            f"skipped={len(skipped)}, failed={len(failed)}"
+            f"skipped={len(skipped)}, failed={len(failed)}; "
+            f"fourier_updated={len(updated_fourier)}, fourier_failed={len(failed_fourier)}"
         )
 
     return {
         "updated": updated,
+        "updated_fourier": updated_fourier,
         "skipped": skipped,
         "failed": failed,
+        "failed_fourier": failed_fourier,
     }
