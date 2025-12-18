@@ -7,7 +7,7 @@
 """
 
 from pathlib import Path
-from .schemas import DataConfig, PodConfig, TrainConfig, EvalConfig
+from .schemas import DataConfig, PodConfig, TrainConfig, FourierConfig, EvalConfig
 
 
 def default_data_config() -> DataConfig:
@@ -81,33 +81,45 @@ def default_eval_config() -> EvalConfig:
       要求和 PodConfig.r 保持一致（这里 r=128）
     - save_dir: artifacts/eval
     """
-    mask_rates = [0.01, 0.02, 0.05, 0.10]
-    noise_sigmas = [0.0, 0.01, 0.02]
+    mask_rates = [0.0001, 0.0004, 0.0016]
+    noise_sigmas = [0.0, 0.01, 0.1]
 
     pod_bands = {
-        "L": (0, 16),
-        "M": (16, 64),
-        "H": (64, 128),
+        "L1": (0, 16),
+        "L2": (16, 32),
+        "M1": (32, 48),
+        "M2": (48, 64),
+        "M3": (64, 80),
+        "H1": (80, 96),
+        "H2": (96, 112),
+        "H3": (112, 128),
     }
-    centered_pod = True
+
+    fourier = FourierConfig(
+        enabled=True,
+        band_scheme="physical",
+        grid_meta={
+            "Lx": 8.0,
+            "Ly": 1.0,
+            "obstacle_diameter": 0.125,
+            "dx": 0.0125,
+            "dy": 0.0125,
+            "angular": False,
+        },
+        num_bins=64,
+        sample_frames=8,
+        kstar_threshold=1.0,
+        mean_mode_true="global",
+        save_curve=True,
+        band_names=("L", "M", "H"),
+        lambda_edges=(1.0, 0.25),
+    )
 
     return EvalConfig(
         mask_rates=mask_rates,
         noise_sigmas=noise_sigmas,
         pod_bands=pod_bands,
-        centered_pod=centered_pod,
+        centered_pod=True,
         save_dir=Path("artifacts/eval"),
-        fourier_enabled=True,
-        fourier_grid={"dx": 1.0, "dy": 1.0, "angular": True},
-        fourier_num_bins=64,
-        fourier_k_max=None,
-        fourier_k_edges=None,  # None -> auto pick by quantiles
-        fourier_band_names=("L", "M", "H"),
-        fourier_auto_edges_quantiles=(0.80, 0.95),
-        fourier_soft_transition=0.0,
-        fourier_kstar_threshold=1.0,
-        fourier_monotone_envelope=True,
-        fourier_sample_frames=8,
-        fourier_save_curve=False,
-        fourier_mean_mode_true="global",
+        fourier=fourier,
     )

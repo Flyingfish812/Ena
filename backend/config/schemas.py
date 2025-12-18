@@ -84,55 +84,55 @@ class TrainConfig:
 
 
 @dataclass
+class FourierConfig:
+    """
+    eval.fourier.* 频域多尺度配置（仅保留新版本 YAML 写法）。
+
+    YAML 期望结构示例：
+      fourier:
+        enabled: true
+        band_scheme: physical
+        grid_meta:
+          Lx: 8.0
+          Ly: 1.0
+          obstacle_diameter: 0.125
+          dx: 0.0125
+          dy: 0.0125
+          angular: false
+        num_bins: 64
+        sample_frames: 8
+        kstar_threshold: 1.0
+        mean_mode_true: global
+        save_curve: true
+        band_names: [L, M, H]
+        lambda_edges: [1.0, 0.25]
+    """
+    enabled: bool = True
+    band_scheme: str = "physical"   # e.g. "physical"
+    grid_meta: Dict[str, Any] = field(default_factory=dict)
+
+    num_bins: int = 64
+    sample_frames: int = 8
+
+    kstar_threshold: float = 1.0
+    mean_mode_true: str = "global"
+
+    save_curve: bool = False
+    band_names: Sequence[str] = ("L", "M", "H")
+    lambda_edges: Sequence[float] = (1.0, 0.25)
+
+
+@dataclass
 class EvalConfig:
     """
-    评估阶段配置。
+    评估阶段配置（新版本 YAML schema）。
 
-    POD 多尺度（legacy）：
-      - pod_bands / centered_pod
-
-    Fourier 频域多尺度（v1.12+）：
-      - fourier_enabled: 是否启用频域尺度分析
-      - fourier_grid: 指定 dx/dy 或 Lx/Ly（用于构造 k 网格）
-      - fourier_num_bins: 径向谱分箱数量
-      - fourier_k_edges: 频带边界（None 则按能量分位数自动选）
-      - fourier_kstar_threshold: k* 的阈值（NRMSE(k) <= threshold）
-      - fourier_sample_frames: 频域统计抽样帧数（控制开销）
-      - fourier_save_curve: 是否把谱曲线存进 entry（很大，默认 False）
+    - pod_bands / centered_pod: legacy POD 多尺度
+    - fourier: 频域多尺度配置（FourierConfig）
     """
     mask_rates: Sequence[float]
     noise_sigmas: Sequence[float]
     pod_bands: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     centered_pod: bool = True
     save_dir: Path = Path("artifacts/eval")
-
-    # ===== Fourier frequency-space multiscale (Batch 3/6) =====
-    fourier_enabled: bool = True
-
-    # grid meta: user may provide:
-    #   {"dx":..., "dy":..., "angular": True/False}
-    # or {"Lx":..., "Ly":..., "angular": True/False}  (dx=Lx/W, dy=Ly/H inferred later)
-    fourier_grid: Dict[str, Any] = field(default_factory=dict)
-
-    # radial spectrum bins
-    fourier_num_bins: int = 64
-    fourier_k_max: float | None = None  # None -> max(k)
-
-    # band partition
-    fourier_k_edges: Sequence[float] | None = None
-    fourier_band_names: Tuple[str, ...] = ("L", "M", "H")
-    fourier_auto_edges_quantiles: Tuple[float, ...] = (0.80, 0.95)
-
-    # optional weak split (soft weights); 0 => hard split
-    fourier_soft_transition: float = 0.0
-
-    # k* definition
-    fourier_kstar_threshold: float = 1.0
-    fourier_monotone_envelope: bool = True
-
-    # compute cost control
-    fourier_sample_frames: int = 8
-    fourier_save_curve: bool = False
-
-    # mean removal mode in FFT of x_true
-    fourier_mean_mode_true: str = "global"
+    fourier: FourierConfig = field(default_factory=FourierConfig)

@@ -42,7 +42,7 @@ from typing import Any, Dict, Tuple
 
 import yaml  # 需要 pip install pyyaml
 
-from .schemas import DataConfig, PodConfig, EvalConfig, TrainConfig
+from .schemas import DataConfig, PodConfig, EvalConfig, FourierConfig, TrainConfig
 
 
 def _to_serializable(obj: Any) -> Any:
@@ -94,16 +94,11 @@ def save_experiment_yaml(
 def load_experiment_yaml(
     path: str | Path,
 ) -> Tuple[DataConfig, PodConfig, EvalConfig, TrainConfig | None]:
-    """
-    从 YAML 文件中恢复 DataConfig / PodConfig / EvalConfig / TrainConfig。
-
-    - 若 YAML 中缺少 train 字段，则返回的 TrainConfig 为 None。
-    """
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
 
-    # data
+    # ---------- data ----------
     data_raw: Dict[str, Any] = config.get("data", {})
     nc_path = Path(data_raw.get("nc_path", "data/cylinder2d.nc"))
     var_keys = tuple(data_raw.get("var_keys", ("u", "v")))
@@ -117,7 +112,7 @@ def load_experiment_yaml(
         cache_dir=cache_dir,
     )
 
-    # pod
+    # ---------- pod ----------
     pod_raw: Dict[str, Any] = config.get("pod", {})
     pod_save_dir = Path(pod_raw.get("save_dir", "artifacts/pod"))
     pod_cfg = PodConfig(
@@ -126,73 +121,49 @@ def load_experiment_yaml(
         save_dir=pod_save_dir,
     )
 
-    # eval
+    # ---------- eval ----------
     eval_raw: Dict[str, Any] = config.get("eval", {})
-    mask_rates = list(eval_raw.get("mask_rates", [0.01, 0.02, 0.05, 0.10]))
-    noise_sigmas = list(eval_raw.get("noise_sigmas", [0.0, 0.01, 0.02]))
+    mask_rates = list(eval_raw.get("mask_rates", [0.0001, 0.0004, 0.0016]))
+    noise_sigmas = list(eval_raw.get("noise_sigmas", [0.0, 0.01, 0.1]))
 
-    pod_bands_raw = eval_raw.get("pod_bands", None)
-    if pod_bands_raw is None:
-        pod_bands: Dict[str, tuple[int, int]] = {
-            "L": (0, 16),
-            "M": (16, 64),
-            "H": (64, 128),
-        }
-    else:
-        pod_bands = {
-            name: (int(v[0]), int(v[1]))
-            for name, v in pod_bands_raw.items()
-        }
+    pod_bands_raw = eval_raw.get("pod_bands", {})
+    pod_bands = {
+        name: (int(v[0]), int(v[1]))
+        for name, v in (pod_bands_raw or {}).items()
+    }
     centered_pod = bool(eval_raw.get("centered_pod", True))
-
     eval_save_dir = Path(eval_raw.get("save_dir", "artifacts/eval"))
-    
-    # ===== Fourier (v1.12+) =====
+
+    # ----- Fourier (NEW SCHEMA ONLY) -----
     fourier_raw: Dict[str, Any] = eval_raw.get("fourier", {}) or {}
 
-    fourier_enabled = bool(fourier_raw.get("enabled", True))
-    fourier_grid = dict(fourier_raw.get("grid", {}))
+    enabled = bool(fourier_raw.get("enabled", True))
+    band_scheme = str(fourier_raw.get("band_scheme", "physical"))
 
-    fourier_num_bins = int(fourier_raw.get("num_bins", 64))
+    grid_meta = dict(fourier_raw.get("grid_meta", {}) or {})
+    # 强约束：新 schema 要求 grid_meta 至少包含 dx/dy/angular
+    # 这里不做兼容填充：缺了就让后续计算阶段明确报错，别静默跑错尺度
+    num_bins = int(fourier_raw.get("num_bins", 64))
+    sample_frames = int(fourier_raw.get("sample_frames", 8))
+    kstar_threshold = float(fourier_raw.get("kstar_threshold", 1.0))
+    mean_mode_true = str(fourier_raw.get("mean_mode_true", "global"))
+    save_curve = bool(fourier_raw.get("save_curve", False))
 
-    fourier_k_max = fourier_raw.get("k_max", None)
-    if fourier_k_max is not None:
-        fourier_k_max = float(fourier_k_max)
+    band_names = tuple(fourier_raw.get("band_names", ("L", "M", "H")))
+    lambda_edges_raw = fourier_raw.get("lambda_edges", (1.0, 0.25))
+    lambda_edges = [float(v) for v in lambda_edges_raw]
 
-    fourier_k_edges = fourier_raw.get("k_edges", None)
-    if fourier_k_edges is not None:
-        fourier_k_edges = [float(v) for v in fourier_k_edges]
-
-    fourier_band_names = tuple(
-        fourier_raw.get("band_names", ("L", "M", "H"))
-    )
-
-    fourier_auto_edges_quantiles = tuple(
-        fourier_raw.get("auto_edges_quantiles", (0.80, 0.95))
-    )
-
-    fourier_soft_transition = float(
-        fourier_raw.get("soft_transition", 0.0)
-    )
-
-    fourier_kstar_threshold = float(
-        fourier_raw.get("kstar_threshold", 1.0)
-    )
-
-    fourier_monotone_envelope = bool(
-        fourier_raw.get("monotone_envelope", True)
-    )
-
-    fourier_sample_frames = int(
-        fourier_raw.get("sample_frames", 8)
-    )
-
-    fourier_save_curve = bool(
-        fourier_raw.get("save_curve", False)
-    )
-
-    fourier_mean_mode_true = str(
-        fourier_raw.get("mean_mode_true", "global")
+    fourier_cfg = FourierConfig(
+        enabled=enabled,
+        band_scheme=band_scheme,
+        grid_meta=grid_meta,
+        num_bins=num_bins,
+        sample_frames=sample_frames,
+        kstar_threshold=kstar_threshold,
+        mean_mode_true=mean_mode_true,
+        save_curve=save_curve,
+        band_names=band_names,
+        lambda_edges=lambda_edges,
     )
 
     eval_cfg = EvalConfig(
@@ -201,24 +172,10 @@ def load_experiment_yaml(
         pod_bands=pod_bands,
         centered_pod=centered_pod,
         save_dir=eval_save_dir,
-
-        # ===== Fourier =====
-        fourier_enabled=fourier_enabled,
-        fourier_grid=fourier_grid,
-        fourier_num_bins=fourier_num_bins,
-        fourier_k_max=fourier_k_max,
-        fourier_k_edges=fourier_k_edges,
-        fourier_band_names=fourier_band_names,
-        fourier_auto_edges_quantiles=fourier_auto_edges_quantiles,
-        fourier_soft_transition=fourier_soft_transition,
-        fourier_kstar_threshold=fourier_kstar_threshold,
-        fourier_monotone_envelope=fourier_monotone_envelope,
-        fourier_sample_frames=fourier_sample_frames,
-        fourier_save_curve=fourier_save_curve,
-        fourier_mean_mode_true=fourier_mean_mode_true,
+        fourier=fourier_cfg,
     )
 
-    # train（可选）
+    # ---------- train (optional) ----------
     train_raw: Dict[str, Any] | None = config.get("train", None)
     if train_raw is None:
         train_cfg = None

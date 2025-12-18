@@ -193,69 +193,81 @@ def _select_sample_frames(T: int, n: int) -> list[int]:
     return [int(x) for x in np.linspace(0, T - 1, num=n, dtype=int)]
 
 def _infer_fourier_grid_meta(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
-    """Map eval_cfg.fourier_grid to grid_meta consumed by fourier_metrics."""
-    g = dict(getattr(eval_cfg, "fourier_grid", {}) or {})
-    # If user gives Lx/Ly but not dx/dy, metrics will compute dx=Lx/W, dy=Ly/H
-    # Also allow angular flag
-    return g
+    """
+    NEW SCHEMA ONLY:
+    Read Fourier grid meta from eval_cfg.fourier.grid_meta.
 
-def _get_fourier_settings(eval_cfg: EvalConfig) -> dict:
-    """Collect Fourier-related settings from eval_cfg with defaults.
-    Support both legacy flat fields (fourier_enabled, fourier_grid, ...)
-    and nested YAML block (eval_cfg.fourier.enabled, eval_cfg.fourier.grid_meta, ...).
+    - If dx/dy missing but Lx/Ly present: infer dx=Lx/W, dy=Ly/H
+    - If Lx/Ly missing but dx/dy present: infer Lx=dx*W, Ly=dy*H
+    - Ensure 'angular' exists (default False)
     """
     f = getattr(eval_cfg, "fourier", None)
+    grid = dict(getattr(f, "grid_meta", {}) or {}) if f is not None else {}
 
-    def _f_get(key: str, default=None):
-        if f is None:
-            return default
-        if isinstance(f, dict):
-            return f.get(key, default)
-        return getattr(f, key, default)
+    # defaults
+    grid.setdefault("angular", False)
 
-    # enabled: prefer legacy flat field if present, else nested
-    enabled_flat = getattr(eval_cfg, "fourier_enabled", None)
-    enabled = bool(enabled_flat) if enabled_flat is not None else bool(_f_get("enabled", False))
+    # infer dx/dy from Lx/Ly
+    if ("dx" not in grid or "dy" not in grid) and ("Lx" in grid and "Ly" in grid):
+        Lx = float(grid["Lx"])
+        Ly = float(grid["Ly"])
+        if W > 0 and H > 0:
+            grid.setdefault("dx", Lx / float(W))
+            grid.setdefault("dy", Ly / float(H))
 
-    # grid_meta: legacy flat field name is fourier_grid; nested uses fourier.grid_meta
-    grid_flat = getattr(eval_cfg, "fourier_grid", None)
-    grid_meta = grid_flat if grid_flat is not None else _f_get("grid_meta", {})
-    grid_meta = dict(grid_meta or {})
+    # infer Lx/Ly from dx/dy
+    if ("Lx" not in grid or "Ly" not in grid) and ("dx" in grid and "dy" in grid):
+        dx = float(grid["dx"])
+        dy = float(grid["dy"])
+        grid.setdefault("Lx", dx * float(W))
+        grid.setdefault("Ly", dy * float(H))
 
-    # band scheme: legacy flat field fourier_band_scheme; nested fourier.band_scheme
-    band_scheme_flat = getattr(eval_cfg, "fourier_band_scheme", None)
-    band_scheme = band_scheme_flat if band_scheme_flat is not None else _f_get("band_scheme", "energy_quantile")
+    return grid
 
-    # lambda_edges: legacy flat field fourier_lambda_edges; nested fourier.lambda_edges
-    lambda_edges_flat = getattr(eval_cfg, "fourier_lambda_edges", None)
-    lambda_edges = lambda_edges_flat if lambda_edges_flat is not None else _f_get("lambda_edges", None)
+def _get_fourier_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
+    """
+    NEW SCHEMA ONLY.
+    Collect Fourier-related settings from eval_cfg.fourier with strict defaults.
+    No legacy flat fields are supported.
+
+    Returns a dict used by _compute_fourier_for_setting.
+    """
+    f = getattr(eval_cfg, "fourier", None)
+    if f is None:
+        return {
+            "enabled": False,
+        }
+
+    grid_meta = _infer_fourier_grid_meta(eval_cfg, H=H, W=W)
+
+    enabled = bool(getattr(f, "enabled", False))
+    band_scheme = str(getattr(f, "band_scheme", "physical")).strip().lower()
+    band_names = tuple(getattr(f, "band_names", ("L", "M", "H")))
+
+    lambda_edges = getattr(f, "lambda_edges", None)
+    if lambda_edges is not None:
+        lambda_edges = [float(v) for v in lambda_edges]
 
     return {
         "enabled": enabled,
         "grid_meta": grid_meta,
 
-        "mean_mode_true": getattr(eval_cfg, "fourier_mean_mode_true", _f_get("mean_mode_true", "global")),
-        "num_bins": int(getattr(eval_cfg, "fourier_num_bins", _f_get("num_bins", 64))),
-        "k_max": getattr(eval_cfg, "fourier_k_max", _f_get("k_max", None)),
+        "num_bins": int(getattr(f, "num_bins", 64)),
+        "sample_frames": int(getattr(f, "sample_frames", 8)),
 
-        "kstar_thr": float(getattr(eval_cfg, "fourier_kstar_threshold", _f_get("kstar_threshold", 1.0))),
-        "mono_env": bool(getattr(eval_cfg, "fourier_monotone_envelope", _f_get("monotone_envelope", True))),
-        "sample_frames": int(getattr(eval_cfg, "fourier_sample_frames", _f_get("sample_frames", 8))),
-        "save_curve": bool(getattr(eval_cfg, "fourier_save_curve", _f_get("save_curve", False))),
-
-        # band edges
-        "k_edges_cfg": getattr(eval_cfg, "fourier_k_edges", _f_get("k_edges", None)),
-        "auto_edges_quantiles": getattr(eval_cfg, "fourier_auto_edges_quantiles", _f_get("auto_edges_quantiles", (0.80, 0.95))),
-        "band_names_cfg": tuple(getattr(eval_cfg, "fourier_band_names", _f_get("band_names", ("L", "M", "H")))),
+        "kstar_thr": float(getattr(f, "kstar_threshold", 1.0)),
+        "mean_mode_true": str(getattr(f, "mean_mode_true", "global")),
+        "save_curve": bool(getattr(f, "save_curve", False)),
 
         "band_scheme": band_scheme,
+        "band_names": band_names,
         "lambda_edges": lambda_edges,
     }
 
 def _compute_fourier_for_setting(
     *,
     X_thwc: np.ndarray,             # [T,H,W,C]
-    A_hat_all: np.ndarray,          # [T,r_eff]  (linear or mlp coeffs)
+    A_hat_all: np.ndarray,          # [T,r_eff]
     Ur_eff: np.ndarray,             # [D,r_eff]
     mean_flat: np.ndarray,          # [D]
     eval_cfg: EvalConfig,
@@ -263,14 +275,16 @@ def _compute_fourier_for_setting(
     W: int,
 ) -> tuple[dict | None, float | None, dict | None, dict | None]:
     """
+    NEW SCHEMA ONLY.
+
     Returns:
       fourier_band_nrmse_out: Dict[str,float] | None
       k_star_out: float | None
       fourier_curve_out: Dict[str,Any] | None
       meta_hint: Dict[str,Any] | None   (用于 result["meta"] 的三件套填充)
     """
-    fs = _get_fourier_settings(eval_cfg)
-    if not fs["enabled"]:
+    fs = _get_fourier_settings(eval_cfg, H=H, W=W)
+    if not fs.get("enabled", False):
         return None, None, None, None
 
     T = int(X_thwc.shape[0])
@@ -282,7 +296,7 @@ def _compute_fourier_for_setting(
     Ee_sum = None
     k_centers_ref = None
 
-    # 1) 累积 radial 能量（true & error）
+    # 1) accumulate radial energy (true & error) across sampled frames
     for t_s in t_samples:
         x_true = X_thwc[t_s]  # [H,W,C]
         a_hat = A_hat_all[t_s]
@@ -292,7 +306,7 @@ def _compute_fourier_for_setting(
             x_hat=x_hat,
             x_true=x_true,
             num_bins=fs["num_bins"],
-            k_max=fs["k_max"],
+            k_max=None,                    # NEW schema does not expose k_max
             grid_meta=fs["grid_meta"],
             mean_mode=fs["mean_mode_true"],
         )
@@ -308,101 +322,77 @@ def _compute_fourier_for_setting(
     if k_centers_ref is None:
         return None, None, None, None
 
-    # 2) NRMSE(k) + k*
+    # 2) NRMSE(k) and k*
     nrmse_k_mean = np.sqrt(Ee_sum / (Et_sum + 1e-12))
     k_star_out = kstar_from_radial_curve(
         k_centers_ref,
         nrmse_k_mean,
-        threshold=fs["kstar_thr"],
-        monotone_enforce=fs["mono_env"],
+        threshold=float(fs["kstar_thr"]),
     )
 
-    # 3) k_edges
-    #    内部用 full_edges=[k0,k1,...,kN]（含端点）做统计；
-    #    对外输出 interior_edges=[k1,...,k_{N-1}] 供画图/空间分解，避免多一段 band3。
-    full_edges: list[float] | None = None
+    # 3) decide band edges
+    band_scheme = fs["band_scheme"]
+    band_names = list(fs["band_names"])
 
-    scheme = str(fs.get("band_scheme", "energy_quantile")).lower()
+    if band_scheme == "physical":
+        lam = fs.get("lambda_edges", None)
+        if not lam:
+            raise ValueError("fourier.band_scheme='physical' requires fourier.lambda_edges in YAML.")
+        # interior edges in k-space
+        interior_edges = sorted([1.0 / float(v) for v in lam if float(v) > 0.0])
+        if len(interior_edges) == 0:
+            raise ValueError("fourier.lambda_edges must contain positive values.")
+        kN = float(np.max(k_centers_ref))
+        full_edges = [0.0] + interior_edges + [kN]
 
-    if scheme == "physical":
-        # 物理尺度：用波长 λ 的分界来定义 bands（k = 1/λ）
-        lam_edges = fs.get("lambda_edges", None)
-        if lam_edges is None:
-            # 给一个稳健默认：如果提供了 obstacle_diameter，用 [8D, 2D]；
-            # 否则退化到 [Ly, Ly/4]
-            g = fs.get("grid_meta", {}) or {}
-            D = g.get("obstacle_diameter", None)
-            Ly = g.get("Ly", None)
-            if D is not None:
-                lam_edges = [8.0 * float(D), 2.0 * float(D)]
-            elif Ly is not None:
-                lam_edges = [float(Ly), float(Ly) / 4.0]
-            else:
-                lam_edges = [1.0, 0.25]
-
-        lam_edges = [float(x) for x in lam_edges]
-        # L/M/H: λ 大 -> k 小；所以要把边界转成递增的 k
-        k_interior = sorted([1.0 / max(le, 1e-12) for le in lam_edges])
-        k0 = 0.0
-        kN = float(np.max(k_centers_ref)) if fs["k_max"] is None else float(fs["k_max"])
-        full_edges = [k0] + k_interior + [kN]
+    elif band_scheme == "energy_quantile":
+        # default quantiles (can be exposed later in FourierConfig if needed)
+        full_edges = auto_pick_k_edges_from_energy(
+            k_centers_ref,
+            Et_sum,
+            quantiles=(0.80, 0.95),
+        )
+        interior_edges = [float(v) for v in full_edges[1:-1]]
 
     else:
-        # energy_quantile（旧逻辑）或显式 k_edges_cfg
-        if fs["k_edges_cfg"] is None:
-            full_edges = auto_pick_k_edges_from_energy(
-                k_centers_ref,
-                Et_sum,
-                quantiles=fs["auto_edges_quantiles"],
-            )
-        else:
-            # 允许用户传：
-            # - interior edges: [k1,k2]
-            # - full edges: [k0,k1,k2,kN]
-            cfg_edges = [float(v) for v in fs["k_edges_cfg"]]
-            if len(cfg_edges) >= 2 and cfg_edges[0] <= 1e-12:
-                # 看起来像 full edges
-                full_edges = cfg_edges
-            else:
-                # 当作 interior edges
-                k0 = 0.0
-                kN = float(np.max(k_centers_ref)) if fs["k_max"] is None else float(fs["k_max"])
-                full_edges = [k0] + cfg_edges + [kN]
+        raise ValueError(f"Unsupported fourier.band_scheme='{band_scheme}'. Use 'physical' or 'energy_quantile'.")
 
-    if full_edges is None or len(full_edges) < 3:
-        return None, None, None, None
+    # 4) ensure band_names match number of bands
+    n_bands = max(0, len(full_edges) - 1)
+    if len(band_names) != n_bands:
+        # strict but safe: auto-generate to avoid index errors
+        band_names = [f"B{i+1}" for i in range(n_bands)]
 
-    # 对外输出的“内部边界”
-    interior_edges = [float(v) for v in full_edges[1:-1]]
-
-    # 4) band names 对齐 band 数
-    nb = len(full_edges) - 1
-    band_names = list(fs["band_names_cfg"])
-    if len(band_names) != nb:
-        band_names = [f"band_{i}" for i in range(nb)]
-
-    # 5) band NRMSE：对 sampled frames 逐帧算后取均值（保持你原本语义）
+    # 5) band nrmse
     band_vals = []
     for t_s in t_samples:
         x_true = X_thwc[t_s]
         a_hat = A_hat_all[t_s]
         x_hat = reconstruct_from_pod(a_hat, Ur_eff, mean_flat).reshape(H, W, -1)
 
-        b = fourier_band_nrmse(
+        # compute band nrmse for this frame
+        k_centers, Et, Ee, _nrmse_k = fourier_radial_nrmse_curve(
             x_hat=x_hat,
             x_true=x_true,
-            k_edges=full_edges,
+            num_bins=fs["num_bins"],
+            k_max=None,
             grid_meta=fs["grid_meta"],
             mean_mode=fs["mean_mode_true"],
-            band_names=band_names,
         )
-        band_vals.append(b)
 
-    fourier_band_nrmse_out = {
-        name: float(np.mean([bv[name] for bv in band_vals])) for name in band_names
-    }
+        band_nrmse_t = fourier_band_nrmse(
+            k_centers=k_centers,
+            E_true_k=Et,
+            E_err_k=Ee,
+            full_edges=full_edges,
+            band_names=band_names,
+            monotone_enforce=True,  # NEW schema: fixed default
+        )
+        band_vals.append(band_nrmse_t)
 
-    # 6) curve（可选保存，用于 per-(p,σ) 的解释图）
+    fourier_band_nrmse_out = {name: float(np.mean([bv[name] for bv in band_vals])) for name in band_names}
+
+    # 6) optional curve (for per-(p,σ) explanation plots)
     fourier_curve_out = None
     if fs["save_curve"]:
         fourier_curve_out = {
@@ -416,10 +406,10 @@ def _compute_fourier_for_setting(
             "k_star_threshold": float(fs["kstar_thr"]),
         }
 
-    # 7) meta_hint：用于 result["meta"] 全局定义图（你 Batch 2 的 fig_energy_spectrum 依赖这个）
+    # 7) meta_hint for build_eval_figures gate and definition plot
     meta_hint = {
         "fourier_k_centers": k_centers_ref.tolist(),
-        "fourier_energy_k": Et_sum.tolist(),      # 用 “true energy spectrum” 做定义图
+        "fourier_energy_k": Et_sum.tolist(),
         "fourier_k_edges": interior_edges,
         "fourier_grid_meta": dict(fs.get("grid_meta", {}) or {}),
     }
@@ -434,30 +424,42 @@ def run_linear_baseline_experiment(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    在全数据集上，对一组 (mask_rate, noise_sigma) 组合运行线性基线重建。
-
-    返回
-    ----
-    result:
-        {
-            "model_type": "linear",
-            "mask_rates": [...],
-            "noise_sigmas": [...],
-            "meta": {... POD 与数据集信息 ...},
-            "entries": [... 原有统计 ...],
-
-            # 旧字段：保留一个代表样本（最小 p / σ，t=0），兼容旧绘图逻辑
-            "example_recon": { ... } | None,
-
-            # 新字段：用于多组四联图绘制
-            "examples": [...],
-
-            # 新字段：每个 mask_rate 对应的空间掩膜（为画采样点服务）
-            "mask_hw_map": {...},
-        }
+    新版：仅支持 eval_cfg.fourier.*（嵌套结构）：
+      - eval_cfg.fourier.enabled
+      - eval_cfg.fourier.band_scheme
+      - eval_cfg.fourier.grid_meta
+      - eval_cfg.fourier.lambda_edges / band_names / ...
     """
     if verbose:
         print("=== [eval-linear] Start linear baseline experiment ===")
+
+    # ---- Fourier config (NEW ONLY) ----
+    fourier_cfg = getattr(eval_cfg, "fourier", None)
+    fourier_enabled = bool(getattr(fourier_cfg, "enabled", False)) if fourier_cfg is not None else False
+    fourier_grid_meta = dict(getattr(fourier_cfg, "grid_meta", {}) or {}) if fourier_cfg is not None else {}
+    fourier_band_scheme = str(getattr(fourier_cfg, "band_scheme", "physical")) if fourier_cfg is not None else "physical"
+    fourier_lambda_edges = getattr(fourier_cfg, "lambda_edges", None) if fourier_cfg is not None else None
+    fourier_band_names = tuple(getattr(fourier_cfg, "band_names", ("L", "M", "H"))) if fourier_cfg is not None else ("L", "M", "H")
+    fourier_num_bins = int(getattr(fourier_cfg, "num_bins", 64)) if fourier_cfg is not None else 64
+    fourier_sample_frames = int(getattr(fourier_cfg, "sample_frames", 8)) if fourier_cfg is not None else 8
+    fourier_kstar_threshold = float(getattr(fourier_cfg, "kstar_threshold", 1.0)) if fourier_cfg is not None else 1.0
+    fourier_mean_mode_true = str(getattr(fourier_cfg, "mean_mode_true", "global")) if fourier_cfg is not None else "global"
+    fourier_save_curve = bool(getattr(fourier_cfg, "save_curve", False)) if fourier_cfg is not None else False
+
+    if fourier_enabled and verbose:
+        print(
+            "[eval-linear][fourier] enabled=True, "
+            f"scheme={fourier_band_scheme}, bins={fourier_num_bins}, sample_frames={fourier_sample_frames}, "
+            f"kstar_thr={fourier_kstar_threshold}, mean_mode={fourier_mean_mode_true}, "
+            f"band_names={fourier_band_names}, lambda_edges={fourier_lambda_edges}"
+        )
+        if not fourier_grid_meta:
+            print("[eval-linear][fourier][WARN] grid_meta is empty. Your physical scaling may be wrong.")
+        else:
+            # 关键字段不强制报错（避免打断），但会提醒
+            for k in ("dx", "dy", "angular"):
+                if k not in fourier_grid_meta:
+                    print(f"[eval-linear][fourier][WARN] grid_meta missing '{k}'.")
 
     # 1) POD 基底
     Ur, mean_flat, meta = _load_or_build_pod(data_cfg, pod_cfg, verbose=verbose)
@@ -477,7 +479,7 @@ def run_linear_baseline_experiment(
         verbose=verbose,
     )
 
-    # 1.2 从 eigenvalues 推出能量比例与累计能量（供多尺度能量曲线使用）
+    # 1.2 从 eigenvalues 推出能量比例与累计能量
     energy_frac = None
     energy_cum = None
     if eigenvalues is not None:
@@ -491,13 +493,13 @@ def run_linear_baseline_experiment(
     # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
 
-    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0（旧逻辑保留）
+    # 典型样本（旧逻辑保留）
     p_ref = float(min(eval_cfg.mask_rates))
     s_ref = float(min(eval_cfg.noise_sigmas))
     t_ref = 0
     example_recon: Dict[str, Any] | None = None
 
-    # 新：为每个 (p,σ) 采样若干帧作为可视化样本，这里最多取 3 帧，均匀分布在时间序列上
+    # 新：每个 (p,σ) 选若干帧作为可视化样本
     n_example_frames = min(3, T)
     example_t_indices = np.linspace(0, T - 1, num=n_example_frames, dtype=int)
     example_t_set = set(int(t) for t in example_t_indices)
@@ -505,7 +507,6 @@ def run_linear_baseline_experiment(
     examples: List[Dict[str, Any]] = []
     mask_hw_map: Dict[str, Any] = {}
 
-    # 3) 遍历 (mask_rate, noise_sigma)
     entries: List[Dict[str, Any]] = []
     fourier_meta_hint: Dict[str, Any] | None = None
 
@@ -513,19 +514,17 @@ def run_linear_baseline_experiment(
         if verbose:
             print(f"\n[eval-linear] mask_rate = {mask_rate:.4f}")
 
-        # 同一 mask_rate 复用一个随机 mask（固定 seed 以保证可复现）
         mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate, seed=0)
         mask_flat = flatten_mask(mask_hw, C=C)
         n_obs = int(mask_flat.sum())
 
-        # 记录下该 mask_rate 对应的 mask_hw，后续绘图时用来标采样点
         mask_key = f"{float(mask_rate):.6g}"
         mask_hw_map[mask_key] = mask_hw.astype(bool).tolist()
 
         if verbose:
             print(f"  -> total observed entries (with {C} channels) = {n_obs}")
 
-        Ur_masked = Ur_eff[mask_flat, :]  # [M,r_eff]
+        Ur_masked = Ur_eff[mask_flat, :]
 
         for noise_sigma in eval_cfg.noise_sigmas:
             if verbose:
@@ -535,25 +534,20 @@ def run_linear_baseline_experiment(
             nmae_list: List[float] = []
             psnr_list: List[float] = []
 
-            # 收集该组合下所有帧的线性系数，便于后面做 band-wise / per-mode / partial 误差
-            A_lin_all = np.empty_like(A_true)  # [T,r_eff]
+            A_lin_all = np.empty_like(A_true)
 
             for t in range(T):
-                x = X_thwc[t]                 # [H,W,C]
-                x_flat = x.reshape(-1)        # [D]
-                a_true_t = A_true[t]          # [r_eff]  # noqa: F841
+                x = X_thwc[t]
+                x_flat = x.reshape(-1)
 
-                # mask + 噪声
-                y = apply_mask_flat(x_flat, mask_flat)  # [M]
+                y = apply_mask_flat(x_flat, mask_flat)
                 y_noisy = add_gaussian_noise(y, sigma=noise_sigma)
                 if eval_cfg.centered_pod:
                     y_noisy -= apply_mask_flat(mean_flat, mask_flat)
 
-                # 线性最小二乘在 POD 空间求系数
-                a_lin = solve_pod_coeffs_least_squares(y_noisy, Ur_masked)  # [r_eff]
+                a_lin = solve_pod_coeffs_least_squares(y_noisy, Ur_masked)
                 A_lin_all[t] = a_lin
 
-                # 重建到物理空间
                 x_lin_flat = reconstruct_from_pod(a_lin, Ur_eff, mean_flat)
                 x_lin = x_lin_flat.reshape(H, W, C)
 
@@ -561,7 +555,6 @@ def run_linear_baseline_experiment(
                 nmae_list.append(nmae(x_lin, x))
                 psnr_list.append(psnr(x_lin, x))
 
-                # 旧逻辑：记录一个典型样本，用于后续全实验可视化（单个例子）
                 if (
                     example_recon is None
                     and float(mask_rate) == p_ref
@@ -578,7 +571,6 @@ def run_linear_baseline_experiment(
                         "x_interp": x_interp_ref.tolist(),
                     }
 
-                # 新逻辑：为每个 (p,σ) 挑选若干帧作为四联图样本
                 if int(t) in example_t_set:
                     x_interp = _compute_interp_baseline(x, mask_hw)
                     examples.append(
@@ -596,29 +588,14 @@ def run_linear_baseline_experiment(
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
 
-            # === 3.1 POD 系数多尺度误差 ===
-
-            # (a) band-wise 系数 RMSE（沿用旧接口）
-            band_errors = compute_pod_band_errors(
-                a_hat=A_lin_all,
-                a_true=A_true,
-                bands=eval_cfg.pod_bands,
-            )
+            band_errors = compute_pod_band_errors(a_hat=A_lin_all, a_true=A_true, bands=eval_cfg.pod_bands)
             band_errors = {k: float(v) for k, v in band_errors.items()}
 
-            # (b) band-wise 系数 NRMSE（相对误差）
-            band_nrmse = nrmse_per_band(
-                a_hat=A_lin_all,
-                a_true=A_true,
-                bands=eval_cfg.pod_bands,
-            )
+            band_nrmse = nrmse_per_band(a_hat=A_lin_all, a_true=A_true, bands=eval_cfg.pod_bands)
             band_nrmse = {k: float(v) for k, v in band_nrmse.items()}
 
-            # (c) per-mode RMSE / NRMSE 谱线
-            coeff_rmse = rmse_per_mode(A_lin_all, A_true)                      # [r_eff]
-            coeff_nrmse = nrmse_per_mode(A_lin_all, A_true, eigenvalues=eigenvalues)  # [r_eff]
-
-            # === 3.2 基于 φ 分组的场级 partial 重建 NMSE ===
+            coeff_rmse = rmse_per_mode(A_lin_all, A_true)
+            coeff_nrmse = nrmse_per_mode(A_lin_all, A_true, eigenvalues=eigenvalues)
 
             partial_info = partial_recon_nmse(
                 a_hat=A_lin_all,
@@ -626,39 +603,19 @@ def run_linear_baseline_experiment(
                 Ur=Ur_eff,
                 groups=phi_groups,
                 mean_flat=mean_flat,
-                sample_indices=None,     # 使用全部时间帧
-                reduction="mean",        # 每个组 / 累积一个标量
+                sample_indices=None,
+                reduction="mean",
             )
-
-            field_nmse_per_group = {
-                name: float(val)
-                for name, val in partial_info["group_nmse"].items()
-            }
-            field_nmse_partial = {
-                name: float(val)
-                for name, val in partial_info["cumulative_nmse"].items()
-            }
-
-            # === 3.3 从 band_errors 推断“有效模态等级”（保持原有行为） ===
+            field_nmse_per_group = {name: float(val) for name, val in partial_info["group_nmse"].items()}
+            field_nmse_partial = {name: float(val) for name, val in partial_info["cumulative_nmse"].items()}
 
             effective_band = None
             effective_r_cut = None
             if band_errors and eval_cfg.pod_bands:
-                # 按 band 起始索引排序，确保从低频到高频
-                band_items = sorted(
-                    eval_cfg.pod_bands.items(),
-                    key=lambda kv: kv[1][0],
-                )
+                band_items = sorted(eval_cfg.pod_bands.items(), key=lambda kv: kv[1][0])
                 names = [name for name, _ in band_items]
-                errs = []
-                for name in names:
-                    v = band_errors.get(name, float("nan"))
-                    errs.append(v)
-
-                errs = np.asarray(errs, dtype=float)
-                # 若全是 NaN，就放弃推断
+                errs = np.asarray([band_errors.get(name, float("nan")) for name in names], dtype=float)
                 if np.isfinite(errs).any():
-                    # 用一个简单的“跳变阈值”来判断从哪一层开始误差显著增大
                     jump_ratio = 3.0
                     eff_idx = len(names) - 1
                     for i in range(len(names) - 1):
@@ -667,37 +624,34 @@ def run_linear_baseline_experiment(
                         if errs[i + 1] > jump_ratio * errs[i]:
                             eff_idx = i
                             break
-
                     effective_band = names[eff_idx]
                     effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
-            # ===== Fourier multiscale (refactored) =====
+            # ===== Fourier multiscale =====
             fourier_band_nrmse_out = None
             k_star_out = None
             fourier_curve_out = None
 
-            fb, ks, fc, meta_hint = _compute_fourier_for_setting(
-                X_thwc=X_thwc,
-                A_hat_all=A_lin_all,
-                Ur_eff=Ur_eff,
-                mean_flat=mean_flat,
-                eval_cfg=eval_cfg,
-                H=H,
-                W=W,
-            )
-            fourier_band_nrmse_out = fb
-            k_star_out = ks
-            fourier_curve_out = fc
-
-            # 把 “L/M/H 是什么” 的全局定义信息写一次进 meta（用于后续统一画 E(k)+edges）
-            if fourier_meta_hint is None and meta_hint is not None:
-                fourier_meta_hint = meta_hint
+            if fourier_enabled:
+                fb, ks, fc, meta_hint = _compute_fourier_for_setting(
+                    X_thwc=X_thwc,
+                    A_hat_all=A_lin_all,
+                    Ur_eff=Ur_eff,
+                    mean_flat=mean_flat,
+                    eval_cfg=eval_cfg,  # 下游你后面会继续清理为只读 eval_cfg.fourier
+                    H=H,
+                    W=W,
+                )
+                fourier_band_nrmse_out = fb
+                k_star_out = ks
+                fourier_curve_out = fc
+                if fourier_meta_hint is None and meta_hint is not None:
+                    fourier_meta_hint = meta_hint
 
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
 
-                # 全场误差统计
                 "nmse_mean": float(nmse_arr.mean()),
                 "nmse_std": float(nmse_arr.std()),
                 "nmae_mean": float(nmae_arr.mean()),
@@ -705,24 +659,20 @@ def run_linear_baseline_experiment(
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
 
-                # POD 系数级误差
-                "band_errors": band_errors,                         # RMSE
-                "band_nrmse": band_nrmse,                           # NRMSE
-                "coeff_rmse_per_mode": coeff_rmse.tolist(),         # [r_eff]
-                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),       # [r_eff]
+                "band_errors": band_errors,
+                "band_nrmse": band_nrmse,
+                "coeff_rmse_per_mode": coeff_rmse.tolist(),
+                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),
 
-                # 场级多尺度误差（φ 分组）
-                "field_nmse_per_group": field_nmse_per_group,       # S1, S2, ...
-                "field_nmse_partial": field_nmse_partial,           # S1, S1+S2, ...
+                "field_nmse_per_group": field_nmse_per_group,
+                "field_nmse_partial": field_nmse_partial,
 
-                # 有效模态等级
                 "effective_band": effective_band,
                 "effective_r_cut": effective_r_cut,
 
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
 
-                # 傅里叶多尺度等级
                 "fourier_band_nrmse": fourier_band_nrmse_out,
                 "k_star": None if k_star_out is None else float(k_star_out),
                 "fourier_curve": fourier_curve_out,
@@ -750,10 +700,18 @@ def run_linear_baseline_experiment(
             "center": meta.get("center", True),
             "energy_frac": energy_frac,
             "energy_cum": energy_cum,
+
+            # 让绘图端能稳定拿到“Fourier 分带定义”
+            "fourier_enabled": bool(fourier_enabled),
+            "fourier_band_scheme": fourier_band_scheme,
+            "fourier_band_names": list(fourier_band_names),
+            "fourier_lambda_edges": None if fourier_lambda_edges is None else [float(x) for x in fourier_lambda_edges],
+            "fourier_grid_meta": dict(fourier_grid_meta),
+
+            # 供 build_eval_figures gate 的三件套（来自一次 meta_hint）
             "fourier_k_centers": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_centers"),
             "fourier_energy_k": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_energy_k"),
             "fourier_k_edges": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_edges"),
-            "fourier_grid_meta": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_grid_meta"),
         },
         "entries": entries,
         "example_recon": example_recon,
@@ -775,15 +733,31 @@ def run_mlp_experiment(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    在全数据集上，对一组 (mask_rate, noise_sigma) 组合运行 MLP 重建。
-
-    新增：
-    - "examples": 每个 (mask_rate, noise_sigma) 下若干帧的 x_true / x_mlp / x_interp，
-      用于后续四联图绘制；
-    - "mask_hw_map": 与线性基线同结构，用于标出采样点。
+    新版：仅支持 eval_cfg.fourier.*（嵌套结构）。
     """
     if verbose:
         print("=== [eval-mlp] Start MLP experiment ===")
+
+    # ---- Fourier config (NEW ONLY) ----
+    fourier_cfg = getattr(eval_cfg, "fourier", None)
+    fourier_enabled = bool(getattr(fourier_cfg, "enabled", False)) if fourier_cfg is not None else False
+    fourier_grid_meta = dict(getattr(fourier_cfg, "grid_meta", {}) or {}) if fourier_cfg is not None else {}
+    fourier_band_scheme = str(getattr(fourier_cfg, "band_scheme", "physical")) if fourier_cfg is not None else "physical"
+    fourier_lambda_edges = getattr(fourier_cfg, "lambda_edges", None) if fourier_cfg is not None else None
+    fourier_band_names = tuple(getattr(fourier_cfg, "band_names", ("L", "M", "H"))) if fourier_cfg is not None else ("L", "M", "H")
+    fourier_num_bins = int(getattr(fourier_cfg, "num_bins", 64)) if fourier_cfg is not None else 64
+    fourier_sample_frames = int(getattr(fourier_cfg, "sample_frames", 8)) if fourier_cfg is not None else 8
+    fourier_kstar_threshold = float(getattr(fourier_cfg, "kstar_threshold", 1.0)) if fourier_cfg is not None else 1.0
+    fourier_mean_mode_true = str(getattr(fourier_cfg, "mean_mode_true", "global")) if fourier_cfg is not None else "global"
+    fourier_save_curve = bool(getattr(fourier_cfg, "save_curve", False)) if fourier_cfg is not None else False
+
+    if fourier_enabled and verbose:
+        print(
+            "[eval-mlp][fourier] enabled=True, "
+            f"scheme={fourier_band_scheme}, bins={fourier_num_bins}, sample_frames={fourier_sample_frames}, "
+            f"kstar_thr={fourier_kstar_threshold}, mean_mode={fourier_mean_mode_true}, "
+            f"band_names={fourier_band_names}, lambda_edges={fourier_lambda_edges}"
+        )
 
     # 1) POD 基底
     Ur, mean_flat, meta = _load_or_build_pod(data_cfg, pod_cfg, verbose=verbose)
@@ -796,14 +770,12 @@ def run_mlp_experiment(
     if verbose:
         print(f"  - meta: T={T}, H={H}, W={W}, C={C}, r_used={r_used}, r_eff={r_eff}")
 
-    # 1.1 载入 POD 辅助信息（特征值 + φ 分组）
     eigenvalues, phi_groups = _load_pod_aux_info(
         pod_cfg=pod_cfg,
         r_eff=r_eff,
         verbose=verbose,
     )
 
-    # 1.2 从 eigenvalues 推出能量比例与累计能量（供多尺度能量曲线使用）
     energy_frac = None
     energy_cum = None
     if eigenvalues is not None:
@@ -814,18 +786,15 @@ def run_mlp_experiment(
             energy_frac = frac.tolist()
             energy_cum = np.cumsum(frac).tolist()
 
-    # 2) 全数据 + 真系数
     X_thwc, A_true = _prepare_snapshots(data_cfg, Ur, mean_flat, r_eff, verbose=verbose)
     D = H * W * C
     X_flat_all = X_thwc.reshape(T, D)
 
-    # 典型样本选择：取最小 mask_rate / noise_sigma，时间帧 t=0（兼容旧逻辑）
     p_ref = float(min(eval_cfg.mask_rates))
     s_ref = float(min(eval_cfg.noise_sigmas))
     t_ref = 0
     example_recon: Dict[str, Any] | None = None
 
-    # 新：统一为每个 (p,σ) 选若干帧作为可视化样本
     n_example_frames = min(3, T)
     example_t_indices = np.linspace(0, T - 1, num=n_example_frames, dtype=int)
     example_t_set = set(int(t) for t in example_t_indices)
@@ -836,30 +805,25 @@ def run_mlp_experiment(
     entries: List[Dict[str, Any]] = []
     fourier_meta_hint: Dict[str, Any] | None = None
 
-    # 3) 对每个 mask_rate：训练一个 MLP
     for mask_rate in eval_cfg.mask_rates:
         if verbose:
             print(f"\n[eval-mlp] mask_rate(train/test) = {mask_rate:.4f}")
 
-        # 3.1 构造观测掩码（训练和测试共用）
         mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate, seed=0)
         mask_flat = flatten_mask(mask_hw, C=C)
         n_obs = int(mask_flat.sum())
 
-        # 记录 mask_hw
         mask_key = f"{float(mask_rate):.6g}"
         mask_hw_map[mask_key] = mask_hw.astype(bool).tolist()
 
         if verbose:
             print(f"  -> total observed entries (with {C} channels) = {n_obs}")
-
             print(
                 f"  -> Training MLP with train_noise_sigma={train_cfg.noise_sigma:.4e}, "
                 f"batch_size={train_cfg.batch_size}, max_epochs={train_cfg.max_epochs}, "
                 f"hidden_dims={train_cfg.hidden_dims}"
             )
 
-        # 3.2 训练 MLP（使用 train_cfg.noise_sigma 作为训练噪声）
         model_mlp, train_info = train_mlp_on_observations(
             X_flat_all=X_flat_all,
             Ur_eff=Ur_eff,
@@ -872,7 +836,6 @@ def run_mlp_experiment(
             verbose=verbose,
         )
 
-        # 4) 在不同 noise_sigma 上评估
         import torch
 
         model_mlp.eval()
@@ -886,27 +849,23 @@ def run_mlp_experiment(
             nmae_list: List[float] = []
             psnr_list: List[float] = []
 
-            A_mlp_all = np.empty_like(A_true)  # [T,r_eff]
+            A_mlp_all = np.empty_like(A_true)
 
             for t in range(T):
-                x = X_thwc[t]            # [H,W,C]
-                x_flat = x.reshape(-1)   # [D]
-                a_true_t = A_true[t]     # [r_eff]  # noqa: F841
+                x = X_thwc[t]
+                x_flat = x.reshape(-1)
 
-                # 观测 + 测试噪声
-                y = apply_mask_flat(x_flat, mask_flat)  # [M]
+                y = apply_mask_flat(x_flat, mask_flat)
                 y_noisy = add_gaussian_noise(y, sigma=noise_sigma)
                 if eval_cfg.centered_pod:
                     y_noisy -= apply_mask_flat(mean_flat, mask_flat)
 
-                # MLP 预测系数
                 y_tensor = torch.from_numpy(y_noisy.astype(np.float32)).to(device)
                 with torch.no_grad():
-                    a_pred_t = model_mlp(y_tensor[None, :])[0].cpu().numpy()  # [r_eff]
+                    a_pred_t = model_mlp(y_tensor[None, :])[0].cpu().numpy()
 
                 A_mlp_all[t] = a_pred_t
 
-                # 重建到物理空间
                 x_mlp_flat = reconstruct_from_pod(a_pred_t, Ur_eff, mean_flat)
                 x_mlp = x_mlp_flat.reshape(H, W, C)
 
@@ -914,7 +873,6 @@ def run_mlp_experiment(
                 nmae_list.append(nmae(x_mlp, x))
                 psnr_list.append(psnr(x_mlp, x))
 
-                # 旧单例 example_recon（最小 p/σ，t=0）
                 if (
                     example_recon is None
                     and float(mask_rate) == p_ref
@@ -931,7 +889,6 @@ def run_mlp_experiment(
                         "x_interp": x_interp_ref.tolist(),
                     }
 
-                # 新：多帧样本
                 if int(t) in example_t_set:
                     x_interp = _compute_interp_baseline(x, mask_hw)
                     examples.append(
@@ -949,29 +906,14 @@ def run_mlp_experiment(
             nmae_arr = np.array(nmae_list)
             psnr_arr = np.array(psnr_list)
 
-            # === 4.1 POD 系数多尺度误差 ===
-
-            # (a) band-wise 系数 RMSE（与 linear 保持一致）
-            band_errors = compute_pod_band_errors(
-                a_hat=A_mlp_all,
-                a_true=A_true,
-                bands=eval_cfg.pod_bands,
-            )
+            band_errors = compute_pod_band_errors(a_hat=A_mlp_all, a_true=A_true, bands=eval_cfg.pod_bands)
             band_errors = {k: float(v) for k, v in band_errors.items()}
 
-            # (b) band-wise 系数 NRMSE
-            band_nrmse = nrmse_per_band(
-                a_hat=A_mlp_all,
-                a_true=A_true,
-                bands=eval_cfg.pod_bands,
-            )
+            band_nrmse = nrmse_per_band(a_hat=A_mlp_all, a_true=A_true, bands=eval_cfg.pod_bands)
             band_nrmse = {k: float(v) for k, v in band_nrmse.items()}
 
-            # (c) per-mode RMSE / NRMSE 谱线
-            coeff_rmse = rmse_per_mode(A_mlp_all, A_true)                          # [r_eff]
-            coeff_nrmse = nrmse_per_mode(A_mlp_all, A_true, eigenvalues=eigenvalues)  # [r_eff]
-
-            # === 4.2 基于 φ 分组的场级 partial 重建 NMSE ===
+            coeff_rmse = rmse_per_mode(A_mlp_all, A_true)
+            coeff_nrmse = nrmse_per_mode(A_mlp_all, A_true, eigenvalues=eigenvalues)
 
             partial_info = partial_recon_nmse(
                 a_hat=A_mlp_all,
@@ -979,36 +921,18 @@ def run_mlp_experiment(
                 Ur=Ur_eff,
                 groups=phi_groups,
                 mean_flat=mean_flat,
-                sample_indices=None,     # 使用全部时间帧
-                reduction="mean",        # 每个组 / 累积一个标量
+                sample_indices=None,
+                reduction="mean",
             )
-
-            field_nmse_per_group = {
-                name: float(val)
-                for name, val in partial_info["group_nmse"].items()
-            }
-            field_nmse_partial = {
-                name: float(val)
-                for name, val in partial_info["cumulative_nmse"].items()
-            }
-
-            # === 4.3 从 band_errors 推断“有效模态等级”（与 linear 同逻辑） ===
+            field_nmse_per_group = {name: float(val) for name, val in partial_info["group_nmse"].items()}
+            field_nmse_partial = {name: float(val) for name, val in partial_info["cumulative_nmse"].items()}
 
             effective_band = None
             effective_r_cut = None
             if band_errors and eval_cfg.pod_bands:
-                # 按 band 起始索引排序，确保从低频到高频
-                band_items = sorted(
-                    eval_cfg.pod_bands.items(),
-                    key=lambda kv: kv[1][0],
-                )
+                band_items = sorted(eval_cfg.pod_bands.items(), key=lambda kv: kv[1][0])
                 names = [name for name, _ in band_items]
-                errs = []
-                for name in names:
-                    v = band_errors.get(name, float("nan"))
-                    errs.append(v)
-
-                errs = np.asarray(errs, dtype=float)
+                errs = np.asarray([band_errors.get(name, float("nan")) for name in names], dtype=float)
                 if np.isfinite(errs).any():
                     jump_ratio = 3.0
                     eff_idx = len(names) - 1
@@ -1018,36 +942,34 @@ def run_mlp_experiment(
                         if errs[i + 1] > jump_ratio * errs[i]:
                             eff_idx = i
                             break
-
                     effective_band = names[eff_idx]
                     effective_r_cut = int(eval_cfg.pod_bands[effective_band][1])
 
-            # ===== Fourier multiscale (refactored) =====
+            # ===== Fourier multiscale =====
             fourier_band_nrmse_out = None
             k_star_out = None
             fourier_curve_out = None
 
-            fb, ks, fc, meta_hint = _compute_fourier_for_setting(
-                X_thwc=X_thwc,
-                A_hat_all=A_mlp_all,
-                Ur_eff=Ur_eff,
-                mean_flat=mean_flat,
-                eval_cfg=eval_cfg,
-                H=H,
-                W=W,
-            )
-            fourier_band_nrmse_out = fb
-            k_star_out = ks
-            fourier_curve_out = fc
-
-            if fourier_meta_hint is None and meta_hint is not None:
-                fourier_meta_hint = meta_hint
+            if fourier_enabled:
+                fb, ks, fc, meta_hint = _compute_fourier_for_setting(
+                    X_thwc=X_thwc,
+                    A_hat_all=A_mlp_all,
+                    Ur_eff=Ur_eff,
+                    mean_flat=mean_flat,
+                    eval_cfg=eval_cfg,
+                    H=H,
+                    W=W,
+                )
+                fourier_band_nrmse_out = fb
+                k_star_out = ks
+                fourier_curve_out = fc
+                if fourier_meta_hint is None and meta_hint is not None:
+                    fourier_meta_hint = meta_hint
 
             entry = {
                 "mask_rate": float(mask_rate),
                 "noise_sigma": float(noise_sigma),
 
-                # 全场误差统计
                 "nmse_mean": float(nmse_arr.mean()),
                 "nmse_std": float(nmse_arr.std()),
                 "nmae_mean": float(nmae_arr.mean()),
@@ -1055,30 +977,24 @@ def run_mlp_experiment(
                 "psnr_mean": float(psnr_arr.mean()),
                 "psnr_std": float(psnr_arr.std()),
 
-                # POD 系数级误差
-                "band_errors": band_errors,                         # RMSE
-                "band_nrmse": band_nrmse,                           # NRMSE
-                "coeff_rmse_per_mode": coeff_rmse.tolist(),         # [r_eff]
-                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),       # [r_eff]
+                "band_errors": band_errors,
+                "band_nrmse": band_nrmse,
+                "coeff_rmse_per_mode": coeff_rmse.tolist(),
+                "coeff_nrmse_per_mode": coeff_nrmse.tolist(),
 
-                # 场级多尺度误差（φ 分组）
-                "field_nmse_per_group": field_nmse_per_group,       # S1, S2, ...
-                "field_nmse_partial": field_nmse_partial,           # S1, S1+S2, ...
+                "field_nmse_per_group": field_nmse_per_group,
+                "field_nmse_partial": field_nmse_partial,
 
-                # 有效模态等级
                 "effective_band": effective_band,
                 "effective_r_cut": effective_r_cut,
 
-                # 数据规模 / 观测数
                 "n_frames": int(T),
                 "n_obs": int(n_obs),
 
-                # 傅里叶多尺度等级
                 "fourier_band_nrmse": fourier_band_nrmse_out,
                 "k_star": None if k_star_out is None else float(k_star_out),
                 "fourier_curve": fourier_curve_out,
 
-                # 训练信息（保持原来的结构）
                 "train_info": train_info,
             }
             entries.append(entry)
@@ -1090,7 +1006,6 @@ def run_mlp_experiment(
                     f"effective_band={effective_band}, r_cut={effective_r_cut}"
                 )
 
-    # 5) 汇总结果
     result: Dict[str, Any] = {
         "model_type": "mlp",
         "mask_rates": list(eval_cfg.mask_rates),
@@ -1105,6 +1020,7 @@ def run_mlp_experiment(
             "center": meta.get("center", True),
             "energy_frac": energy_frac,
             "energy_cum": energy_cum,
+
             "train_cfg": {
                 "mask_rate": train_cfg.mask_rate,
                 "noise_sigma": train_cfg.noise_sigma,
@@ -1114,10 +1030,16 @@ def run_mlp_experiment(
                 "max_epochs": train_cfg.max_epochs,
                 "device": train_cfg.device,
             },
+
+            "fourier_enabled": bool(fourier_enabled),
+            "fourier_band_scheme": fourier_band_scheme,
+            "fourier_band_names": list(fourier_band_names),
+            "fourier_lambda_edges": None if fourier_lambda_edges is None else [float(x) for x in fourier_lambda_edges],
+            "fourier_grid_meta": dict(fourier_grid_meta),
+
             "fourier_k_centers": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_centers"),
             "fourier_energy_k": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_energy_k"),
             "fourier_k_edges": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_k_edges"),
-            "fourier_grid_meta": None if fourier_meta_hint is None else fourier_meta_hint.get("fourier_grid_meta"),
         },
         "entries": entries,
         "example_recon": example_recon,

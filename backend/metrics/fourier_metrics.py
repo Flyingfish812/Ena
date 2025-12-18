@@ -9,8 +9,6 @@ from ..fourier.filters import (
     make_wavenumber_grid,
     fft2_field,
     radial_bin_spectrum,
-    make_band_masks_from_edges,
-    apply_band_mask_in_fourier,
 )
 
 
@@ -135,66 +133,74 @@ def fourier_radial_nrmse_curve(
 
 
 def fourier_band_nrmse(
-    x_hat: np.ndarray,
-    x_true: np.ndarray,
-    k_edges: Sequence[float],
-    grid_meta: Optional[Dict[str, Any]] = None,
-    mean_mode: str = "none",
-    eps: float = 1e-12,
+    *,
+    k_centers: np.ndarray,
+    E_true_k: np.ndarray,
+    E_err_k: np.ndarray,
+    full_edges: Sequence[float],
     band_names: Optional[Sequence[str]] = None,
+    eps: float = 1e-12,
+    monotone_enforce: bool = True,
 ) -> Dict[str, float]:
-    """NRMSE per radial-k band, computed via FFT energy in masks.
-
-    NRMSE_band = sqrt( sum_{k in band} |F_err|^2 / sum_{k in band} |F_true|^2 )
-      (with Parseval normalization cancelling out)
-
-    band_names:
-      - if provided, must match number of bands (=len(k_edges)-1)
-      - else defaults to band_0, band_1, ...
     """
-    x_hat = np.asarray(x_hat)
-    x_true = np.asarray(x_true)
+    NEW SCHEMA ONLY.
 
-    # infer spatial size
-    if x_true.ndim == 2:
-        H, W = x_true.shape
-    elif x_true.ndim == 3:
-        if x_true.shape[0] <= 8 and x_true.shape[1] > 8 and x_true.shape[2] > 8:
-            H, W = x_true.shape[1], x_true.shape[2]
-        else:
-            H, W = x_true.shape[0], x_true.shape[1]
+    Compute NRMSE per radial-k band using already-binned spectra.
+
+    Inputs:
+      - k_centers: (B,) radial bin centers
+      - E_true_k:  (B,) radial energy spectrum of true field
+      - E_err_k:   (B,) radial energy spectrum of error field (x_hat - x_true)
+      - full_edges: band edges INCLUDING endpoints, length = n_bands + 1
+          e.g. [0.0, k1, k2, ..., kN]  (monotone increasing)
+        Note: membership uses [edge_i, edge_{i+1}) bins.
+
+      - band_names: optional names per band, length must equal n_bands
+      - eps: numerical stabilizer
+      - monotone_enforce: if True, enforce nondecreasing envelope across bands (low->high k)
+
+    Returns:
+      dict {band_name: nrmse_band}
+    """
+    k_centers = np.asarray(k_centers, dtype=np.float64)
+    E_true_k = np.asarray(E_true_k, dtype=np.float64)
+    E_err_k = np.asarray(E_err_k, dtype=np.float64)
+
+    if k_centers.ndim != 1 or E_true_k.ndim != 1 or E_err_k.ndim != 1:
+        raise ValueError("k_centers, E_true_k, E_err_k must be 1D arrays.")
+    if not (k_centers.size == E_true_k.size == E_err_k.size):
+        raise ValueError("k_centers, E_true_k, E_err_k must have the same length.")
+    if k_centers.size == 0:
+        return {}
+
+    edges = [float(v) for v in full_edges]
+    if len(edges) < 2:
+        raise ValueError("full_edges must have length >= 2.")
+    if any(not np.isfinite(v) for v in edges):
+        raise ValueError("full_edges contains non-finite values.")
+    if any(edges[i + 1] <= edges[i] for i in range(len(edges) - 1)):
+        raise ValueError("full_edges must be strictly increasing.")
+
+    n_bands = len(edges) - 1
+    if band_names is None:
+        band_names = [f"band_{i}" for i in range(n_bands)]
     else:
-        raise ValueError(f"Unsupported x_true shape: {x_true.shape}")
-
-    grid = _infer_grid_from_meta(H, W, grid_meta)
-
-    F_true = _fft_for_metric(x_true, mean_mode=mean_mode)
-    F_err = _fft_for_metric(x_hat - x_true, mean_mode="none")
-
-    masks = make_band_masks_from_edges(grid, k_edges)
-
-    B = len(k_edges) - 1
-    if band_names is not None:
         band_names = list(band_names)
-        if len(band_names) != B:
-            raise ValueError(f"band_names length must be {B}, got {len(band_names)}")
-    else:
-        band_names = [f"band_{i}" for i in range(B)]
+        if len(band_names) != n_bands:
+            raise ValueError(f"band_names length must be {n_bands}, got {len(band_names)}")
 
-    out: Dict[str, float] = {}
-    for i in range(B):
-        m = masks[f"band_{i}"]
-        # sum |F|^2 over masked region; support multi-channel FFT output
-        if F_true.ndim == 2:
-            num = float(np.sum((np.abs(F_err) ** 2) * m))
-            den = float(np.sum((np.abs(F_true) ** 2) * m))
-        else:
-            num = float(np.sum((np.abs(F_err) ** 2) * m[None, :, :]))
-            den = float(np.sum((np.abs(F_true) ** 2) * m[None, :, :]))
+    out_vals: List[float] = []
+    for i in range(n_bands):
+        lo, hi = edges[i], edges[i + 1]
+        sel = (k_centers >= lo) & (k_centers < hi)
+        num = float(np.sum(E_err_k[sel]))
+        den = float(np.sum(E_true_k[sel]))
+        out_vals.append(float(np.sqrt(num / (den + float(eps)))))
 
-        out[band_names[i]] = float(np.sqrt(num / (den + float(eps))))
+    if monotone_enforce and len(out_vals) > 0:
+        out_vals = np.maximum.accumulate(np.asarray(out_vals, dtype=np.float64)).tolist()
 
-    return out
+    return {band_names[i]: float(out_vals[i]) for i in range(n_bands)}
 
 
 def kstar_from_radial_curve(
