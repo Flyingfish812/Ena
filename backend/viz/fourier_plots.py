@@ -118,7 +118,6 @@ def plot_energy_spectrum_with_band_edges(
 
     # optional: if obstacle diameter is known, also show λ/D as a small note
     g = dict(grid_meta or {})
-    print(g)
     D = g.get("obstacle_diameter", None)
     if D is not None and float(D) > 0:
         secax.set_xlabel("wavelength λ (length unit)   [λ/D shown in band labels]")
@@ -179,55 +178,68 @@ def plot_energy_spectrum_with_band_edges(
 def plot_kstar_curve_from_entry(
     entry: Dict[str, Any],
     *,
-    title_prefix: str = "NRMSE vs spatial scale",
+    # --- style / labels (aligned with plot_energy_spectrum_with_band_edges) ---
+    title: str | None = None,
+    xlabel: str = "wavenumber k (cycles / length unit)",
+    ylabel: str = "NRMSE(k)",
+    loglog: bool = True,
     show_edges: bool = True,
     show_kstar: bool = True,
+    # --- meta (can be injected, otherwise auto-resolved from entry/curve) ---
+    k_edges: Sequence[float] | None = None,                 # interior edges in k-domain: [k1,k2,...]
+    band_names: Sequence[str] = ("L", "M", "H"),
+    grid_meta: dict | None = None,                          # dx/dy/obstacle_diameter/Lx/Ly ...
 ) -> Optional[plt.Figure]:
     """
-    【解释图】单个配置的 NRMSE(k) 曲线，但主 x 轴改为物理尺度 ℓ=1/k（wavelength / characteristic scale）。
-    目标：让读者直接读出“模型能可靠重建到多小的结构”。
+    【解释图】单个配置的 NRMSE(k) 曲线，主 x 轴使用 k（与全局 E(k) 定义图一致），上方 secondary axis 显示 ℓ=1/k。
 
-    需要 entry["fourier_curve"] 至少包含:
-      - k_centers, nrmse_k
-
-    可选:
-      - k_edges: band 边界（k域） -> 转成 ℓ_edges 并画竖线/阴影
-      - k_star: k* -> 标出 ℓ* = 1/k*
-      - k_star_threshold 或 nrmse_threshold: 阈值线（水平线）
-      - grid_meta: dict, 推荐含 dx,dy 以及（可选）Lx,Ly,obstacle_diameter
-
-    参照信息（如果拿得到）：
-      - Nyquist 尺度: ℓ_Nyq = 2*min(dx,dy)
-      - obstacle diameter D
-      - domain sizes Lx, Ly
+    数据来源（与 pipeline 对齐）：
+      - entry["fourier_curve"] 应至少包含: k_centers, nrmse_k
+      - 可从 entry["fourier_meta"]（或 curve 内字段）补齐:
+          k_edges / band_names / grid_meta / k_star_threshold / k_star
     """
     curve = entry.get("fourier_curve", None)
-    if curve is None:
+    if not isinstance(curve, dict):
         return None
 
-    k = np.asarray(curve.get("k_centers", []), dtype=float).reshape(-1)
-    y = np.asarray(curve.get("nrmse_k", []), dtype=float).reshape(-1)
-    if k.size == 0 or y.size == 0 or k.size != y.size:
-        return None
-
-    # ---- grid meta (for physical annotation) ----
-    # 兼容不同可能的存放位置
-    grid_meta = (
-        curve.get("grid_meta", None)
-        or entry.get("grid_meta", None)
-        or entry.get("fourier_meta", None)
+    # ---- resolve meta (prefer explicit args, otherwise from entry/curve) ----
+    meta = (
+        entry.get("fourier_meta", None)
         or entry.get("fourier", None)
+        or entry.get("meta", None)
         or {}
     )
+    meta = meta if isinstance(meta, dict) else {}
+
+    # grid_meta: explicit > meta["grid_meta"] > meta["grid"] > curve["grid_meta"] ...
+    if grid_meta is None:
+        grid_meta = (
+            meta.get("grid_meta", None)
+            or meta.get("grid", None)
+            or curve.get("grid_meta", None)
+            or curve.get("grid", None)
+        )
     g = dict(grid_meta or {})
     dx = float(g.get("dx", 1.0))
     dy = float(g.get("dy", 1.0))
-    Lx = g.get("Lx", None)
-    Ly = g.get("Ly", None)
     D = g.get("obstacle_diameter", None)
 
-    # ---- build physical scale ℓ = 1/k ----
-    # k=0 会导致无穷大尺度；解释曲线一般从最小正k开始画
+    # k_edges: explicit > curve > meta
+    if k_edges is None:
+        k_edges = curve.get("k_edges", None) or meta.get("k_edges", None)
+
+    # band_names: explicit > curve > meta
+    bn_from_curve = curve.get("band_names", None) or meta.get("band_names", None)
+    if bn_from_curve is not None:
+        band_names = bn_from_curve
+
+    # ---- load curve data ----
+    k = np.asarray(curve.get("k_centers", []), dtype=float)
+    y = np.asarray(curve.get("nrmse_k", []), dtype=float)
+    if k.size == 0 or y.size == 0 or k.size != y.size:
+        return None
+
+    # ---- clean + sort by k (so x-axis matches E(k) definition figure) ----
     eps = 1e-12
     mask = np.isfinite(k) & np.isfinite(y) & (k > 0)
     k = k[mask]
@@ -235,167 +247,162 @@ def plot_kstar_curve_from_entry(
     if k.size == 0:
         return None
 
-    ell = 1.0 / np.maximum(k, eps)  # length unit
-    # 为了让 x 轴从“小尺度 -> 大尺度”或反过来更直观，这里选“大尺度在右边”
-    # 即 ell 从小到大递增（k 从大到小）
-    order = np.argsort(ell)
-    ell = ell[order]
-    y = y[order]
+    order = np.argsort(k)
     k_sorted = k[order]
+    y_sorted = y[order]
 
     # ---- title suffix: show p, sigma, model ----
     p = entry.get("mask_rate", None)
-    s = entry.get("noise_sigma", None)
-    model = entry.get("model", entry.get("name", None))
+    sigma = entry.get("noise_sigma", None)
+    model = entry.get("model_name", entry.get("model", None))
 
-    suffix_parts = []
-    if model is not None:
-        suffix_parts.append(str(model))
-    if p is not None:
-        suffix_parts.append(f"p={float(p):.3g}")
-    if s is not None:
-        suffix_parts.append(f"σ={float(s):.3g}")
-    suffix = " | " + ", ".join(suffix_parts) if suffix_parts else ""
+    if title is None:
+        parts = []
+        if p is not None:
+            try:
+                parts.append(f"p={float(p):.4g}")
+            except Exception:
+                parts.append(f"p={p}")
+        if sigma is not None:
+            try:
+                parts.append(f"σ={float(sigma):.4g}")
+            except Exception:
+                parts.append(f"σ={sigma}")
+        if model is not None:
+            parts.append(str(model))
+        suffix = ("  [" + ", ".join(parts) + "]") if parts else ""
+        title = "NRMSE(k) with band edges" + suffix
 
     # ---- plot ----
-    fig, ax = plt.subplots(1, 1, figsize=(8.2, 4.2))
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    ax.plot(k_sorted, y_sorted, linewidth=2.0)
 
-    # 主曲线：NRMSE vs ℓ
-    ax.plot(ell, y, linewidth=2.2)
+    if loglog:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
 
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("spatial scale ℓ (length unit, ℓ = 1/k)")
-    ax.set_ylabel("NRMSE(ℓ) (log)")
-    ax.set_title(f"{title_prefix}{suffix}")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
 
-    # ---- top axis: show k as secondary axis (so readers who like k still get it) ----
-    def ell_to_k(x):
-        x = np.asarray(x, dtype=float)
-        return 1.0 / np.maximum(x, eps)
-
+    # ---- top axis: show ℓ as secondary axis (to match global definition figure style: top ℓ, bottom k) ----
     def k_to_ell(x):
         x = np.asarray(x, dtype=float)
         return 1.0 / np.maximum(x, eps)
 
-    secax = ax.secondary_xaxis("top", functions=(ell_to_k, k_to_ell))
-    secax.set_xlabel("wavenumber k (cycles / length unit)")
+    def ell_to_k(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
 
-    # ---- band edges: convert k_edges -> ℓ_edges and annotate ----
-    if show_edges:
-        k_edges = curve.get("k_edges", None)
-        band_names = curve.get("band_names", None) or ("L", "M", "H")
-        if k_edges is not None:
-            # keep only valid positive edges
-            edges_k = sorted([float(v) for v in k_edges if v is not None and np.isfinite(v) and float(v) > 0])
-            edges_ell = [1.0 / max(ke, eps) for ke in edges_k]  # decreasing with ke
-            # in ℓ-axis (increasing), edges should be sorted
-            edges_ell = sorted(edges_ell)
+    secax = ax.secondary_xaxis("top", functions=(k_to_ell, ell_to_k))
+    secax.set_xlabel("spatial scale ℓ (length unit)   [ℓ = 1/k]")
 
-            # draw vertical lines at ℓ edges
-            for le in edges_ell:
-                ax.axvline(le, linestyle="--", linewidth=1.0)
+    # ---- band edges: annotate on k-axis (NO reversal needed now) ----
+    if show_edges and k_edges is not None:
+        edges_k = sorted([
+            float(v) for v in k_edges
+            if v is not None and np.isfinite(v) and float(v) > 0
+        ])
+        if len(edges_k) > 0:
+            # vertical lines at band edges
+            for ke in edges_k:
+                ax.axvline(ke, linestyle="--", linewidth=1.0)
 
-            # add light shading + labels to make “bands = scale ranges” explicit
-            # segments in ℓ: [ℓ_min, e1], [e1,e2], ... [elast, ℓ_max]
+            # segments on k-axis: [x_min, e1], [e1,e2], ..., [elast, x_max]
             x_min, x_max = ax.get_xlim()
-            segs = [x_min] + [le for le in edges_ell if x_min < le < x_max] + [x_max]
+            segs = [max(x_min, eps)] + [ke for ke in edges_k if x_min < ke < x_max] + [x_max]
             nb = max(1, len(segs) - 1)
+
+            def _label_for_segment(i: int, a: float, b: float) -> str:
+                # on k-axis increasing, band index i maps directly to band_names[i] (L,M,H)
+                name = band_names[i] if 0 <= i < len(band_names) else f"B{i}"
+
+                # convert to λ range for readability
+                lam_a = 1.0 / max(a, eps)
+                lam_b = 1.0 / max(b, eps)
+
+                # since k increases, λ decreases; report λ ranges in a consistent inequality form
+                if i == 0:
+                    # k < b  <=>  λ > 1/b
+                    lam_text = f"λ ≥ {1.0/max(b,eps):.3g}"
+                elif i == nb - 1:
+                    # k ≥ a <=> λ < 1/a
+                    lam_text = f"λ < {1.0/max(a,eps):.3g}"
+                else:
+                    # a ≤ k < b  <=>  1/b < λ ≤ 1/a
+                    lam_text = f"{1.0/max(b,eps):.3g} < λ ≤ {1.0/max(a,eps):.3g}"
+
+                if D is not None and float(D) > 0:
+                    Df = float(D)
+                    if i == 0:
+                        lamD_text = f"λ/D ≥ {(1.0/max(b,eps))/Df:.3g}"
+                    elif i == nb - 1:
+                        lamD_text = f"λ/D < {(1.0/max(a,eps))/Df:.3g}"
+                    else:
+                        lamD_text = f"{(1.0/max(b,eps))/Df:.3g} < λ/D ≤ {(1.0/max(a,eps))/Df:.3g}"
+                    return f"{name}\n({lam_text})\n({lamD_text})"
+
+                return f"{name}\n({lam_text})"
 
             for i in range(nb):
                 a, b = segs[i], segs[i + 1]
                 if not (np.isfinite(a) and np.isfinite(b) and b > a > 0):
                     continue
-                # alternate subtle shading
+
                 if i % 2 == 0:
                     ax.axvspan(a, b, alpha=0.06)
 
-                name = band_names[i] if i < len(band_names) else f"B{i}"
                 xm = np.sqrt(a * b)  # log-midpoint
+                label = _label_for_segment(i, a, b)
 
-                # show ℓ range text
-                if i == 0:
-                    txt = f"{name}\nℓ < {b:.3g}"
-                elif i == nb - 1:
-                    txt = f"{name}\nℓ ≥ {a:.3g}"
-                else:
-                    txt = f"{name}\n{a:.3g} ≤ ℓ < {b:.3g}"
-
-                # place near top
                 y_top = ax.get_ylim()[1]
-                ax.text(xm, y_top, txt, ha="center", va="top", fontsize=9)
+                ax.text(xm, y_top, label, ha="center", va="top", fontsize=9)
 
-    # ---- threshold + meaning ----
-    thr = curve.get("k_star_threshold", curve.get("nrmse_threshold", None))
+    # ---- threshold ----
+    thr = (
+        curve.get("k_star_threshold", None)
+        or curve.get("nrmse_threshold", None)
+        or meta.get("k_star_threshold", None)
+        or meta.get("nrmse_threshold", None)
+    )
     if thr is not None and np.isfinite(float(thr)):
         thr = float(thr)
         ax.axhline(thr, linestyle=":", linewidth=1.2)
-        # 更“人话”的解释：NRMSE=1 常被理解为误差能量≈信号能量（当然也取决于你怎么归一化）
-        # 这里不强行解释成唯一物理意义，只写“判据线”
-        ax.text(ax.get_xlim()[0], thr, " criterion (threshold) ", va="bottom", ha="left", fontsize=9)
+        ax.text(
+            ax.get_xlim()[0],
+            thr,
+            f"  threshold={thr:g}",
+            va="bottom",
+            ha="left",
+            fontsize=9,
+        )
 
-    # ---- k* -> ℓ* ----
+    # ---- show k* marker (on k-axis) ----
+    kstar_label = None
     if show_kstar:
-        k_star = curve.get("k_star", entry.get("k_star", None))
+        k_star = curve.get("k_star", meta.get("k_star", None))
         if k_star is not None and np.isfinite(float(k_star)) and float(k_star) > 0:
             k_star = float(k_star)
             ell_star = 1.0 / max(k_star, eps)
-            ax.axvline(ell_star, linestyle="-.", linewidth=1.6)
-            ax.text(
-                ell_star,
-                ax.get_ylim()[0],
-                f"  ℓ*={ell_star:.3g}  (k*={k_star:.3g})",
-                va="bottom",
-                ha="left",
-                fontsize=9,
-            )
+            kstar_label = f"k*={k_star:.3g} (ℓ*={ell_star:.3g})"
+            ax.axvline(k_star, linestyle="-.", linewidth=1.5, label=kstar_label)
 
-    # ---- physical reference markers ----
-    # Nyquist scale: smallest resolvable wavelength on grid (~2*dx)
+    # ---- Nyquist marker (on k-axis) ----
+    nyq_label = None
     try:
         dmin = float(min(dx, dy))
         if np.isfinite(dmin) and dmin > 0:
-            ell_nyq = 2.0 * dmin
-            ax.axvline(ell_nyq, linestyle=":", linewidth=1.2)
-            ax.text(
-                ell_nyq,
-                ax.get_ylim()[1],
-                f"Nyquist ℓ≈2Δ ({ell_nyq:.3g})",
-                va="top",
-                ha="left",
-                fontsize=9,
-            )
+            k_nyq = 1.0 / (2.0 * dmin)
+            nyq_label = f"Nyquist k_N={k_nyq:.3g}"
+            ax.axvline(k_nyq, linestyle=":", linewidth=1.2, label=nyq_label)
     except Exception:
         pass
 
-    # obstacle diameter D
-    if D is not None:
-        try:
-            D = float(D)
-            if np.isfinite(D) and D > 0:
-                ax.axvline(D, linestyle=":", linewidth=1.2)
-                ax.text(D, ax.get_ylim()[1], f"D={D:.3g}", va="top", ha="left", fontsize=9)
-        except Exception:
-            pass
-
-    # domain scale notes (not vertical lines; just a legend-like note)
-    note_parts = []
-    if (Lx is not None) and np.isfinite(float(Lx)):
-        note_parts.append(f"Lx={float(Lx):.3g}")
-    if (Ly is not None) and np.isfinite(float(Ly)):
-        note_parts.append(f"Ly={float(Ly):.3g}")
-    if note_parts:
-        ax.text(
-            0.99,
-            0.02,
-            " / ".join(note_parts),
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=9,
-            alpha=0.9,
-        )
+    # ---- legend: keep it compact, no layout blow-up ----
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        ax.legend(loc="lower right", frameon=True, fontsize=9)
 
     fig.tight_layout()
     return fig

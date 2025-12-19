@@ -227,6 +227,39 @@ def build_eval_figures(
         if not meta:
             meta = (linear_results.get("meta", {}) or {})
         return meta
+    
+    def _pick_fourier_meta(*, entry: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """
+        统一 Fourier meta 的来源优先级（从强到弱）：
+        1) entry["fourier_meta"] / entry["fourier"]（每个 cfg 独有，最精确）
+        2) global meta: _pick_meta() 里的 fourier_*（全局兜底，用于定义图/缺字段时）
+        """
+        fm: Dict[str, Any] = {}
+        if isinstance(entry, dict):
+            for k in ("fourier_meta", "fourier"):
+                v = entry.get(k)
+                if isinstance(v, dict) and v:
+                    fm.update(v)
+
+        gm = _pick_meta()
+        # 兼容两种风格：要么直接 fourier_grid_meta，要么包在 fourier_meta 里
+        if isinstance(gm.get("fourier_meta"), dict):
+            fm.update({k: v for k, v in gm["fourier_meta"].items() if v is not None})
+
+        # 把 global 的四个关键键补齐进来（不覆盖 entry 已有）
+        for k in ("fourier_k_centers", "fourier_energy_k", "fourier_k_edges", "fourier_grid_meta"):
+            v = gm.get(k, None)
+            if v is not None and k not in fm:
+                fm[k] = v
+
+        # 统一字段名：grid_meta
+        if "grid_meta" not in fm:
+            if isinstance(fm.get("fourier_grid_meta"), dict):
+                fm["grid_meta"] = fm["fourier_grid_meta"]
+            elif isinstance(fm.get("grid"), dict):
+                fm["grid_meta"] = fm["grid"]
+
+        return fm
 
     def _band_names_from_anything() -> tuple[str, ...]:
         # 1) meta 优先（新 schema）
@@ -380,20 +413,34 @@ def build_eval_figures(
         e_lin = lin_entry_idx.get((p_val, s_val))
         e_mlp = mlp_entry_idx.get((p_val, s_val))
 
-        # k* curve (linear)
+        # ----- k* curve (linear) -----
         if e_lin and e_lin.get("fourier_curve") is not None:
+            fm = _pick_fourier_meta(entry=e_lin)
             fig = _safe_build(
                 f"k* curve (linear) {cfg}",
-                lambda e=e_lin: plot_kstar_curve_from_entry(e, title_prefix="NRMSE(k) [linear]"),
+                lambda e=e_lin, fm_=fm: plot_kstar_curve_from_entry(
+                    e,
+                    title=f"NRMSE(k) vs spatial scale ℓ [linear] | {cfg}",
+                    band_names=fm_.get("band_names", band_names_global),
+                    k_edges=fm_.get("k_edges", None),          # 可选：显式传，避免 entry 缺字段时画不出 band
+                    grid_meta=fm_.get("grid_meta", None),       # 用于 λ/D 标注等
+                ),
             )
             if fig is not None:
                 fig_fourier_kstar_curves_linear[cfg] = fig
 
-        # k* curve (mlp)
+        # ----- k* curve (mlp) -----
         if e_mlp and e_mlp.get("fourier_curve") is not None:
+            fm = _pick_fourier_meta(entry=e_mlp)
             fig = _safe_build(
                 f"k* curve (mlp) {cfg}",
-                lambda e=e_mlp: plot_kstar_curve_from_entry(e, title_prefix="NRMSE(k) [mlp]"),
+                lambda e=e_mlp, fm_=fm: plot_kstar_curve_from_entry(
+                    e,
+                    title=f"NRMSE(k) vs spatial scale ℓ [mlp] | {cfg}",
+                    band_names=fm_.get("band_names", band_names_global),
+                    k_edges=fm_.get("k_edges", None),
+                    grid_meta=fm_.get("grid_meta", None),
+                ),
             )
             if fig is not None:
                 fig_fourier_kstar_curves_mlp[cfg] = fig
@@ -403,8 +450,10 @@ def build_eval_figures(
             # 线性：优先用 e_lin 的 band 定义；没有的话用 e_mlp/meta 兜底
             ex_lin_list = lin_ex_by_cfg.get(cfg, [])
             if ex_lin_list:
-                k_edges = _k_edges_from_entry_or_meta(e_lin if e_lin is not None else e_mlp)
-                bn = _band_names_from_entry_or_meta(e_lin if e_lin is not None else e_mlp)
+                src_entry = e_lin if e_lin is not None else e_mlp
+                fm = _pick_fourier_meta(entry=src_entry)
+                k_edges = fm.get("k_edges", None) or _k_edges_from_entry_or_meta(src_entry)
+                bn = fm.get("band_names", None) or _band_names_from_entry_or_meta(src_entry)
                 if k_edges is not None:
                     figs_list: list[Any] = []
                     for ex in ex_lin_list:
@@ -431,10 +480,12 @@ def build_eval_figures(
             # MLP：优先用 e_mlp 的 band 定义；没有的话用 e_lin/meta 兜底
             ex_mlp_list = mlp_ex_by_cfg.get(cfg, [])
             if ex_mlp_list:
-                k_edges = _k_edges_from_entry_or_meta(e_mlp if e_mlp is not None else e_lin)
-                bn = _band_names_from_entry_or_meta(e_mlp if e_mlp is not None else e_lin)
+                src_entry = e_mlp if e_mlp is not None else e_lin
+                fm = _pick_fourier_meta(entry=src_entry)
+                k_edges = fm.get("k_edges", None) or _k_edges_from_entry_or_meta(src_entry)
+                bn = fm.get("band_names", None) or _band_names_from_entry_or_meta(src_entry)
                 if k_edges is not None:
-                    figs_list = []
+                    figs_list: list[Any] = []
                     for ex in ex_mlp_list:
                         fi = ex.get("frame_idx", "?")
                         fig = _safe_build(
@@ -457,22 +508,22 @@ def build_eval_figures(
                         fig_fourier_decomp_mlp[cfg] = figs_list
 
     # 4.4 全局 band 定义图（E(k)+edges）
-    meta = _pick_meta()
+    fm_global = _pick_fourier_meta(entry=None)  # 只从全局 meta 来
     fig_energy_spectrum = _safe_build(
         "Energy spectrum definition figure",
         lambda: (
             plot_energy_spectrum_with_band_edges(
-                k_centers=np.asarray(meta.get("fourier_k_centers")),
-                energy_k=np.asarray(meta.get("fourier_energy_k")),
-                k_edges=meta.get("fourier_k_edges"),
-                band_names=_band_names_from_anything(),
-                grid_meta=meta.get("fourier_grid_meta", None),
+                k_centers=np.asarray(fm_global.get("fourier_k_centers")),
+                energy_k=np.asarray(fm_global.get("fourier_energy_k")),
+                k_edges=fm_global.get("fourier_k_edges"),
+                band_names=fm_global.get("band_names", band_names_global),
+                grid_meta=fm_global.get("grid_meta", None),
                 title="Energy spectrum E(k) with band edges",
             )
             if (
-                meta.get("fourier_k_centers") is not None
-                and meta.get("fourier_energy_k") is not None
-                and meta.get("fourier_k_edges") is not None
+                fm_global.get("fourier_k_centers") is not None
+                and fm_global.get("fourier_energy_k") is not None
+                and fm_global.get("fourier_k_edges") is not None
             )
             else None
         ),
