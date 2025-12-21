@@ -363,16 +363,51 @@ def build_eval_figures(
     # -----------------------------
     # 4) Fourier 多尺度可视化（汇总 + per-cfg 解释图）
     # -----------------------------
-    # 4.1 k* heatmap
+
+    # 4.0 entries index：后面多个 Fourier 图都会用到；提前构建，避免重复
+    lin_entry_idx = _index_entries(linear_results)
+    mlp_entry_idx = _index_entries(mlp_results)
+
+    def _pick_any_entry_for_fourier_meta() -> Dict[str, Any] | None:
+        """从 entries 中挑一个最可能带 fourier 信息的 entry，用于提取全局 grid_meta。"""
+        # 优先 linear（因为你现在要先把 linear heatmap 画对）
+        for e in (lin_entry_idx.values() or []):
+            if isinstance(e, dict) and (e.get("fourier_curve") is not None or e.get("fourier_meta") or e.get("fourier")):
+                return e
+        # 再尝试 mlp
+        for e in (mlp_entry_idx.values() or []):
+            if isinstance(e, dict) and (e.get("fourier_curve") is not None or e.get("fourier_meta") or e.get("fourier")):
+                return e
+        return None
+
+    # 4.0.1 统一提取 heatmap 要用的 grid_meta（用于 Nyquist/ℓ_N 标注与 k*>kN 判无效）
+    _entry_for_heatmap = _pick_any_entry_for_fourier_meta()
+    fm_heat = _pick_fourier_meta(entry=_entry_for_heatmap)
+    grid_meta_heat = fm_heat.get("grid_meta", None)
+
+    # 4.1 k* heatmap（新版：内部会以 ℓ*=1/k* 为主，并根据 grid_meta 计算 Nyquist）
     fig_kstar_linear = _safe_build(
         "k* heatmap (linear)",
-        lambda: plot_kstar_heatmap(df_linear, df_mlp, model="linear", title="k* heatmap"),
+        lambda gm=grid_meta_heat: plot_kstar_heatmap(
+            df_linear,
+            df_mlp,
+            model="linear",
+            title="Resolvable scale ℓ* heatmap",
+            grid_meta=gm,
+        ),
     )
+
     fig_kstar_mlp = None
     if mlp_results is not None:
         fig_kstar_mlp = _safe_build(
             "k* heatmap (mlp)",
-            lambda: plot_kstar_heatmap(df_linear, df_mlp, model="mlp", title="k* heatmap"),
+            lambda gm=grid_meta_heat: plot_kstar_heatmap(
+                df_linear,
+                df_mlp,
+                model="mlp",
+                title="Resolvable scale ℓ* heatmap",
+                grid_meta=gm,
+            ),
         )
 
     # 4.2 Fourier band NRMSE curves（随 p/σ）
@@ -383,9 +418,6 @@ def build_eval_figures(
     ) or {}
 
     # 4.3 per-(p,σ) Fourier 解释图：k* 曲线（entry 级，默认保留）
-    lin_entry_idx = _index_entries(linear_results)
-    mlp_entry_idx = _index_entries(mlp_results)
-
     # all cfg names：至少来自 entries；若 include_example_figures=True 再 union examples
     all_cfg_names: set[str] = set()
     for (p, s) in set(lin_entry_idx.keys()) | set(mlp_entry_idx.keys()):

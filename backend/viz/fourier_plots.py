@@ -296,7 +296,7 @@ def plot_kstar_curve_from_entry(
         return 1.0 / np.maximum(x, eps)
 
     secax = ax.secondary_xaxis("top", functions=(k_to_ell, ell_to_k))
-    secax.set_xlabel("spatial scale ℓ (length unit)   [ℓ = 1/k]")
+    secax.set_xlabel("spatial scale $\ell$ (length unit)   [$\ell$ = 1/k]")
 
     # ---- band edges: annotate on k-axis (NO reversal needed now) ----
     if show_edges and k_edges is not None:
@@ -385,8 +385,15 @@ def plot_kstar_curve_from_entry(
         if k_star is not None and np.isfinite(float(k_star)) and float(k_star) > 0:
             k_star = float(k_star)
             ell_star = 1.0 / max(k_star, eps)
-            kstar_label = f"k*={k_star:.3g} (ℓ*={ell_star:.3g})"
-            ax.axvline(k_star, linestyle="-.", linewidth=1.5, label=kstar_label)
+            kstar_label = rf"$k^*$={k_star:.3g} ($\ell^*$={ell_star:.3g})"
+            ax.axvline(
+                k_star,
+                linestyle="-.",
+                linewidth=1.6,
+                color="tab:red",          # 红色强调
+                label=kstar_label,
+                zorder=3,                 # 压过曲线
+            )
 
     # ---- Nyquist marker (on k-axis) ----
     nyq_label = None
@@ -394,8 +401,15 @@ def plot_kstar_curve_from_entry(
         dmin = float(min(dx, dy))
         if np.isfinite(dmin) and dmin > 0:
             k_nyq = 1.0 / (2.0 * dmin)
-            nyq_label = f"Nyquist k_N={k_nyq:.3g}"
-            ax.axvline(k_nyq, linestyle=":", linewidth=1.2, label=nyq_label)
+            nyq_label = rf"Nyquist $k_N$={k_nyq:.3g}"
+            ax.axvline(
+                k_nyq,
+                linestyle=":",
+                linewidth=1.4,
+                color="0.35",             # 中性灰（比 black 轻）
+                label=nyq_label,
+                zorder=2,
+            )
     except Exception:
         pass
 
@@ -700,42 +714,304 @@ def plot_kstar_heatmap(
     *,
     title: str = "k* heatmap",
     model: str = "linear",
+    grid_meta: dict | None = None,
+    show_numbers: bool = True,
+    number_fmt_k: str = "{:.3g}",
+    number_fmt_ell: str = "{:.3g}",
+    # --- new knobs ---
+    use_log10_ell: bool = False,
+    hatch_no_scale: str = "///",
+    hatch_facecolor: tuple[float, float, float, float] = (0.90, 0.90, 0.90, 1.0),
 ) -> Optional[plt.Figure]:
     """
-    画 k* 的 (p, σ) 热力图。
-    - df 必须含列: mask_rate, noise_sigma, k_star
+    画 k* 的 (p, σ) 热力图（升级版：以尺度 ℓ*=1/k* 为主展示，并显式考虑 Nyquist）。
+
+    改进点：
+    - 右侧 info panel：definition + 状态图例，不遮挡主图
+    - NaN/<=0 的格子：按 “No resolvable scale” 处理，并用 hatch 纹理标识（不再写 N/A）
+    - k* > k_N：越 Nyquist（无意义区域），格子内写 k*>kN / ℓ*<ℓN，并加 ×
+    - 可选 use_log10_ell：颜色映射用 log10(ℓ*)（格子数字仍显示原 ℓ* 与 k*）
     """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, Patch
+    from matplotlib.lines import Line2D
+
     df = df_lin if model == "linear" else df_mlp
     if df is None or len(df) == 0:
         return None
     if "k_star" not in df.columns:
         return None
 
-    # pivot -> rows: noise_sigma, cols: mask_rate
-    try:
-        pv = df.pivot(index="noise_sigma", columns="mask_rate", values="k_star")
-    except Exception:
+    # ---------------------------
+    # resolve grid_meta / dx,dy
+    # ---------------------------
+    def _try_parse_meta_obj(x):
+        if x is None:
+            return None
+        if isinstance(x, dict):
+            return x
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return None
+            try:
+                import json
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
         return None
 
-    # 保证排序
-    pv = pv.sort_index(axis=0).sort_index(axis=1)
+    def _resolve_grid_meta_from_df(df_):
+        if isinstance(grid_meta, dict) and len(grid_meta) > 0:
+            return dict(grid_meta)
 
-    fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.0))
-    im = ax.imshow(pv.values, origin="lower", aspect="auto")
+        for col in ("fourier_meta", "fourier", "meta"):
+            if col in df_.columns:
+                for v in df_[col].tolist():
+                    meta_obj = _try_parse_meta_obj(v)
+                    if isinstance(meta_obj, dict) and meta_obj:
+                        gm = (
+                            meta_obj.get("grid_meta", None)
+                            or meta_obj.get("grid", None)
+                            or meta_obj.get("gridMeta", None)
+                            or meta_obj.get("gridmeta", None)
+                        )
+                        gm_obj = _try_parse_meta_obj(gm) or (gm if isinstance(gm, dict) else None)
+                        if isinstance(gm_obj, dict) and gm_obj:
+                            return dict(gm_obj)
+                        if any(k in meta_obj for k in ("dx", "dy")):
+                            return dict(meta_obj)
+
+        g = {}
+        if "dx" in df_.columns:
+            try:
+                g["dx"] = float(df_["dx"].dropna().iloc[0])
+            except Exception:
+                pass
+        if "dy" in df_.columns:
+            try:
+                g["dy"] = float(df_["dy"].dropna().iloc[0])
+            except Exception:
+                pass
+        return g if g else {}
+
+    g = _resolve_grid_meta_from_df(df)
+    dx = float(g.get("dx", 1.0))
+    dy = float(g.get("dy", 1.0))
+
+    eps = 1e-12
+    k_nyq = None
+    ell_nyq = None
+    try:
+        dmin = float(min(dx, dy))
+        if np.isfinite(dmin) and dmin > 0:
+            k_nyq = 1.0 / (2.0 * dmin)
+            ell_nyq = 1.0 / max(k_nyq, eps)
+    except Exception:
+        k_nyq = None
+        ell_nyq = None
+
+    # ---------------------------
+    # pivot table
+    # ---------------------------
+    try:
+        pv_k = df.pivot(index="noise_sigma", columns="mask_rate", values="k_star")
+    except Exception:
+        return None
+    pv_k = pv_k.sort_index(axis=0).sort_index(axis=1)
+    K = pv_k.to_numpy(dtype=float)
+
+    # ℓ* (physical meaning)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        L = 1.0 / np.maximum(K, eps)
+        L[~np.isfinite(K) | (K <= 0)] = np.nan
+
+    # classify cells
+    no_scale = ~np.isfinite(L)  # includes NaN / invalid k_star
+    invalid_nyq = np.zeros_like(K, dtype=bool)
+    if k_nyq is not None and np.isfinite(k_nyq):
+        invalid_nyq = np.isfinite(K) & (K > float(k_nyq))
+
+    # values used for colormap (clamp invalid to boundary so cmap doesn't blow up)
+    L_show = L.copy()
+    if ell_nyq is not None and np.isfinite(ell_nyq):
+        L_show[invalid_nyq] = float(ell_nyq)
+
+    # for colormap: optionally log10(ℓ*)
+    Z = L_show.copy()
+    if use_log10_ell:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            Z = np.log10(np.maximum(L_show, eps))
+            Z[~np.isfinite(L_show)] = np.nan  # keep NaNs
+
+    finite_Z = Z[np.isfinite(Z)]
+    if finite_Z.size == 0:
+        return None
+    vmin = float(np.nanmin(finite_Z))
+    vmax = float(np.nanmax(finite_Z))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = (vmin - 1.0), (vmin + 1.0)
+
+    # ---------------------------
+    # layout: main heatmap + right info panel (no overlay)
+    # ---------------------------
+    fig = plt.figure(figsize=(8.6, 4.6), constrained_layout=True)
+    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 0.52])
+
+    ax = fig.add_subplot(gs[0, 0])
+    ax_info = fig.add_subplot(gs[0, 1])
+    ax_info.axis("off")
+
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(color=hatch_facecolor)  # NaN cells base color
+
+    im = ax.imshow(
+        Z,
+        origin="lower",
+        aspect="auto",
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+    )
+
     ax.set_title(f"{title} ({model})")
-
-    ax.set_xticks(np.arange(pv.shape[1]))
-    ax.set_xticklabels([f"{c:.3g}" for c in pv.columns], rotation=45, ha="right")
+    ax.set_xticks(np.arange(pv_k.shape[1]))
+    ax.set_xticklabels([f"{c:.3g}" for c in pv_k.columns], rotation=45, ha="right")
     ax.set_xlabel("mask_rate p")
-
-    ax.set_yticks(np.arange(pv.shape[0]))
-    ax.set_yticklabels([f"{r:.3g}" for r in pv.index])
+    ax.set_yticks(np.arange(pv_k.shape[0]))
+    ax.set_yticklabels([f"{r:.3g}" for r in pv_k.index])
     ax.set_ylabel("noise_sigma σ")
 
+    # colorbar attached to main axis
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cb.set_label("k*")
+    if use_log10_ell:
+        cb.set_label(r"$\log_{10}(\ell^*)$  where $\ell^*=1/k^*$  (length unit)")
+    else:
+        cb.set_label(r"resolvable scale $\ell^* = 1/k^*$  (length unit)")
 
-    fig.tight_layout()
+    # ---------------------------
+    # overlay hatch for "no resolvable scale" cells
+    # ---------------------------
+    # (use patches instead of just "N/A" text so it looks intentional, not missing)
+    H, W = Z.shape
+    for i in range(H):
+        for j in range(W):
+            if no_scale[i, j]:
+                rect = Rectangle(
+                    (j - 0.5, i - 0.5),
+                    1.0,
+                    1.0,
+                    facecolor=hatch_facecolor,
+                    edgecolor="0.65",
+                    hatch=hatch_no_scale,
+                    linewidth=0.0,
+                    zorder=2,
+                )
+                ax.add_patch(rect)
+
+    # ---------------------------
+    # numbers in each cell
+    # ---------------------------
+    if show_numbers:
+        norm = im.norm
+        for i in range(H):
+            for j in range(W):
+                k = K[i, j]
+                ell = L[i, j]  # true ell* (not clamped)
+                txt = None
+
+                if no_scale[i, j]:
+                    # Treat as "model fails to resolve any trustworthy scale"
+                    txt = "No scale"
+                else:
+                    if (k_nyq is not None) and np.isfinite(k_nyq) and (k > k_nyq):
+                        if ell_nyq is not None and np.isfinite(ell_nyq):
+                            txt = (
+                                rf"$\ell^*<{number_fmt_ell.format(ell_nyq)}$" "\n"
+                                rf"$k^*>{number_fmt_k.format(k_nyq)}$"
+                            )
+                        else:
+                            txt = rf"$k^*>{number_fmt_k.format(k_nyq)}$"
+                    else:
+                        txt = (
+                            rf"$\ell^*={number_fmt_ell.format(ell)}$" "\n"
+                            rf"$k^*={number_fmt_k.format(k)}$"
+                        )
+
+                # pick text color
+                val_for_color = Z[i, j]
+                if np.isfinite(val_for_color):
+                    rgba = cmap(norm(val_for_color))
+                    lum = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+                    tcolor = "black" if lum > 0.55 else "white"
+                else:
+                    # for hatched cells, prefer dark text
+                    tcolor = "black"
+
+                ax.text(
+                    j,
+                    i,
+                    txt,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color=tcolor,
+                    zorder=4,
+                )
+
+    # mark invalid Nyquist cells with ×
+    if invalid_nyq.any():
+        ys, xs = np.where(invalid_nyq)
+        ax.scatter(xs, ys, marker="x", s=60, linewidths=2.0, color="white", zorder=5)
+
+    # ---------------------------
+    # info panel: definition + status legend (no overlay)
+    # ---------------------------
+    def_lines = [
+        r"$k^*$: threshold crossing wavenumber",
+        r"$\ell^*=1/k^*$: smallest trustworthy spatial scale",
+    ]
+    if k_nyq is not None and np.isfinite(k_nyq):
+        def_lines.append(rf"Nyquist: $k_N=1/(2\,\min(dx,dy))={k_nyq:.3g}$")
+    if ell_nyq is not None and np.isfinite(ell_nyq):
+        def_lines.append(rf"$\ell_N=1/k_N={ell_nyq:.3g}$")
+
+    ax_info.text(
+        0.02,
+        0.98,
+        "\n".join(def_lines),
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.95, edgecolor="0.6"),
+        transform=ax_info.transAxes,
+    )
+
+    # status legend
+    handles = []
+    labels = []
+
+    handles.append(Patch(facecolor=hatch_facecolor, edgecolor="0.65", hatch=hatch_no_scale))
+    labels.append("No resolvable scale (k* undefined)")
+
+    handles.append(Line2D([0], [0], marker="x", color="none", markeredgecolor="black",
+                          markersize=8, markeredgewidth=2))
+    labels.append(r"Invalid: $k^*>k_N$")
+
+    ax_info.legend(
+        handles,
+        labels,
+        loc="lower left",
+        frameon=True,
+        framealpha=0.95,
+        fontsize=9,
+        borderpad=0.6,
+        handlelength=1.6,
+        handletextpad=0.8,
+    )
+
     return fig
 
 
