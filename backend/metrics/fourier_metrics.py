@@ -60,6 +60,82 @@ def _infer_hw(x: np.ndarray) -> Tuple[int, int]:
     raise ValueError(f"Unsupported x shape: {x.shape}")
 
 
+def _weighted_moving_average_1d(
+    y: np.ndarray,
+    w: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    """Weighted moving average with finite-mask handling.
+
+    - y: (B,) may contain non-finite values
+    - w: (B,) nonnegative weights (e.g., count per bin)
+    - window: odd integer recommended; effective half-width = window//2
+    """
+    y = np.asarray(y, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    B = int(y.size)
+    if B == 0:
+        return y.copy()
+    window = int(window)
+    if window <= 1:
+        return y.copy()
+
+    half = window // 2
+    out = np.empty_like(y, dtype=np.float64)
+
+    finite = np.isfinite(y) & np.isfinite(w) & (w > 0)
+    for i in range(B):
+        lo = max(0, i - half)
+        hi = min(B, i + half + 1)
+        m = finite[lo:hi]
+        if not np.any(m):
+            out[i] = np.nan
+            continue
+        yy = y[lo:hi][m]
+        ww = w[lo:hi][m]
+        s = float(np.sum(ww))
+        out[i] = float(np.sum(yy * ww) / s) if s > 0 else np.nan
+    return out
+
+
+def smooth_nrmse_from_energy(
+    E_true_k: np.ndarray,
+    E_err_k: np.ndarray,
+    count_k: Optional[np.ndarray] = None,
+    *,
+    eps: float = 1e-12,
+    smooth_window: int = 7,
+    empty_to_nan: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Smooth Et/Ee first, then compute NRMSE.
+
+    Returns:
+      Et_smooth, Ee_smooth, nrmse_smooth
+    """
+    Et = np.asarray(E_true_k, dtype=np.float64)
+    Ee = np.asarray(E_err_k, dtype=np.float64)
+
+    if count_k is None:
+        w = np.ones_like(Et, dtype=np.float64)
+    else:
+        w = np.asarray(count_k, dtype=np.float64)
+        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+
+    # mark empty bins as NaN before smoothing (so they don't drag averages down)
+    if empty_to_nan and count_k is not None:
+        empty = (np.asarray(count_k) <= 0)
+        Et = Et.copy()
+        Ee = Ee.copy()
+        Et[empty] = np.nan
+        Ee[empty] = np.nan
+
+    Et_s = _weighted_moving_average_1d(Et, w, smooth_window)
+    Ee_s = _weighted_moving_average_1d(Ee, w, smooth_window)
+
+    nrmse_s = np.sqrt(Ee_s / (Et_s + float(eps)))
+    return Et_s, Ee_s, nrmse_s
+
+
 def energy_spectrum(
     x_true: np.ndarray,
     num_bins: int = 64,
@@ -110,17 +186,16 @@ def fourier_radial_nrmse_curve(
     *,
     binning: str = "log",
     k_min: Optional[float] = None,
-    drop_zero_bin: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    drop_first_bin: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute radial NRMSE(k) curve based on energy in each k-bin.
 
-    Returns:
-      k_centers, E_true_k, E_err_k, nrmse_k
-      where nrmse_k = sqrt(E_err_k / (E_true_k + eps)).
+    Always returns:
+      k_centers, E_true_k, E_err_k, nrmse_k, count_k
 
-    Notes:
-      - binning="log" produces better multi-scale interpretability on log axes.
-      - drop_zero_bin is optional; keep False for scientifically faithful low-k coverage.
+    Note:
+      - nrmse_k is raw. Empty bins (count_k==0) are set to NaN here.
+        (This prevents the "fake zero spikes" problem by construction.)
     """
     x_hat = np.asarray(x_hat)
     x_true = np.asarray(x_true)
@@ -129,33 +204,40 @@ def fourier_radial_nrmse_curve(
     grid = _infer_grid_from_meta(H, W, grid_meta)
 
     F_true = _fft_for_metric(x_true, mean_mode=mean_mode)
-    F_err = _fft_for_metric(x_hat - x_true, mean_mode="none")  # error already mean-free notionally
+    F_err = _fft_for_metric(x_hat - x_true, mean_mode="none")
 
-    k_centers, E_true_k, _ = radial_bin_spectrum(
+    k_centers, E_true_k, _edges, count_k = radial_bin_spectrum(
         F_true,
         grid,
         num_bins=num_bins,
         k_max=k_max,
         binning=binning,
         k_min=k_min,
-        drop_zero_bin=drop_zero_bin,
-        return_edges=True,
+        drop_first_bin=drop_first_bin,
     )
-    _, E_err_k, _ = radial_bin_spectrum(
+    _, E_err_k, _edges2, _count2 = radial_bin_spectrum(
         F_err,
         grid,
         num_bins=num_bins,
         k_max=k_max,
         binning=binning,
         k_min=k_min,
-        drop_zero_bin=drop_zero_bin,
-        return_edges=True,
+        drop_first_bin=drop_first_bin,
     )
 
     E_true_k = np.asarray(E_true_k, dtype=np.float64)
     E_err_k = np.asarray(E_err_k, dtype=np.float64)
+    count_k = np.asarray(count_k, dtype=np.int64)
+
     nrmse_k = np.sqrt(E_err_k / (E_true_k + float(eps)))
-    return np.asarray(k_centers), E_true_k, E_err_k, nrmse_k
+
+    # empty bin => NaN (not 0)
+    empty = (count_k <= 0)
+    if np.any(empty):
+        nrmse_k = np.asarray(nrmse_k, dtype=np.float64)
+        nrmse_k[empty] = np.nan
+
+    return np.asarray(k_centers), E_true_k, E_err_k, nrmse_k, count_k
 
 
 def fourier_band_nrmse(

@@ -151,19 +151,17 @@ def radial_bin_spectrum(
     *,
     binning: str = "log",
     k_min: Optional[float] = None,
-    drop_zero_bin: bool = False,
-    return_edges: bool = False,
-) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    drop_first_bin: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute radial binned energy spectrum E(k) from FFT F.
 
-    Binning strategies:
-      - binning="linear": uniform edges in k
-      - binning="log": geometric edges in k (requires k_min>0)
+    Always returns a fixed 4-tuple:
+      k_centers: (B,)
+      E_k:      (B,)
+      k_edges:  (B+1,)
+      count_k:  (B,) number of frequency samples per bin
 
-    Returns:
-        k_centers: (B,)
-        E_k: (B,)   where sum(E_k) ~= spatial energy (Parseval), up to binning resolution.
-        (optional) k_edges: (B+1,)
+    This avoids fragile API branches and supports empty-bin masking & weighted smoothing.
     """
     if num_bins <= 0:
         raise ValueError(f"num_bins must be >0, got {num_bins}")
@@ -207,28 +205,28 @@ def radial_bin_spectrum(
     else:
         raise ValueError(f"Unsupported F shape: {F.shape}")
 
-    # binning
     k_flat = k.reshape(-1)
     e_flat = np.asarray(E_samples, dtype=np.float64).reshape(-1)
 
-    # np.digitize returns 1..B (or B+1), we map to 0..B-1
     idx = np.digitize(k_flat, edges, right=False) - 1
     B = int(num_bins)
+
     E_k = np.zeros((B,), dtype=np.float64)
+    count_k = np.zeros((B,), dtype=np.int64)
+
     valid = (idx >= 0) & (idx < B)
     np.add.at(E_k, idx[valid], e_flat[valid])
+    np.add.at(count_k, idx[valid], 1)
 
-    if drop_zero_bin:
-        # drop the first bin if it's effectively k≈0 (linear binning),
-        # or if centers[0] is extremely small (log binning with tiny k_min).
-        if centers.size > 0 and (np.isclose(centers[0], 0.0) or centers[0] <= 0.0):
-            centers = centers[1:]
-            E_k = E_k[1:]
-            edges = edges[1:]  # keep alignment: edges length = centers+1
+    if drop_first_bin:
+        if B <= 1:
+            return centers[:0], E_k[:0], edges[:1], count_k[:0]
+        centers = centers[1:]
+        E_k = E_k[1:]
+        count_k = count_k[1:]
+        edges = edges[1:]  # keep edges length = (B) after dropping first bin
 
-    if return_edges:
-        return centers, E_k, edges
-    return centers, E_k
+    return centers, E_k, edges, count_k
 
 
 def make_band_masks_from_edges(

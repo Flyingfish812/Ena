@@ -277,12 +277,14 @@ def _compute_fourier_for_setting(
     """
     NEW SCHEMA ONLY.
 
-    Returns:
-      fourier_band_nrmse_out: Dict[str,float] | None
-      k_star_out: float | None
-      fourier_curve_out: Dict[str,Any] | None
-      meta_hint: Dict[str,Any] | None   (用于 result["meta"] 的三件套填充)
+    Fixes:
+      1) Empty bins are no longer treated as "NRMSE=0" in the saved curve (we store None).
+      2) Provide a smoothed trend curve by smoothing energies (Et/Ee) with count-weights.
+      3) Use smoothed curve for k* (more stable & interpretable).
+      4) Unify band_nrmse and curve to the SAME accumulated spectrum (no double compute).
     """
+    from ..metrics.fourier_metrics import smooth_nrmse_from_energy
+
     fs = _get_fourier_settings(eval_cfg, H=H, W=W)
     if not fs.get("enabled", False):
         return None, None, None, None
@@ -294,85 +296,23 @@ def _compute_fourier_for_setting(
 
     Et_sum = None
     Ee_sum = None
+    Ct_sum = None
     k_centers_ref = None
 
-    # 1) accumulate radial energy (true & error) across sampled frames
+    def _safe_float_list(arr: np.ndarray) -> list:
+        out: list = []
+        for v in np.asarray(arr).reshape(-1):
+            fv = float(v)
+            out.append(None if (not np.isfinite(fv)) else fv)
+        return out
+
+    # ---- 1) accumulate energies + counts across sampled frames ----
     for t_s in t_samples:
         x_true = X_thwc[t_s]  # [H,W,C]
         a_hat = A_hat_all[t_s]
         x_hat = reconstruct_from_pod(a_hat, Ur_eff, mean_flat).reshape(H, W, -1)
 
-        k_centers, Et, Ee, _nrmse_k = fourier_radial_nrmse_curve(
-            x_hat=x_hat,
-            x_true=x_true,
-            num_bins=fs["num_bins"],
-            k_max=None,                    # NEW schema does not expose k_max
-            grid_meta=fs["grid_meta"],
-            mean_mode=fs["mean_mode_true"],
-            binning=fs["binning"],
-        )
-
-        if k_centers_ref is None:
-            k_centers_ref = k_centers
-            Et_sum = np.zeros_like(Et, dtype=float)
-            Ee_sum = np.zeros_like(Ee, dtype=float)
-
-        Et_sum += Et
-        Ee_sum += Ee
-
-    if k_centers_ref is None:
-        return None, None, None, None
-
-    # 2) NRMSE(k) and k*
-    nrmse_k_mean = np.sqrt(Ee_sum / (Et_sum + 1e-12))
-    k_star_out = kstar_from_radial_curve(
-        k_centers_ref,
-        nrmse_k_mean,
-        threshold=float(fs["kstar_thr"]),
-    )
-
-    # 3) decide band edges
-    band_scheme = fs["band_scheme"]
-    band_names = list(fs["band_names"])
-
-    if band_scheme == "physical":
-        lam = fs.get("lambda_edges", None)
-        if not lam:
-            raise ValueError("fourier.band_scheme='physical' requires fourier.lambda_edges in YAML.")
-        # interior edges in k-space
-        interior_edges = sorted([1.0 / float(v) for v in lam if float(v) > 0.0])
-        if len(interior_edges) == 0:
-            raise ValueError("fourier.lambda_edges must contain positive values.")
-        kN = float(np.max(k_centers_ref))
-        full_edges = [0.0] + interior_edges + [kN]
-
-    elif band_scheme == "energy_quantile":
-        # default quantiles (can be exposed later in FourierConfig if needed)
-        full_edges = auto_pick_k_edges_from_energy(
-            k_centers_ref,
-            Et_sum,
-            quantiles=(0.80, 0.95),
-        )
-        interior_edges = [float(v) for v in full_edges[1:-1]]
-
-    else:
-        raise ValueError(f"Unsupported fourier.band_scheme='{band_scheme}'. Use 'physical' or 'energy_quantile'.")
-
-    # 4) ensure band_names match number of bands
-    n_bands = max(0, len(full_edges) - 1)
-    if len(band_names) != n_bands:
-        # strict but safe: auto-generate to avoid index errors
-        band_names = [f"B{i+1}" for i in range(n_bands)]
-
-    # 5) band nrmse
-    band_vals = []
-    for t_s in t_samples:
-        x_true = X_thwc[t_s]
-        a_hat = A_hat_all[t_s]
-        x_hat = reconstruct_from_pod(a_hat, Ur_eff, mean_flat).reshape(H, W, -1)
-
-        # compute band nrmse for this frame
-        k_centers, Et, Ee, _nrmse_k = fourier_radial_nrmse_curve(
+        k_centers, Et, Ee, _, count_k = fourier_radial_nrmse_curve(
             x_hat=x_hat,
             x_true=x_true,
             num_bins=fs["num_bins"],
@@ -382,41 +322,123 @@ def _compute_fourier_for_setting(
             binning=fs["binning"],
         )
 
-        band_nrmse_t = fourier_band_nrmse(
-            k_centers=k_centers,
-            E_true_k=Et,
-            E_err_k=Ee,
-            full_edges=full_edges,
-            band_names=band_names,
-            monotone_enforce=True,  # NEW schema: fixed default
+        if k_centers_ref is None:
+            k_centers_ref = np.asarray(k_centers, dtype=float)
+            Et_sum = np.zeros_like(Et, dtype=float)
+            Ee_sum = np.zeros_like(Ee, dtype=float)
+            Ct_sum = np.zeros_like(count_k, dtype=float)
+
+        Et_sum += np.asarray(Et, dtype=float)
+        Ee_sum += np.asarray(Ee, dtype=float)
+        Ct_sum += np.asarray(count_k, dtype=float)
+
+    if k_centers_ref is None or Et_sum is None or Ee_sum is None or Ct_sum is None:
+        return None, None, None, None
+
+    eps = 1e-12
+
+    # ---- 2) raw nrmse (mask empty bins) ----
+    nrmse_k_raw = np.sqrt(Ee_sum / (Et_sum + eps))
+    empty = (Ct_sum <= 0)
+    nrmse_k_raw = np.asarray(nrmse_k_raw, dtype=float)
+    nrmse_k_raw[empty] = np.nan
+
+    # ---- 3) smooth energies -> smooth nrmse ----
+    smooth_window = 7
+    if int(fs["num_bins"]) <= 32:
+        smooth_window = 5
+    if int(fs["num_bins"]) <= 16:
+        smooth_window = 3
+
+    Et_s, Ee_s, nrmse_k_smooth = smooth_nrmse_from_energy(
+        Et_sum,
+        Ee_sum,
+        Ct_sum,
+        eps=eps,
+        smooth_window=smooth_window,
+        empty_to_nan=True,
+    )
+
+    # ---- 4) k* based on smooth curve ----
+    k_star_out = kstar_from_radial_curve(
+        k_centers_ref,
+        nrmse_k_smooth,
+        threshold=float(fs["kstar_thr"]),
+    )
+
+    # ---- 5) band edges ----
+    band_scheme = fs["band_scheme"]
+    band_names = list(fs["band_names"])
+
+    if band_scheme == "physical":
+        lam = fs.get("lambda_edges", None)
+        if not lam:
+            raise ValueError("fourier.band_scheme='physical' requires fourier.lambda_edges in YAML.")
+        interior_edges = sorted([1.0 / float(v) for v in lam if float(v) > 0.0])
+        if len(interior_edges) == 0:
+            raise ValueError("fourier.lambda_edges must contain positive values.")
+        kN = float(np.max(k_centers_ref))
+        full_edges = [0.0] + interior_edges + [kN]
+
+    elif band_scheme == "energy_quantile":
+        full_edges = auto_pick_k_edges_from_energy(
+            k_centers_ref,
+            Et_sum,
+            quantiles=(0.80, 0.95),
         )
-        band_vals.append(band_nrmse_t)
+        interior_edges = [float(v) for v in full_edges[1:-1]]
+    else:
+        raise ValueError(f"Unsupported fourier.band_scheme='{band_scheme}'. Use 'physical' or 'energy_quantile'.")
 
-    fourier_band_nrmse_out = {name: float(np.mean([bv[name] for bv in band_vals])) for name in band_names}
+    n_bands = max(0, len(full_edges) - 1)
+    if len(band_names) != n_bands:
+        band_names = [f"B{i+1}" for i in range(n_bands)]
 
-    # 6) optional curve (for per-(p,σ) explanation plots)
+    # ---- 6) band nrmse from the SAME accumulated spectrum ----
+    # (no per-frame recompute; consistent with curve & k*)
+    fourier_band_nrmse_out = fourier_band_nrmse(
+        k_centers=k_centers_ref,
+        E_true_k=np.asarray(Et_sum, dtype=float),
+        E_err_k=np.asarray(Ee_sum, dtype=float),
+        full_edges=full_edges,
+        band_names=band_names,
+        monotone_enforce=True,
+    )
+
+    # ---- 7) curve export ----
     fourier_curve_out = None
     if fs["save_curve"]:
         fourier_curve_out = {
-            "k_centers": k_centers_ref.tolist(),
-            "E_true_k": Et_sum.tolist(),
-            "E_err_k": Ee_sum.tolist(),
-            "nrmse_k": nrmse_k_mean.tolist(),
-            "k_edges": interior_edges,
+            "k_centers": _safe_float_list(np.asarray(k_centers_ref)),
+            "E_true_k": _safe_float_list(np.asarray(Et_sum)),
+            "E_err_k": _safe_float_list(np.asarray(Ee_sum)),
+
+            "nrmse_k": _safe_float_list(np.asarray(nrmse_k_smooth)),
+            "nrmse_k_raw": _safe_float_list(np.asarray(nrmse_k_raw)),
+
+            "k_edges": [float(x) for x in interior_edges],
             "band_names": band_names,
+
             "k_star": None if k_star_out is None else float(k_star_out),
             "k_star_threshold": float(fs["kstar_thr"]),
+
+            "smooth_window": int(smooth_window),
+            "smooth_on": "energy_weighted_moving_avg",
         }
 
-    # 7) meta_hint for build_eval_figures gate and definition plot
     meta_hint = {
-        "fourier_k_centers": k_centers_ref.tolist(),
-        "fourier_energy_k": Et_sum.tolist(),
-        "fourier_k_edges": interior_edges,
+        "fourier_k_centers": _safe_float_list(np.asarray(k_centers_ref)),
+        "fourier_energy_k": _safe_float_list(np.asarray(Et_sum)),
+        "fourier_k_edges": [float(x) for x in interior_edges],
         "fourier_grid_meta": dict(fs.get("grid_meta", {}) or {}),
     }
 
-    return fourier_band_nrmse_out, (None if k_star_out is None else float(k_star_out)), fourier_curve_out, meta_hint
+    return (
+        {k: float(v) for k, v in fourier_band_nrmse_out.items()},
+        (None if k_star_out is None else float(k_star_out)),
+        fourier_curve_out,
+        meta_hint,
+    )
 
 def _gather_observations_batch(
     X_flat_all: np.ndarray,   # [T, D]
