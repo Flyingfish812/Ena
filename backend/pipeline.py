@@ -839,6 +839,7 @@ def quick_figs_from_saved_experiment(
 
     return figs
 
+# POD构建快速接口
 def quick_build_pod(
     nc_path: str | Path,
     save_dir: str | Path = "artifacts/pod",
@@ -895,6 +896,7 @@ def quick_build_pod(
         plot=plot,
     )
 
+# 线性基线快速测试接口
 def quick_test_linear_baseline(
     nc_path: str | Path,
     pod_dir: str | Path = "artifacts/pod",
@@ -1140,6 +1142,7 @@ def quick_test_linear_baseline(
     }
     return result
 
+# 线性基线快速测试接口
 def quick_test_mlp_baseline(
     nc_path: str | Path,
     pod_dir: str | Path = "artifacts/pod",
@@ -1464,167 +1467,6 @@ def quick_test_mlp_baseline(
         "fig_modes": fig_modes,
         "meta": meta,
     }
-    return result
-
-def quick_full_experiment(
-    nc_path: str | Path = "data/cylinder2d.nc",
-    *,
-
-    var_keys: tuple[str, ...] = ("u", "v"),
-    r: int = 128,
-    center: bool = True,
-    mask_rates: Sequence[float] | None = None,
-    noise_sigmas: Sequence[float] | None = None,
-    pod_bands: Dict[str, tuple[int, int]] | None = None,
-    train_mask_rate: float = 0.02,
-    train_noise_sigma: float = 0.01,
-    hidden_dims: tuple[int, ...] = (256, 256),
-    lr: float = 1e-3,
-    batch_size: int = 64,
-    max_epochs: int = 50,
-    device: str = "cuda",
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """
-    一行跑完“小论文主实验”的高层接口。
-    """
-    nc_path = Path(nc_path)
-
-    if mask_rates is None:
-        mask_rates = [0.01, 0.02, 0.05, 0.10]
-    if noise_sigmas is None:
-        noise_sigmas = [0.0, 0.01, 0.02]
-
-    if pod_bands is None:
-        r_L = min(16, r)
-        r_M = min(64, r)
-        pod_bands = {
-            "L": (0, r_L),
-            "M": (r_L, r_M),
-            "H": (r_M, r),
-        }
-
-    data_cfg = DataConfig(
-        nc_path=nc_path,
-        var_keys=var_keys,
-        cache_dir=None,
-    )
-
-    pod_cfg = PodConfig(
-        r=r,
-        center=center,
-        save_dir=Path(f"artifacts/pod_r{r}"),
-    )
-
-    eval_cfg = EvalConfig(
-        mask_rates=list(mask_rates),
-        noise_sigmas=list(noise_sigmas),
-        pod_bands=pod_bands,
-        save_dir=Path("artifacts/eval"),
-    )
-
-    train_cfg = TrainConfig(
-        mask_rate=float(train_mask_rate),
-        noise_sigma=float(train_noise_sigma),
-        hidden_dims=hidden_dims,
-        lr=lr,
-        batch_size=batch_size,
-        max_epochs=max_epochs,
-        device=device,
-        save_dir=Path("artifacts/nn")
-        / f"p{train_mask_rate:.4f}_sigma{train_noise_sigma:.3g}".replace(".", "-"),
-    )
-
-    result = run_full_eval_pipeline(
-        data_cfg=data_cfg,
-        pod_cfg=pod_cfg,
-        eval_cfg=eval_cfg,
-        train_cfg=train_cfg,
-        verbose=verbose,
-    )
-
-    # ===== 代表性多尺度图：linear / mlp 各一张 =====
-    fig_ms_lin = None
-    fig_ms_mlp = None
-
-    lin_results = result.get("linear", None)
-    mlp_results = result.get("mlp", None)
-
-    if lin_results is not None and mlp_results is not None:
-        lin_entries = lin_results.get("entries", []) or []
-        mlp_entries = mlp_results.get("entries", []) or []
-
-        if lin_entries and mlp_entries:
-            def _build_index(entries):
-                m = {}
-                for e in entries:
-                    p = float(e.get("mask_rate", -1.0))
-                    s = float(e.get("noise_sigma", -1.0))
-                    m[(p, s)] = e
-                return m
-
-            lin_idx = _build_index(lin_entries)
-            mlp_idx = _build_index(mlp_entries)
-
-            train_meta = mlp_results.get("meta", {}).get("train_cfg", {}) or {}
-            p_train = train_meta.get("mask_rate", None)
-            s_train = train_meta.get("noise_sigma", None)
-
-            entry_lin = None
-            entry_mlp = None
-
-            if p_train is not None and s_train is not None:
-                key = (float(p_train), float(s_train))
-                entry_lin = lin_idx.get(key, None)
-                entry_mlp = mlp_idx.get(key, None)
-
-            if entry_mlp is None and mlp_entries:
-                entry_mlp = mlp_entries[0]
-                key = (float(entry_mlp.get("mask_rate", -1.0)),
-                       float(entry_mlp.get("noise_sigma", -1.0)))
-                entry_lin = lin_idx.get(key, None)
-
-            energy_cum = (
-                mlp_results.get("meta", {}).get("energy_cum")
-                or lin_results.get("meta", {}).get("energy_cum")
-            )
-
-            if entry_lin is not None:
-                title = (
-                    f"Multiscale summary (linear, p={entry_lin['mask_rate']}, "
-                    f"σ={entry_lin['noise_sigma']})"
-                )
-                fig_ms_lin, _ = plot_multiscale_summary(
-                    entry_lin,
-                    energy_cum=energy_cum,
-                    title_prefix=title,
-                    model_label="linear",
-                )
-
-            if entry_mlp is not None:
-                title = (
-                    f"Multiscale summary (mlp, p={entry_mlp['mask_rate']}, "
-                    f"σ={entry_mlp['noise_sigma']})"
-                )
-                fig_ms_mlp, _ = plot_multiscale_summary(
-                    entry_mlp,
-                    energy_cum=energy_cum,
-                    title_prefix=title,
-                    model_label="mlp",
-                )
-
-    # 兼容旧字段：默认把 mlp 的那张作为 fig_multiscale_example
-    result["fig_multiscale_example_linear"] = fig_ms_lin
-    result["fig_multiscale_example_mlp"] = fig_ms_mlp
-    result["fig_multiscale_example"] = fig_ms_mlp
-
-    result["configs"] = {
-        "data_cfg": data_cfg,
-        "pod_cfg": pod_cfg,
-        "eval_cfg": eval_cfg,
-        "train_cfg": train_cfg,
-    }
-
     return result
 
 def extract_and_save_figures(

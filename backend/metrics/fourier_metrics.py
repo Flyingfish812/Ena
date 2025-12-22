@@ -48,47 +48,55 @@ def _fft_for_metric(
     return fft2_field(x, mean_mode=mean_mode)
 
 
+def _infer_hw(x: np.ndarray) -> Tuple[int, int]:
+    x = np.asarray(x)
+    if x.ndim == 2:
+        return int(x.shape[0]), int(x.shape[1])
+    if x.ndim == 3:
+        # allow (H,W,C) or (C,H,W)
+        if x.shape[0] <= 8 and x.shape[1] > 8 and x.shape[2] > 8:
+            return int(x.shape[1]), int(x.shape[2])  # (C,H,W)
+        return int(x.shape[0]), int(x.shape[1])      # (H,W,C)
+    raise ValueError(f"Unsupported x shape: {x.shape}")
+
+
 def energy_spectrum(
     x_true: np.ndarray,
     num_bins: int = 64,
     k_max: Optional[float] = None,
     grid_meta: Optional[Dict[str, Any]] = None,
     mean_mode: str = "none",
+    *,
+    binning: str = "log",
+    k_min: Optional[float] = None,
+    drop_zero_bin: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (k_centers, E_k, k_edges)."""
+    """Return (k_centers, E_k, k_edges).
+
+    Notes:
+      - Unused.
+      - This function no longer silently drops k≈0 for plotting.
+        Use drop_zero_bin=True if the caller wants log-friendly output.
+      - binning="log" enables geometric radial bins (requires k_min>0; if None a grid-based default is used).
+    """
     x_true = np.asarray(x_true)
-    if x_true.ndim == 2:
-        H, W = x_true.shape
-    elif x_true.ndim == 3:
-        # allow (H,W,C) or (C,H,W); grid sizes are last two spatial dims
-        if x_true.shape[0] <= 8 and x_true.shape[1] > 8 and x_true.shape[2] > 8:
-            H, W = x_true.shape[1], x_true.shape[2]  # (C,H,W)
-        else:
-            H, W = x_true.shape[0], x_true.shape[1]  # (H,W,C)
-    else:
-        raise ValueError(f"Unsupported x_true shape: {x_true.shape}")
+    H, W = _infer_hw(x_true)
 
     grid = _infer_grid_from_meta(H, W, grid_meta)
     F = _fft_for_metric(x_true, mean_mode=mean_mode)
-    k_centers, E_k, k_edges = radial_bin_spectrum(F, grid, num_bins=num_bins, k_max=k_max, return_edges=True)
 
-    # remove k=0 bin for log-scale friendly plots
-    k_centers = np.asarray(k_centers)
-    E_k = np.asarray(E_k)
-    k_edges = np.asarray(k_edges)
+    k_centers, E_k, k_edges = radial_bin_spectrum(
+        F,
+        grid,
+        num_bins=num_bins,
+        k_max=k_max,
+        binning=binning,
+        k_min=k_min,
+        drop_zero_bin=drop_zero_bin,
+        return_edges=True,
+    )
 
-    if k_centers.size > 0 and np.isclose(k_centers[0], 0.0):
-        # drop the first bin (k=0) to make loglog plots stable
-        k_centers = k_centers[1:]
-        E_k = E_k[1:]
-        # edges length = bins+1; drop the first edge as well
-        if k_edges.size == (k_centers.size + 2):  # original edges
-            k_edges = k_edges[1:]
-        elif k_edges.size == (k_centers.size + 1):
-            # already consistent, no-op
-            pass
-
-    return k_centers, E_k, k_edges
+    return np.asarray(k_centers), np.asarray(E_k), np.asarray(k_edges)
 
 
 def fourier_radial_nrmse_curve(
@@ -99,37 +107,55 @@ def fourier_radial_nrmse_curve(
     grid_meta: Optional[Dict[str, Any]] = None,
     mean_mode: str = "none",
     eps: float = 1e-12,
+    *,
+    binning: str = "log",
+    k_min: Optional[float] = None,
+    drop_zero_bin: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute radial NRMSE(k) curve based on energy in each k-bin.
 
     Returns:
       k_centers, E_true_k, E_err_k, nrmse_k
       where nrmse_k = sqrt(E_err_k / (E_true_k + eps)).
+
+    Notes:
+      - binning="log" produces better multi-scale interpretability on log axes.
+      - drop_zero_bin is optional; keep False for scientifically faithful low-k coverage.
     """
     x_hat = np.asarray(x_hat)
     x_true = np.asarray(x_true)
-
-    # infer spatial size
-    if x_true.ndim == 2:
-        H, W = x_true.shape
-    elif x_true.ndim == 3:
-        if x_true.shape[0] <= 8 and x_true.shape[1] > 8 and x_true.shape[2] > 8:
-            H, W = x_true.shape[1], x_true.shape[2]
-        else:
-            H, W = x_true.shape[0], x_true.shape[1]
-    else:
-        raise ValueError(f"Unsupported x_true shape: {x_true.shape}")
+    H, W = _infer_hw(x_true)
 
     grid = _infer_grid_from_meta(H, W, grid_meta)
 
     F_true = _fft_for_metric(x_true, mean_mode=mean_mode)
     F_err = _fft_for_metric(x_hat - x_true, mean_mode="none")  # error already mean-free notionally
 
-    k_centers, E_true_k, _ = radial_bin_spectrum(F_true, grid, num_bins=num_bins, k_max=k_max, return_edges=True)
-    _, E_err_k, _ = radial_bin_spectrum(F_err, grid, num_bins=num_bins, k_max=k_max, return_edges=True)
+    k_centers, E_true_k, _ = radial_bin_spectrum(
+        F_true,
+        grid,
+        num_bins=num_bins,
+        k_max=k_max,
+        binning=binning,
+        k_min=k_min,
+        drop_zero_bin=drop_zero_bin,
+        return_edges=True,
+    )
+    _, E_err_k, _ = radial_bin_spectrum(
+        F_err,
+        grid,
+        num_bins=num_bins,
+        k_max=k_max,
+        binning=binning,
+        k_min=k_min,
+        drop_zero_bin=drop_zero_bin,
+        return_edges=True,
+    )
 
+    E_true_k = np.asarray(E_true_k, dtype=np.float64)
+    E_err_k = np.asarray(E_err_k, dtype=np.float64)
     nrmse_k = np.sqrt(E_err_k / (E_true_k + float(eps)))
-    return k_centers, E_true_k, E_err_k, nrmse_k
+    return np.asarray(k_centers), E_true_k, E_err_k, nrmse_k
 
 
 def fourier_band_nrmse(
@@ -208,8 +234,14 @@ def kstar_from_radial_curve(
     nrmse_k: np.ndarray,
     threshold: float = 1.0,
     monotone_enforce: bool = True,
+    *,
+    method: str = "last_ok",
 ) -> float:
-    """Compute k* as the largest k such that NRMSE(k) <= threshold.
+    """Compute k* as a cutoff wavenumber based on NRMSE(k) <= threshold.
+
+    method:
+      - "last_ok": (legacy) return the largest sampled k with NRMSE<=thr
+      - "crossing_interp": estimate the last crossing point with linear interpolation
 
     monotone_enforce:
       - True: enforce nondecreasing NRMSE envelope via cumulative max,
@@ -225,11 +257,52 @@ def kstar_from_radial_curve(
     thr = float(threshold)
     curve = nrmse_k
     if monotone_enforce:
-        curve = np.maximum.accumulate(curve)  # make it nondecreasing vs k
+        curve = np.maximum.accumulate(curve)
+
+    method = str(method).lower().strip()
+    if method not in ("last_ok", "crossing_interp"):
+        raise ValueError(f"method must be 'last_ok' or 'crossing_interp', got {method}")
 
     ok = curve <= thr
     if not np.any(ok):
         return 0.0
 
-    idx = int(np.where(ok)[0][-1])
-    return float(k_centers[idx])
+    if method == "last_ok":
+        idx = int(np.where(ok)[0][-1])
+        return float(k_centers[idx])
+
+    # crossing_interp:
+    # find the last index where ok is True; then interpolate to the next point where curve>thr (if any).
+    i_last_ok = int(np.where(ok)[0][-1])
+    if i_last_ok == (k_centers.size - 1):
+        return float(k_centers[i_last_ok])
+
+    # We assume curve is nondecreasing if monotone_enforce=True; if False, this is still a reasonable
+    # local interpolation near the last ok point.
+    k0 = float(k_centers[i_last_ok])
+    y0 = float(curve[i_last_ok])
+    k1 = float(k_centers[i_last_ok + 1])
+    y1 = float(curve[i_last_ok + 1])
+
+    if not (np.isfinite(k0) and np.isfinite(k1) and np.isfinite(y0) and np.isfinite(y1)):
+        return float(k0)
+
+    # if y1 is still <= thr (rare with nondecreasing), fall back to scanning forward
+    if y1 <= thr:
+        j = i_last_ok + 1
+        while j < k_centers.size and float(curve[j]) <= thr:
+            j += 1
+        if j >= k_centers.size:
+            return float(k_centers[-1])
+        k0 = float(k_centers[j - 1])
+        y0 = float(curve[j - 1])
+        k1 = float(k_centers[j])
+        y1 = float(curve[j])
+
+    # linear interpolation to y=thr
+    if np.isclose(y1, y0):
+        return float(k0)
+
+    t = (thr - y0) / (y1 - y0)
+    t = float(np.clip(t, 0.0, 1.0))
+    return float(k0 + t * (k1 - k0))

@@ -30,13 +30,14 @@ eval:
       dx: 0.0125
       dy: 0.0125
       angular: false      # angular: true 表示 rad/length，需要 2π 的换算，除非全链路都统一用角波数
+    binning: log    # linear | log
     num_bins: 64
     sample_frames: 8
     kstar_threshold: 1.0
     mean_mode_true: global
     save_curve: true
-    band_names: [Background, Big, Medium, Small]
-    lambda_edges: [1.0, 0.5, 0.25]   # 物理尺度切分：用波长 λ 的分界（length unit）.例：λ_LM=1.0（一个通道高度级别），λ_MH=0.25（约 2D）
+    band_names: [Background, Big, Medium, Small, Tiny]
+    lambda_edges: [1.0, 0.5, 0.25, 0.125]   # 物理尺度切分：用波长 λ 的分界（length unit）.例：λ_LM=1.0（一个通道高度级别），λ_MH=0.25（约 2D）
 train:
   mask_rate: 0.0004
   noise_sigma: 0.01

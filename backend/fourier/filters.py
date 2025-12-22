@@ -125,28 +125,76 @@ def parseval_energy_from_fft(F: np.ndarray) -> float:
     raise ValueError(f"Unsupported F shape: {F.shape}")
 
 
+def _infer_default_k_min_from_grid(grid: FourierGrid2D) -> float:
+    """Heuristic: use the smallest *positive* frequency step among axes.
+
+    For angular=False: units are cycles/length, so:
+      dkx = 1/(W*dx), dky = 1/(H*dy)
+    For angular=True: multiplied by 2π.
+
+    This is a safe-ish lower bound when user doesn't provide k_min for log binning.
+    """
+    dkx = 1.0 / (float(grid.W) * float(grid.dx))
+    dky = 1.0 / (float(grid.H) * float(grid.dy))
+    dk = min(dkx, dky)
+    if grid.angular:
+        dk = 2.0 * np.pi * dk
+    # avoid pathological tiny / zero
+    return float(max(dk, 1e-12))
+
+
 def radial_bin_spectrum(
     F: np.ndarray,
     grid: FourierGrid2D,
     num_bins: int = 64,
     k_max: Optional[float] = None,
+    *,
+    binning: str = "log",
+    k_min: Optional[float] = None,
+    drop_zero_bin: bool = False,
     return_edges: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute radial binned energy spectrum E(k) from FFT F.
+
+    Binning strategies:
+      - binning="linear": uniform edges in k
+      - binning="log": geometric edges in k (requires k_min>0)
 
     Returns:
         k_centers: (B,)
         E_k: (B,)   where sum(E_k) ~= spatial energy (Parseval), up to binning resolution.
         (optional) k_edges: (B+1,)
     """
-    k = grid.k
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be >0, got {num_bins}")
+
+    k = np.asarray(grid.k, dtype=np.float64)
     if k_max is None:
         k_max = float(np.max(k))
+    k_max = float(k_max)
+    if not np.isfinite(k_max) or k_max <= 0:
+        raise ValueError(f"Invalid k_max={k_max}")
 
-    edges = np.linspace(0.0, k_max, num_bins + 1, dtype=np.float64)
+    binning = str(binning).lower().strip()
+    if binning not in ("linear", "log"):
+        raise ValueError(f"binning must be 'linear' or 'log', got {binning}")
+
+    if binning == "linear":
+        edges = np.linspace(0.0, k_max, num_bins + 1, dtype=np.float64)
+    else:
+        if k_min is None:
+            k_min = _infer_default_k_min_from_grid(grid)
+        k_min = float(k_min)
+        if not np.isfinite(k_min) or k_min <= 0:
+            raise ValueError(f"log-binning requires k_min>0, got k_min={k_min}")
+        if k_min >= k_max:
+            raise ValueError(f"log-binning requires k_min<k_max, got k_min={k_min}, k_max={k_max}")
+        edges = np.geomspace(k_min, k_max, num_bins + 1).astype(np.float64)
+
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     # energy density per frequency sample (Parseval): |F|^2 / N
+    F = np.asarray(F)
     if F.ndim == 2:
         H, W = F.shape
         N = H * W
@@ -161,14 +209,22 @@ def radial_bin_spectrum(
 
     # binning
     k_flat = k.reshape(-1)
-    e_flat = E_samples.reshape(-1)
+    e_flat = np.asarray(E_samples, dtype=np.float64).reshape(-1)
 
     # np.digitize returns 1..B (or B+1), we map to 0..B-1
     idx = np.digitize(k_flat, edges, right=False) - 1
-    B = num_bins
+    B = int(num_bins)
     E_k = np.zeros((B,), dtype=np.float64)
     valid = (idx >= 0) & (idx < B)
     np.add.at(E_k, idx[valid], e_flat[valid])
+
+    if drop_zero_bin:
+        # drop the first bin if it's effectively k≈0 (linear binning),
+        # or if centers[0] is extremely small (log binning with tiny k_min).
+        if centers.size > 0 and (np.isclose(centers[0], 0.0) or centers[0] <= 0.0):
+            centers = centers[1:]
+            E_k = E_k[1:]
+            edges = edges[1:]  # keep alignment: edges length = centers+1
 
     if return_edges:
         return centers, E_k, edges
