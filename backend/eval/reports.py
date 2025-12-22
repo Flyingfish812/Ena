@@ -131,6 +131,61 @@ def save_results_csv(df: pd.DataFrame, path: Path | str) -> None:
     df.to_csv(path, index=False)
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Recursively convert common non-JSON-serializable objects into JSONable
+    Python types.
+
+    Handles:
+      - numpy.ndarray -> list
+      - numpy scalar -> Python scalar
+      - torch.Tensor -> list
+      - Path -> str
+      - set/tuple -> list
+    """
+    # Fast path for plain JSON types
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    # pathlib
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # numpy
+    try:
+        import numpy as np  # local import to avoid hard dependency
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.generic):  # np.float32, np.int64, etc.
+            return obj.item()
+    except Exception:
+        pass
+
+    # torch
+    try:
+        import torch
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+    except Exception:
+        pass
+
+    # dict
+    if isinstance(obj, dict):
+        # ensure keys are strings (JSON requires string keys)
+        out = {}
+        for k, v in obj.items():
+            kk = str(k) if not isinstance(k, str) else k
+            out[kk] = _to_jsonable(v)
+        return out
+
+    # list/tuple/set
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(x) for x in obj]
+
+    # fallback: try stringifying (last resort; better than crashing & truncating file)
+    return str(obj)
+
+
 def _strip_heavy_fields(result: Dict[str, Any] | None) -> Dict[str, Any] | None:
     """
     从单个 model 结果 dict 中移除体积巨大的字段（如 examples / example_recon / fourier_curve），
@@ -173,13 +228,13 @@ def save_full_experiment_results(
 
     paths: Dict[str, Path] = {}
 
-    # 1) JSON（瘦身）
+    # 1) JSON（瘦身 + JSON 化）
     linear_res_full = all_result.get("linear", None)
     linear_res = _strip_heavy_fields(linear_res_full)
     if linear_res is not None:
         p_json = base_dir / "linear_results.json"
         with p_json.open("w", encoding="utf-8") as f:
-            json.dump(linear_res, f, indent=2, ensure_ascii=False)
+            json.dump(_to_jsonable(linear_res), f, indent=2, ensure_ascii=False)
         paths["linear_json"] = p_json
 
     mlp_res_full = all_result.get("mlp", None)
@@ -187,7 +242,7 @@ def save_full_experiment_results(
     if mlp_res is not None:
         p_json = base_dir / "mlp_results.json"
         with p_json.open("w", encoding="utf-8") as f:
-            json.dump(mlp_res, f, indent=2, ensure_ascii=False)
+            json.dump(_to_jsonable(mlp_res), f, indent=2, ensure_ascii=False)
         paths["mlp_json"] = p_json
 
     # 2) CSV

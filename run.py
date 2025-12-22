@@ -9,4 +9,3 @@ res = run_experiment_from_yaml(
 )
 
 print("报告路径:", res["report_path"])
-res["df_linear"].head()
