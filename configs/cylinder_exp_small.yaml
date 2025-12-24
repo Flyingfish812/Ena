@@ -7,8 +7,8 @@ pod:
   center: true
   save_dir: artifacts/pod
 eval:
-  mask_rates: [0.0001, 0.0004, 0.0016]
-  noise_sigmas: [0, 0.01, 0.1]
+  mask_rates: [0.0004]
+  noise_sigmas: [0.0]
   pod_bands:
     L1: [0, 16]
     L2: [16, 32]
@@ -32,7 +32,7 @@ eval:
       angular: false      # angular: true 表示 rad/length，需要 2π 的换算，除非全链路都统一用角波数
     binning: log    # linear | log
     num_bins: 64
-    k_min_eval: 0.25    # 仅计算 k >= k_min_eval 的 NRMSE 曲线
+    k_min_eval: 0.7    # 仅计算 k >= k_min_eval 的 NRMSE 曲线
     sample_frames: 8
     kstar_threshold: 1.0
     mean_mode_true: global
@@ -41,7 +41,7 @@ eval:
     lambda_edges: [1.0, 0.5, 0.25, 0.125]   # 物理尺度切分：用波长 λ 的分界（length unit）.例：λ_LM=1.0（一个通道高度级别），λ_MH=0.25（约 2D）
 train:
   mask_rate: 0.0004  # <- 没用的，可以删
-  noise_sigma: 0.01
+  noise_sigma: 0.1
   hidden_dims: [64, 64]
   lr: 0.001
   batch_size: 64

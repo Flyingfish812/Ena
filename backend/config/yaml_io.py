@@ -141,9 +141,9 @@ def load_experiment_yaml(
     band_scheme = str(fourier_raw.get("band_scheme", "physical"))
 
     grid_meta = dict(fourier_raw.get("grid_meta", {}) or {})
-    # 强约束：新 schema 要求 grid_meta 至少包含 dx/dy/angular
-    # 这里不做兼容填充：缺了就让后续计算阶段明确报错，别静默跑错尺度
+    binning = str(fourier_raw.get("binning", "log"))
     num_bins = int(fourier_raw.get("num_bins", 64))
+    k_min_eval = float(fourier_raw.get("k_min_eval", 0.25))
     sample_frames = int(fourier_raw.get("sample_frames", 8))
     kstar_threshold = float(fourier_raw.get("kstar_threshold", 1.0))
     mean_mode_true = str(fourier_raw.get("mean_mode_true", "global"))
@@ -157,7 +157,9 @@ def load_experiment_yaml(
         enabled=enabled,
         band_scheme=band_scheme,
         grid_meta=grid_meta,
+        binning=binning,
         num_bins=num_bins,
+        k_min_eval=k_min_eval,
         sample_frames=sample_frames,
         kstar_threshold=kstar_threshold,
         mean_mode_true=mean_mode_true,

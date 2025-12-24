@@ -1816,6 +1816,11 @@ def extract_and_save_figures(
             return False
         if len(k_centers) == 0 or len(nrmse_cum) == 0 or len(k_centers) != len(nrmse_cum):
             return False
+        
+        nrmse_cum_arr = np.asarray(
+            [np.nan if v is None else float(v) for v in nrmse_cum],
+            dtype=float,
+        )
 
         # -------------------------
         # optional arrays
@@ -1849,7 +1854,10 @@ def extract_and_save_figures(
         gm = fc.get("grid_meta", None)
         if not isinstance(gm, dict):
             gm = grid_meta_fallback if isinstance(grid_meta_fallback, dict) else {}
-
+        cm = fc.get("cum_meta", None)
+        if not isinstance(cm, dict):
+            cm = {}
+        
         def _to_float_or_nan(x):
             try:
                 if x is None:
@@ -1869,7 +1877,7 @@ def extract_and_save_figures(
 
             # main curve (v1.17)
             k_centers=np.asarray(k_centers, dtype=float),
-            nrmse_cum=np.asarray(nrmse_cum, dtype=float),
+            nrmse_cum=np.asarray(nrmse_cum_arr, dtype=float),
 
             # diagnostic curve (optional)
             nrmse_k=np.asarray(nrmse_k, dtype=float) if nrmse_k is not None else np.asarray([], dtype=float),
@@ -1889,6 +1897,7 @@ def extract_and_save_figures(
 
             # grid meta
             grid_meta_json=json.dumps(gm, ensure_ascii=False),
+            cum_meta_json=json.dumps(cm, ensure_ascii=False),
         )
         return True
 

@@ -111,7 +111,9 @@ class FourierConfig:
     band_scheme: str = "physical"   # e.g. "physical"
     grid_meta: Dict[str, Any] = field(default_factory=dict)
 
+    binning: str = "log"  # "linear" or "log"
     num_bins: int = 64
+    k_min_eval: float = 0.25
     sample_frames: int = 8
 
     kstar_threshold: float = 1.0

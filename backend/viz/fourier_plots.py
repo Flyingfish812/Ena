@@ -250,6 +250,7 @@ def plot_kstar_curve_from_entry(
     # ---- load cumulative curve (MAIN) ----
     y_cum = np.asarray(curve.get("nrmse_cum", []), dtype=float).reshape(-1)
     if y_cum.size == 0 or y_cum.size != k.size:
+        print(f"[warn] plot_kstar_curve_from_entry: invalid nrmse_cum size {y_cum.size} vs k size {k.size}!")
         return None
 
     # ---- load local curve (optional diagnostic) ----
@@ -260,6 +261,8 @@ def plot_kstar_curve_from_entry(
             y_local = np.asarray(y_local_arr, dtype=float).reshape(-1)
             if y_local.size != k.size:
                 y_local = None
+    if y_local is None:
+        print(f"[warn] no valid local nrmse_k curve found!")
 
     # ---- clean + sort by k ----
     eps = 1e-12
@@ -276,15 +279,9 @@ def plot_kstar_curve_from_entry(
     # diagnostic curve aligned to k_sorted where possible
     y_local_sorted = None
     if y_local is not None:
-        mask_local = np.isfinite(k) & np.isfinite(y_local) & (k > 0)
-        if np.any(mask_local):
-            k_loc = k[mask_local]
-            y_loc = y_local[mask_local]
-            ord2 = np.argsort(k_loc)
-            k_loc_s = k_loc[ord2]
-            y_loc_s = y_loc[ord2]
-            if k_loc_s.size == k_sorted.size and np.allclose(k_loc_s, k_sorted, rtol=0, atol=0):
-                y_local_sorted = y_loc_s
+        y_local_main = np.asarray(y_local, dtype=float).reshape(-1)[mask_main]
+        if y_local_main.size == k_main.size:
+            y_local_sorted = y_local_main[order]
 
     # ---- title suffix: show p, sigma, model ----
     p = entry.get("mask_rate", None)
@@ -489,31 +486,45 @@ def plot_kstar_curve_from_entry(
     except Exception:
         pass
 
-    # ---- legend ----
+    # Layout: reserve a right sidebar for legend + band definitions
+    right_sidebar_left = 0.8  # 左边界（0~1），越小右侧越宽
+    fig.subplots_adjust(right=right_sidebar_left)
+
+    # ---- external legend (top of sidebar) ----
     handles, labels = ax.get_legend_handles_labels()
-    if labels:
-        ax.legend(loc="lower right", frameon=True, fontsize=9)
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper left",
+            bbox_to_anchor=(right_sidebar_left + 0.01, 0.4),
+            frameon=True,
+            fontsize=9,
+            borderaxespad=0.0,
+        )
 
-    # --------------------------------
-    # External info panel for band details (right side, outside axes)
-    # --------------------------------
+    # ---- band definitions (bottom of sidebar) ----
     if band_info_lines:
-        # Make room on right
-        fig.subplots_adjust(right=0.78)
-
-        # Add a small text box outside the axes
         info_text = "Band definitions:\n" + "\n".join(f"- {ln}" for ln in band_info_lines)
         fig.text(
-            0.80, 0.50,
+            right_sidebar_left + 0.01, 0.5,   # 左下角
             info_text,
-            ha="left", va="center",
+            ha="left",
+            va="bottom",
             fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.95, edgecolor="0.6"),
+            bbox=dict(
+                boxstyle="round,pad=0.35",
+                facecolor="white",
+                alpha=0.95,
+                edgecolor="0.6",
+            ),
         )
-    else:
-        fig.tight_layout()
+
+    # Tighten ONLY the main axes area; sidebar is already reserved by subplots_adjust
+    fig.tight_layout(rect=[0.0, 0.0, right_sidebar_left, 1.0])
 
     return fig
+
 
 
 def plot_spatial_fourier_band_decomposition(

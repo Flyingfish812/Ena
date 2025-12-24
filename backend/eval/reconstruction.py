@@ -251,7 +251,7 @@ def _get_fourier_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
 
     # --- v1.17: cumulative NRMSE + adaptive cutoff (k*_cum) settings ---
     # k_min_eval: do not evaluate k* in the ultra-low-k region (background / near-zero-energy instability)
-    k_min_eval = float(getattr(f, "k_min_eval", 1.0))
+    k_min_eval = float(getattr(f, "k_min_eval", 0.25))
 
     # plateau detection: "improvement < eps_plateau for m_plateau consecutive bins"
     eps_plateau = float(getattr(f, "kstar_plateau_eps", 1e-3))
@@ -392,7 +392,7 @@ def _compute_fourier_for_setting(
     )
 
     # ---- 4) v1.17: cumulative curve (main) ----
-    k_min_eval = float(fs.get("k_min_eval", 1.0))
+    k_min_eval = float(fs.get("k_min_eval", 0.25))
     k_eval, nrmse_cum, cum_meta = fourier_cumulative_nrmse_curve_from_energy(
         k_centers=np.asarray(k_centers_ref, dtype=float),
         E_true_k=np.asarray(Et_sum, dtype=float),
@@ -501,6 +501,7 @@ def _compute_fourier_for_setting(
                 "k_star_idx": kstar_dbg.get("k_star_idx", None),
             },
             "cum_meta": {
+                "k_min_eval": cum_meta.get("k_min_eval", None),
                 "start_idx": cum_meta.get("start_idx", None),
             },
         }

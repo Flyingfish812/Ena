@@ -142,7 +142,7 @@ def fourier_cumulative_nrmse_curve_from_energy(
     E_err_k: np.ndarray,
     count_k: Optional[np.ndarray] = None,
     *,
-    k_min_eval: float = 1.0,
+    k_min_eval: float = 0.25,
     eps: float = 1e-12,
     monotone_enforce: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
