@@ -81,7 +81,6 @@ def plot_field_comparison(
     fig.tight_layout()
     return fig
 
-
 def plot_error_map(
     x_true_hw: np.ndarray,
     x_hat_hw: np.ndarray,

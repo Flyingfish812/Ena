@@ -25,15 +25,18 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
     转换为 pandas DataFrame 形式，便于绘图或导出。
 
     v1.12+（Fourier 多尺度）新增列：
-    - k_star
+    - k_star（v1.17 起语义升级为：累计低通误差曲线平台点 k*_cum）
     - fourier_band_nrmse_<band>
+
+    v1.17 额外可选列（若结果中提供）：
+    - k_star_legacy（旧阈值穿越法，仅用于诊断/对照）
+    - k_star_method（例如 "cum_plateau"）
     """
     model_type = result.get("model_type", "model")
     entries = result.get("entries", []) or []
 
     rows: list[dict[str, Any]] = []
 
-    # --- 先扫一遍，收集所有可能出现的 key，保证列名完备 ---
     band_rmse_names: set[str] = set()
     band_nrmse_names: set[str] = set()
     group_names: set[str] = set()
@@ -41,6 +44,8 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
 
     fourier_band_names: set[str] = set()
     has_kstar = False
+    has_kstar_legacy = False
+    has_kstar_method = False
 
     for e in entries:
         band_errors = e.get("band_errors", {}) or {}
@@ -58,6 +63,18 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
         # Fourier
         if "k_star" in e:
             has_kstar = True
+
+        # legacy k* might be stored either on entry or inside fourier_curve (if not stripped)
+        if "k_star_legacy" in e:
+            has_kstar_legacy = True
+        else:
+            fc = e.get("fourier_curve", None)
+            if isinstance(fc, dict) and ("k_star_legacy" in fc):
+                has_kstar_legacy = True
+
+        if "k_star_method" in e:
+            has_kstar_method = True
+
         fb = e.get("fourier_band_nrmse", {}) or {}
         if isinstance(fb, dict):
             fourier_band_names.update(fb.keys())
@@ -66,10 +83,8 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
     band_nrmse_sorted = sorted(band_nrmse_names)
     group_sorted = sorted(group_names)
     partial_sorted = sorted(partial_names)
-
     fourier_band_sorted = sorted(fourier_band_names)
 
-    # --- 逐 entry 构造行 ---
     for e in entries:
         row: dict[str, Any] = {
             "model_type": model_type,
@@ -83,34 +98,40 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
             "psnr_std": e.get("psnr_std", None),
             "n_frames": e.get("n_frames", None),
             "n_obs": e.get("n_obs", None),
-            # 有效模态等级（legacy POD band）
             "effective_band": e.get("effective_band", None),
             "effective_r_cut": e.get("effective_r_cut", None),
         }
 
         band_errors = e.get("band_errors", {}) or {}
         for name in band_rmse_sorted:
-            key = f"band_{name}"
-            row[key] = float(band_errors.get(name, float("nan")))
+            row[f"band_{name}"] = float(band_errors.get(name, float("nan")))
 
         band_nrmse = e.get("band_nrmse", {}) or {}
         for name in band_nrmse_sorted:
-            key = f"band_nrmse_{name}"
-            row[key] = float(band_nrmse.get(name, float("nan")))
+            row[f"band_nrmse_{name}"] = float(band_nrmse.get(name, float("nan")))
 
         group_err = e.get("field_nmse_per_group", {}) or {}
         for name in group_sorted:
-            key = f"group_nmse_{name}"
-            row[key] = float(group_err.get(name, float("nan")))
+            row[f"group_nmse_{name}"] = float(group_err.get(name, float("nan")))
 
         partial_err = e.get("field_nmse_partial", {}) or {}
         for name in partial_sorted:
-            key = f"partial_nmse_{name}"
-            row[key] = float(partial_err.get(name, float("nan")))
+            row[f"partial_nmse_{name}"] = float(partial_err.get(name, float("nan")))
 
         # Fourier flat columns
         if has_kstar:
             row["k_star"] = e.get("k_star", float("nan"))
+
+        if has_kstar_legacy:
+            k_leg = e.get("k_star_legacy", None)
+            if k_leg is None:
+                fc = e.get("fourier_curve", None)
+                if isinstance(fc, dict):
+                    k_leg = fc.get("k_star_legacy", None)
+            row["k_star_legacy"] = float(k_leg) if k_leg is not None else float("nan")
+
+        if has_kstar_method:
+            row["k_star_method"] = e.get("k_star_method", None)
 
         fb = e.get("fourier_band_nrmse", {}) or {}
         for b in fourier_band_sorted:
@@ -118,8 +139,7 @@ def results_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
 
         rows.append(row)
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def save_results_csv(df: pd.DataFrame, path: Path | str) -> None:
@@ -322,6 +342,7 @@ def _append_path_or_list(lines: list[str], label: str, p):
     else:
         lines.append(f"- {label}: `{Path(p)}`")
 
+
 def generate_experiment_report_md(
     all_result: Dict[str, Any],
     out_path: Path | str,
@@ -334,6 +355,10 @@ def generate_experiment_report_md(
     v1.12+：
     - 保留原 POD-band 多尺度（论文旧版可对照）
     - 新增 Fourier 频域尺度：k* 与 Fourier band NRMSE
+
+    v1.17：
+    - k* 语义升级为：累计低通误差曲线 NRMSE_{<=K} 的平台起点（plateau onset）
+    - 更强调尺度：ℓ* = 1/k*
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,16 +436,30 @@ def generate_experiment_report_md(
         )
 
     # Fourier quick summary: best/worst k* if exists
+    def _safe_inv(x: float) -> float:
+        import numpy as np
+        if x is None:
+            return float("nan")
+        try:
+            v = float(x)
+        except Exception:
+            return float("nan")
+        return (1.0 / v) if (np.isfinite(v) and v > 0) else float("nan")
+
     fourier_summary: list[str] = []
     if "k_star" in df_lin.columns:
         try:
             best_k = df_lin.loc[df_lin["k_star"].idxmax()]
             worst_k = df_lin.loc[df_lin["k_star"].idxmin()]
+            kmax = float(best_k["k_star"])
+            kmin = float(worst_k["k_star"])
             fourier_summary.append(
-                f"- Linear 的最大 k* = {best_k['k_star']:.4g} (p={best_k['mask_rate']:.3g}, σ={best_k['noise_sigma']:.3g})"
+                f"- Linear 的最大 k* = {kmax:.4g}, 对应 ℓ*=1/k* ≈ {_safe_inv(kmax):.4g} "
+                f"(p={best_k['mask_rate']:.3g}, σ={best_k['noise_sigma']:.3g})"
             )
             fourier_summary.append(
-                f"- Linear 的最小 k* = {worst_k['k_star']:.4g} (p={worst_k['mask_rate']:.3g}, σ={worst_k['noise_sigma']:.3g})"
+                f"- Linear 的最小 k* = {kmin:.4g}, 对应 ℓ*=1/k* ≈ {_safe_inv(kmin):.4g} "
+                f"(p={worst_k['mask_rate']:.3g}, σ={worst_k['noise_sigma']:.3g})"
             )
         except Exception:
             pass
@@ -429,11 +468,15 @@ def generate_experiment_report_md(
         try:
             best_k = df_mlp.loc[df_mlp["k_star"].idxmax()]
             worst_k = df_mlp.loc[df_mlp["k_star"].idxmin()]
+            kmax = float(best_k["k_star"])
+            kmin = float(worst_k["k_star"])
             fourier_summary.append(
-                f"- MLP 的最大 k* = {best_k['k_star']:.4g} (p={best_k['mask_rate']:.3g}, σ={best_k['noise_sigma']:.3g})"
+                f"- MLP 的最大 k* = {kmax:.4g}, 对应 ℓ*=1/k* ≈ {_safe_inv(kmax):.4g} "
+                f"(p={best_k['mask_rate']:.3g}, σ={best_k['noise_sigma']:.3g})"
             )
             fourier_summary.append(
-                f"- MLP 的最小 k* = {worst_k['k_star']:.4g} (p={worst_k['mask_rate']:.3g}, σ={worst_k['noise_sigma']:.3g})"
+                f"- MLP 的最小 k* = {kmin:.4g}, 对应 ℓ*=1/k* ≈ {_safe_inv(kmin):.4g} "
+                f"(p={worst_k['mask_rate']:.3g}, σ={worst_k['noise_sigma']:.3g})"
             )
         except Exception:
             pass
@@ -493,11 +536,18 @@ def generate_experiment_report_md(
     fourier_cols = [c for c in df_lin.columns if c.startswith("fourier_band_nrmse_")]
     if fourier_cols or ("k_star" in df_lin.columns):
         fourier_lines.append("本次实验同时在空间频域做了尺度评估：")
-        fourier_lines.append("- **k\\***：定义为 NRMSE(k) 首次不超过阈值（默认 1.0）的最大可恢复波数。")
-        fourier_lines.append("- **Fourier band NRMSE**：把频谱按径向波数分段后，对每段计算归一化误差。")
+        fourier_lines.append(
+            "- **k\\***（v1.17）：先计算累计低通误差曲线 "
+            r"$\mathrm{NRMSE}_{\le K}=\sqrt{\sum_{k\le K}E_e(k) / \sum_{k\le K}E_t(k)}$，"
+            "将 **k\\*** 定义为该曲线进入“平台期”的起点（plateau onset）。"
+        )
+        fourier_lines.append("- **ℓ\\***：定义为 ℓ\\*=1/k\\*，表示模型可恢复的最小可信尺度。")
+        fourier_lines.append(
+            "- **Fourier band NRMSE**：把径向波数按 band edges 分段后，对每段计算归一化误差。"
+        )
         if fourier_summary:
             fourier_lines.append("")
-            fourier_lines.append("k* 的简单统计：")
+            fourier_lines.append("k* 的简单统计（同时给出 ℓ*=1/k*）：")
             fourier_lines.extend(fourier_summary)
 
     # ------------------------------------------------------------------
@@ -581,6 +631,7 @@ def generate_experiment_report_md(
     else:
         lines.append("当前结果未提供 Fourier 频域多尺度信息（可能 fourier_enabled=false 或未写入 entry）。")
     lines.append("")
+
     lines.append("### 7.1 k* 热力图（文件路径）")
     lines.append("")
     if fig_kstar_linear is not None:
@@ -628,8 +679,8 @@ def generate_experiment_report_md(
 
         candidates = [
             cfg_dir / "fourier_kstar_curve_linear.png",
-            cfg_dir / "fourier_band_decomp_linear.png",
             cfg_dir / "fourier_kstar_curve_mlp.png",
+            cfg_dir / "fourier_band_decomp_linear.png",
             cfg_dir / "fourier_band_decomp_mlp.png",
         ]
         any_found = False
@@ -638,7 +689,7 @@ def generate_experiment_report_md(
                 lines.append(f"  - `{pth}`")
                 any_found = True
         if not any_found:
-            lines.append("  - （该 cfg 未找到解释图文件，可能该轮未生成或该 cfg 没有 example/k_edges）")
+            lines.append("  - （该 cfg 未找到解释图文件，可能该轮未生成或该 cfg 没有保存对应 npz/曲线）")
 
     try:
         _append_cfg_explain_block("Linear best NMSE", best_lin)
@@ -656,6 +707,5 @@ def generate_experiment_report_md(
             pass
 
     lines.append("")
-
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path

@@ -181,22 +181,31 @@ def plot_kstar_curve_from_entry(
     # --- style / labels (aligned with plot_energy_spectrum_with_band_edges) ---
     title: str | None = None,
     xlabel: str = "wavenumber k (cycles / length unit)",
-    ylabel: str = "NRMSE(k)",
+    ylabel: str = r"Cumulative NRMSE$_{≤ K}$",
     loglog: bool = True,
     show_edges: bool = True,
     show_kstar: bool = True,
+    # --- NEW: keep local curve as diagnostic overlay ---
+    show_local_curve: bool = True,
+    local_curve_label: str = "Local NRMSE(k) (diagnostic)",
     # --- meta (can be injected, otherwise auto-resolved from entry/curve) ---
     k_edges: Sequence[float] | None = None,                 # interior edges in k-domain: [k1,k2,...]
     band_names: Sequence[str] = ("L", "M", "H"),
     grid_meta: dict | None = None,                          # dx/dy/obstacle_diameter/Lx/Ly ...
 ) -> Optional[plt.Figure]:
     """
-    【解释图】单个配置的 NRMSE(k) 曲线，主 x 轴使用 k（与全局 E(k) 定义图一致），上方 secondary axis 显示 ℓ=1/k。
+    【解释图 v1.17】单个配置的 Fourier 尺度恢复能力曲线图。
 
-    数据来源（与 pipeline 对齐）：
-      - entry["fourier_curve"] 应至少包含: k_centers, nrmse_k
-      - 可从 entry["fourier_meta"]（或 curve 内字段）补齐:
-          k_edges / band_names / grid_meta / k_star_threshold / k_star
+    主曲线（对外口径 / k* 定义依据）：
+      - cumulative curve: NRMSE_{<=K} vs K  (curve["nrmse_cum"])
+
+    诊断曲线（辅助解释，不作为 k* 的定义依据）：
+      - local curve: NRMSE(k) vs k (curve["nrmse_k"])
+
+    变更（v1.17 绘图可读性升级）：
+      - 图内 band 只保留大标签（Background/Big/Medium/Small/Tiny）
+      - 详细括号信息（λ 与 λ/D 范围）移动到图外 info panel（右侧）
+      - 不改变 band 边界（由 k_edges 决定）
     """
     curve = entry.get("fourier_curve", None)
     if not isinstance(curve, dict):
@@ -233,23 +242,49 @@ def plot_kstar_curve_from_entry(
     if bn_from_curve is not None:
         band_names = bn_from_curve
 
-    # ---- load curve data ----
-    k = np.asarray(curve.get("k_centers", []), dtype=float)
-    y = np.asarray(curve.get("nrmse_k", []), dtype=float)
-    if k.size == 0 or y.size == 0 or k.size != y.size:
-        return None
-
-    # ---- clean + sort by k (so x-axis matches E(k) definition figure) ----
-    eps = 1e-12
-    mask = np.isfinite(k) & np.isfinite(y) & (k > 0)
-    k = k[mask]
-    y = y[mask]
+    # ---- load k centers ----
+    k = np.asarray(curve.get("k_centers", []), dtype=float).reshape(-1)
     if k.size == 0:
         return None
 
-    order = np.argsort(k)
-    k_sorted = k[order]
-    y_sorted = y[order]
+    # ---- load cumulative curve (MAIN) ----
+    y_cum = np.asarray(curve.get("nrmse_cum", []), dtype=float).reshape(-1)
+    if y_cum.size == 0 or y_cum.size != k.size:
+        return None
+
+    # ---- load local curve (optional diagnostic) ----
+    y_local = None
+    if show_local_curve:
+        y_local_arr = curve.get("nrmse_k", None)
+        if y_local_arr is not None:
+            y_local = np.asarray(y_local_arr, dtype=float).reshape(-1)
+            if y_local.size != k.size:
+                y_local = None
+
+    # ---- clean + sort by k ----
+    eps = 1e-12
+    mask_main = np.isfinite(k) & np.isfinite(y_cum) & (k > 0)
+    if not np.any(mask_main):
+        return None
+
+    k_main = k[mask_main]
+    y_main = y_cum[mask_main]
+    order = np.argsort(k_main)
+    k_sorted = k_main[order]
+    y_sorted = y_main[order]
+
+    # diagnostic curve aligned to k_sorted where possible
+    y_local_sorted = None
+    if y_local is not None:
+        mask_local = np.isfinite(k) & np.isfinite(y_local) & (k > 0)
+        if np.any(mask_local):
+            k_loc = k[mask_local]
+            y_loc = y_local[mask_local]
+            ord2 = np.argsort(k_loc)
+            k_loc_s = k_loc[ord2]
+            y_loc_s = y_loc[ord2]
+            if k_loc_s.size == k_sorted.size and np.allclose(k_loc_s, k_sorted, rtol=0, atol=0):
+                y_local_sorted = y_loc_s
 
     # ---- title suffix: show p, sigma, model ----
     p = entry.get("mask_rate", None)
@@ -271,11 +306,24 @@ def plot_kstar_curve_from_entry(
         if model is not None:
             parts.append(str(model))
         suffix = ("  [" + ", ".join(parts) + "]") if parts else ""
-        title = "NRMSE(k) with band edges" + suffix
+        title = r"Cumulative NRMSE$_{≤ K}$ with band edges" + suffix
 
-    # ---- plot ----
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    ax.plot(k_sorted, y_sorted, linewidth=2.0)
+    # ---- plot (wider, reserve right margin for info panel) ----
+    fig, ax = plt.subplots(figsize=(8.8, 4.2))
+
+    # main curve (cumulative)
+    ax.plot(k_sorted, y_sorted, linewidth=2.2, label=r"Cumulative NRMSE$_{≤ K}$")
+
+    # diagnostic overlay (local)
+    if y_local_sorted is not None:
+        ax.plot(
+            k_sorted,
+            y_local_sorted,
+            linewidth=1.3,
+            linestyle="--",
+            alpha=0.65,
+            label=local_curve_label,
+        )
 
     if loglog:
         ax.set_xscale("log")
@@ -286,7 +334,7 @@ def plot_kstar_curve_from_entry(
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
 
-    # ---- top axis: show ℓ as secondary axis (to match global definition figure style: top ℓ, bottom k) ----
+    # ---- top axis: ℓ = 1/k ----
     def k_to_ell(x):
         x = np.asarray(x, dtype=float)
         return 1.0 / np.maximum(x, eps)
@@ -296,41 +344,47 @@ def plot_kstar_curve_from_entry(
         return 1.0 / np.maximum(x, eps)
 
     secax = ax.secondary_xaxis("top", functions=(k_to_ell, ell_to_k))
-    secax.set_xlabel("spatial scale $\ell$ (length unit)   [$\ell$ = 1/k]")
+    secax.set_xlabel(r"spatial scale $\ell$ (length unit)   [$\ell$ = 1/k]")
 
-    # ---- band edges: annotate on k-axis (NO reversal needed now) ----
+    # -----------------------------
+    # band edges + big labels on plot
+    # -----------------------------
+    band_info_lines: list[str] = []
     if show_edges and k_edges is not None:
         edges_k = sorted([
             float(v) for v in k_edges
             if v is not None and np.isfinite(v) and float(v) > 0
         ])
-        if len(edges_k) > 0:
-            # vertical lines at band edges
-            for ke in edges_k:
-                ax.axvline(ke, linestyle="--", linewidth=1.0)
 
-            # segments on k-axis: [x_min, e1], [e1,e2], ..., [elast, x_max]
+        if len(edges_k) > 0:
+            for ke in edges_k:
+                ax.axvline(ke, linestyle="--", linewidth=1.0, alpha=0.9)
+
             x_min, x_max = ax.get_xlim()
             segs = [max(x_min, eps)] + [ke for ke in edges_k if x_min < ke < x_max] + [x_max]
             nb = max(1, len(segs) - 1)
 
-            def _label_for_segment(i: int, a: float, b: float) -> str:
-                # on k-axis increasing, band index i maps directly to band_names[i] (L,M,H)
-                name = band_names[i] if 0 <= i < len(band_names) else f"B{i}"
+            # Decide "big labels" shown inside plot.
+            # If band_names looks like generic ("L","M","H"), we override with descriptive labels.
+            default_big = ["Background", "Big", "Medium", "Small", "Tiny"]
+            use_big_names = list(default_big[:nb])
+            # If user provided meaningful names (not just L/M/H), respect them as the in-plot label.
+            try:
+                bn_norm = [str(x).strip() for x in band_names]
+                generic = set(["L", "M", "H", "LMH", "low", "mid", "high"])
+                if len(bn_norm) >= nb and not all((b in generic or len(b) <= 2) for b in bn_norm[:nb]):
+                    use_big_names = bn_norm[:nb]
+            except Exception:
+                pass
 
-                # convert to λ range for readability
-                lam_a = 1.0 / max(a, eps)
-                lam_b = 1.0 / max(b, eps)
-
-                # since k increases, λ decreases; report λ ranges in a consistent inequality form
+            # helper: make detailed text for info panel
+            def _detail_for_segment(i: int, a: float, b: float) -> str:
+                name = use_big_names[i] if 0 <= i < len(use_big_names) else f"B{i}"
                 if i == 0:
-                    # k < b  <=>  λ > 1/b
                     lam_text = f"λ ≥ {1.0/max(b,eps):.3g}"
                 elif i == nb - 1:
-                    # k ≥ a <=> λ < 1/a
                     lam_text = f"λ < {1.0/max(a,eps):.3g}"
                 else:
-                    # a ≤ k < b  <=>  1/b < λ ≤ 1/a
                     lam_text = f"{1.0/max(b,eps):.3g} < λ ≤ {1.0/max(a,eps):.3g}"
 
                 if D is not None and float(D) > 0:
@@ -341,62 +395,84 @@ def plot_kstar_curve_from_entry(
                         lamD_text = f"λ/D < {(1.0/max(a,eps))/Df:.3g}"
                     else:
                         lamD_text = f"{(1.0/max(b,eps))/Df:.3g} < λ/D ≤ {(1.0/max(a,eps))/Df:.3g}"
-                    return f"{name}\n({lam_text})\n({lamD_text})"
+                    return f"{name}: ({lam_text}), ({lamD_text})"
+                return f"{name}: ({lam_text})"
 
-                return f"{name}\n({lam_text})"
-
+            # draw alternating spans and put ONLY big labels in-plot
+            # use axes y-coord so it won't depend on log-y limits
+            y_text = 0.87  # in axes fraction
             for i in range(nb):
                 a, b = segs[i], segs[i + 1]
                 if not (np.isfinite(a) and np.isfinite(b) and b > a > 0):
                     continue
-
                 if i % 2 == 0:
                     ax.axvspan(a, b, alpha=0.06)
 
-                xm = np.sqrt(a * b)  # log-midpoint
-                label = _label_for_segment(i, a, b)
+                xm = np.sqrt(a * b)
 
-                y_top = ax.get_ylim()[1]
-                ax.text(xm, y_top, label, ha="center", va="top", fontsize=9)
+                # big label only
+                ax.text(
+                    xm,
+                    y_text,
+                    use_big_names[i] if i < len(use_big_names) else f"B{i}",
+                    transform=ax.get_xaxis_transform(),  # x in data, y in axes
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    alpha=0.95,
+                )
 
-    # ---- threshold ----
-    thr = (
-        curve.get("k_star_threshold", None)
+                # collect detailed line for external panel
+                band_info_lines.append(_detail_for_segment(i, a, b))
+
+    # ---- legacy threshold (optional, diagnostic only) ----
+    thr_legacy = (
+        curve.get("k_star_threshold_legacy", None)
+        or curve.get("k_star_threshold", None)
         or curve.get("nrmse_threshold", None)
         or meta.get("k_star_threshold", None)
         or meta.get("nrmse_threshold", None)
     )
-    if thr is not None and np.isfinite(float(thr)):
-        thr = float(thr)
-        ax.axhline(thr, linestyle=":", linewidth=1.2)
+    if thr_legacy is not None and np.isfinite(float(thr_legacy)):
+        thr_legacy = float(thr_legacy)
+        ax.axhline(thr_legacy, linestyle=":", linewidth=1.1, alpha=0.7)
         ax.text(
             ax.get_xlim()[0],
-            thr,
-            f"  threshold={thr:g}",
+            thr_legacy,
+            f"  legacy thr={thr_legacy:g}",
             va="bottom",
             ha="left",
             fontsize=9,
+            alpha=0.8,
         )
 
-    # ---- show k* marker (on k-axis) ----
-    kstar_label = None
+    # ---- show k* marker (MAIN, on k-axis) ----
     if show_kstar:
-        k_star = curve.get("k_star", meta.get("k_star", None))
-        if k_star is not None and np.isfinite(float(k_star)) and float(k_star) > 0:
-            k_star = float(k_star)
+        k_star = (
+            curve.get("k_star_cum", None)
+            or entry.get("k_star", None)
+            or curve.get("k_star", None)
+            or meta.get("k_star", None)
+        )
+        if k_star is not None:
+            try:
+                k_star = float(k_star)
+            except Exception:
+                k_star = None
+
+        if k_star is not None and np.isfinite(k_star) and k_star > 0:
             ell_star = 1.0 / max(k_star, eps)
             kstar_label = rf"$k^*$={k_star:.3g} ($\ell^*$={ell_star:.3g})"
             ax.axvline(
                 k_star,
                 linestyle="-.",
-                linewidth=1.6,
-                color="tab:red",          # 红色强调
+                linewidth=1.7,
+                color="tab:red",
                 label=kstar_label,
-                zorder=3,                 # 压过曲线
+                zorder=3,
             )
 
-    # ---- Nyquist marker (on k-axis) ----
-    nyq_label = None
+    # ---- Nyquist marker ----
     try:
         dmin = float(min(dx, dy))
         if np.isfinite(dmin) and dmin > 0:
@@ -406,19 +482,37 @@ def plot_kstar_curve_from_entry(
                 k_nyq,
                 linestyle=":",
                 linewidth=1.4,
-                color="0.35",             # 中性灰（比 black 轻）
+                color="0.35",
                 label=nyq_label,
                 zorder=2,
             )
     except Exception:
         pass
 
-    # ---- legend: keep it compact, no layout blow-up ----
+    # ---- legend ----
     handles, labels = ax.get_legend_handles_labels()
     if labels:
         ax.legend(loc="lower right", frameon=True, fontsize=9)
 
-    fig.tight_layout()
+    # --------------------------------
+    # External info panel for band details (right side, outside axes)
+    # --------------------------------
+    if band_info_lines:
+        # Make room on right
+        fig.subplots_adjust(right=0.78)
+
+        # Add a small text box outside the axes
+        info_text = "Band definitions:\n" + "\n".join(f"- {ln}" for ln in band_info_lines)
+        fig.text(
+            0.80, 0.50,
+            info_text,
+            ha="left", va="center",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.95, edgecolor="0.6"),
+        )
+    else:
+        fig.tight_layout()
+
     return fig
 
 
@@ -724,13 +818,16 @@ def plot_kstar_heatmap(
     hatch_facecolor: tuple[float, float, float, float] = (0.90, 0.90, 0.90, 1.0),
 ) -> Optional[plt.Figure]:
     """
-    画 k* 的 (p, σ) 热力图（升级版：以尺度 ℓ*=1/k* 为主展示，并显式考虑 Nyquist）。
+    画 k* 的 (p, σ) 热力图（v1.17：主口径为累计低通误差曲线的自适应截止 k*）。
 
-    改进点：
-    - 右侧 info panel：definition + 状态图例，不遮挡主图
-    - NaN/<=0 的格子：按 “No resolvable scale” 处理，并用 hatch 纹理标识（不再写 N/A）
-    - k* > k_N：越 Nyquist（无意义区域），格子内写 k*>kN / ℓ*<ℓN，并加 ×
-    - 可选 use_log10_ell：颜色映射用 log10(ℓ*)（格子数字仍显示原 ℓ* 与 k*）
+    v1.17 定义（与数学手册对齐）：
+      - 先计算累计低通误差曲线 NRMSE_{<=K}
+      - k* 为该累计曲线进入“平台期”的起点（plateau onset）
+      - ℓ* = 1/k* 表示模型可恢复的最小可信尺度
+
+    仍显式考虑 Nyquist：
+      - 若 k* > k_N，则认为该格子“越 Nyquist（无物理意义）”，用 × 标记
+      - NaN/<=0 则认为 “No resolvable scale”
     """
     import numpy as np
     import matplotlib.pyplot as plt
@@ -857,8 +954,8 @@ def plot_kstar_heatmap(
     # ---------------------------
     # layout: main heatmap + right info panel (no overlay)
     # ---------------------------
-    fig = plt.figure(figsize=(8.6, 4.6), constrained_layout=True)
-    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 0.52])
+    fig = plt.figure(figsize=(8.8, 4.8), constrained_layout=True)
+    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 0.56])
 
     ax = fig.add_subplot(gs[0, 0])
     ax_info = fig.add_subplot(gs[0, 1])
@@ -884,7 +981,6 @@ def plot_kstar_heatmap(
     ax.set_yticklabels([f"{r:.3g}" for r in pv_k.index])
     ax.set_ylabel("noise_sigma σ")
 
-    # colorbar attached to main axis
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     if use_log10_ell:
         cb.set_label(r"$\log_{10}(\ell^*)$  where $\ell^*=1/k^*$  (length unit)")
@@ -894,10 +990,9 @@ def plot_kstar_heatmap(
     # ---------------------------
     # overlay hatch for "no resolvable scale" cells
     # ---------------------------
-    # (use patches instead of just "N/A" text so it looks intentional, not missing)
-    H, W = Z.shape
-    for i in range(H):
-        for j in range(W):
+    H_, W_ = Z.shape
+    for i in range(H_):
+        for j in range(W_):
             if no_scale[i, j]:
                 rect = Rectangle(
                     (j - 0.5, i - 0.5),
@@ -916,17 +1011,15 @@ def plot_kstar_heatmap(
     # ---------------------------
     if show_numbers:
         norm = im.norm
-        for i in range(H):
-            for j in range(W):
-                k = K[i, j]
+        for i in range(H_):
+            for j in range(W_):
+                k_val = K[i, j]
                 ell = L[i, j]  # true ell* (not clamped)
-                txt = None
 
                 if no_scale[i, j]:
-                    # Treat as "model fails to resolve any trustworthy scale"
                     txt = "No scale"
                 else:
-                    if (k_nyq is not None) and np.isfinite(k_nyq) and (k > k_nyq):
+                    if (k_nyq is not None) and np.isfinite(k_nyq) and (k_val > k_nyq):
                         if ell_nyq is not None and np.isfinite(ell_nyq):
                             txt = (
                                 rf"$\ell^*<{number_fmt_ell.format(ell_nyq)}$" "\n"
@@ -937,17 +1030,15 @@ def plot_kstar_heatmap(
                     else:
                         txt = (
                             rf"$\ell^*={number_fmt_ell.format(ell)}$" "\n"
-                            rf"$k^*={number_fmt_k.format(k)}$"
+                            rf"$k^*={number_fmt_k.format(k_val)}$"
                         )
 
-                # pick text color
                 val_for_color = Z[i, j]
                 if np.isfinite(val_for_color):
                     rgba = cmap(norm(val_for_color))
                     lum = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
                     tcolor = "black" if lum > 0.55 else "white"
                 else:
-                    # for hatched cells, prefer dark text
                     tcolor = "black"
 
                 ax.text(
@@ -961,16 +1052,16 @@ def plot_kstar_heatmap(
                     zorder=4,
                 )
 
-    # mark invalid Nyquist cells with ×
     if invalid_nyq.any():
         ys, xs = np.where(invalid_nyq)
         ax.scatter(xs, ys, marker="x", s=60, linewidths=2.0, color="white", zorder=5)
 
     # ---------------------------
-    # info panel: definition + status legend (no overlay)
+    # info panel: definition + status legend
     # ---------------------------
     def_lines = [
-        r"$k^*$: threshold crossing wavenumber",
+        r"$k^*$: plateau onset of cumulative low-pass error",
+        r"$\mathrm{NRMSE}_{≤ K}=\sqrt{\sum_{k≤ K}E_e(k) / \sum_{k≤ K}E_t(k)}$",
         r"$\ell^*=1/k^*$: smallest trustworthy spatial scale",
     ]
     if k_nyq is not None and np.isfinite(k_nyq):
@@ -989,13 +1080,10 @@ def plot_kstar_heatmap(
         transform=ax_info.transAxes,
     )
 
-    # status legend
     handles = []
     labels = []
-
     handles.append(Patch(facecolor=hatch_facecolor, edgecolor="0.65", hatch=hatch_no_scale))
     labels.append("No resolvable scale (k* undefined)")
-
     handles.append(Line2D([0], [0], marker="x", color="none", markeredgecolor="black",
                           markersize=8, markeredgewidth=2))
     labels.append(r"Invalid: $k^*>k_N$")
@@ -1127,17 +1215,21 @@ def plot_fourier_band_nrmse_curves(
 def plot_fourier_curve_from_entry(
     entry: Dict[str, Any],
     *,
-    title: str = "NRMSE(k)",
+    title: str = "Fourier scale curve",
 ) -> Optional[plt.Figure]:
     """
-    兼容旧接口：仍然叫 plot_fourier_curve_from_entry，
-    但升级为“解释型”曲线图：NRMSE(k) + (可选) k* + (可选) threshold + (可选) band edges。
+    兼容旧接口：仍然叫 plot_fourier_curve_from_entry。
+
+    v1.17 起，它返回的就是“k* 解释型曲线图”：
+      - 主曲线：累计低通 NRMSE_{<=K} vs K
+      - 可选叠加：局部 NRMSE(k) vs k（诊断）
     """
     return plot_kstar_curve_from_entry(
         entry,
-        title_prefix=title,
+        title=title,
         show_edges=True,
         show_kstar=True,
+        show_local_curve=True,
     )
 
 

@@ -34,6 +34,8 @@ from ..metrics.fourier_metrics import (
     fourier_radial_nrmse_curve,
     kstar_from_radial_curve,
     fourier_band_nrmse,
+    fourier_cumulative_nrmse_curve_from_energy,
+    kstar_from_cumulative_curve,
 )
 from ..fourier.filters import auto_pick_k_edges_from_energy
 
@@ -247,6 +249,20 @@ def _get_fourier_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
     if lambda_edges is not None:
         lambda_edges = [float(v) for v in lambda_edges]
 
+    # --- v1.17: cumulative NRMSE + adaptive cutoff (k*_cum) settings ---
+    # k_min_eval: do not evaluate k* in the ultra-low-k region (background / near-zero-energy instability)
+    k_min_eval = float(getattr(f, "k_min_eval", 1.0))
+
+    # plateau detection: "improvement < eps_plateau for m_plateau consecutive bins"
+    eps_plateau = float(getattr(f, "kstar_plateau_eps", 1e-3))
+    m_plateau = int(getattr(f, "kstar_plateau_m", 4))
+
+    # monotone enforcement on cumulative curve (numerical stability)
+    cum_monotone = bool(getattr(f, "kstar_cum_monotone", True))
+
+    # if no plateau found, whether to return last finite k as k*
+    prefer_last = bool(getattr(f, "kstar_prefer_last", True))
+
     return {
         "enabled": enabled,
         "grid_meta": grid_meta,
@@ -255,13 +271,22 @@ def _get_fourier_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> dict:
         "num_bins": int(getattr(f, "num_bins", 64)),
         "sample_frames": int(getattr(f, "sample_frames", 8)),
 
+        # legacy threshold (kept for debug curves only; NOT used as the main k*)
         "kstar_thr": float(getattr(f, "kstar_threshold", 1.0)),
+
         "mean_mode_true": str(getattr(f, "mean_mode_true", "global")),
         "save_curve": bool(getattr(f, "save_curve", False)),
 
         "band_scheme": band_scheme,
         "band_names": band_names,
         "lambda_edges": lambda_edges,
+
+        # v1.17 new knobs
+        "k_min_eval": float(k_min_eval),
+        "kstar_plateau_eps": float(eps_plateau),
+        "kstar_plateau_m": int(m_plateau),
+        "kstar_cum_monotone": bool(cum_monotone),
+        "kstar_prefer_last": bool(prefer_last),
     }
 
 def _compute_fourier_for_setting(
@@ -277,11 +302,18 @@ def _compute_fourier_for_setting(
     """
     NEW SCHEMA ONLY.
 
-    Fixes:
-      1) Empty bins are no longer treated as "NRMSE=0" in the saved curve (we store None).
+    v1.17 (Adaptive cutoff):
+      - Accumulate radial energies Et/Ee across sampled frames
+      - Provide both:
+          * local curve: NRMSE_F(k)  (diagnostic)
+          * cumulative curve: NRMSE_{<=K} (main for k*)
+      - Define k* as the plateau onset of the cumulative curve (k_star_cum)
+      - Keep legacy threshold-based k* only for debug (k_star_legacy)
+
+    Fixes (kept):
+      1) Empty bins are no longer treated as "NRMSE=0" in the saved curve (we store NaN/None).
       2) Provide a smoothed trend curve by smoothing energies (Et/Ee) with count-weights.
-      3) Use smoothed curve for k* (more stable & interpretable).
-      4) Unify band_nrmse and curve to the SAME accumulated spectrum (no double compute).
+      3) Unify band_nrmse and curves to the SAME accumulated spectrum (no double compute).
     """
     from ..metrics.fourier_metrics import smooth_nrmse_from_energy
 
@@ -337,13 +369,13 @@ def _compute_fourier_for_setting(
 
     eps = 1e-12
 
-    # ---- 2) raw nrmse (mask empty bins) ----
+    # ---- 2) raw local nrmse (mask empty bins) ----
     nrmse_k_raw = np.sqrt(Ee_sum / (Et_sum + eps))
     empty = (Ct_sum <= 0)
     nrmse_k_raw = np.asarray(nrmse_k_raw, dtype=float)
     nrmse_k_raw[empty] = np.nan
 
-    # ---- 3) smooth energies -> smooth nrmse ----
+    # ---- 3) smooth energies -> smooth local nrmse (diagnostic trend) ----
     smooth_window = 7
     if int(fs["num_bins"]) <= 32:
         smooth_window = 5
@@ -359,14 +391,36 @@ def _compute_fourier_for_setting(
         empty_to_nan=True,
     )
 
-    # ---- 4) k* based on smooth curve ----
-    k_star_out = kstar_from_radial_curve(
+    # ---- 4) v1.17: cumulative curve (main) ----
+    k_min_eval = float(fs.get("k_min_eval", 1.0))
+    k_eval, nrmse_cum, cum_meta = fourier_cumulative_nrmse_curve_from_energy(
+        k_centers=np.asarray(k_centers_ref, dtype=float),
+        E_true_k=np.asarray(Et_sum, dtype=float),
+        E_err_k=np.asarray(Ee_sum, dtype=float),
+        count_k=np.asarray(Ct_sum, dtype=float),
+        k_min_eval=k_min_eval,
+        eps=eps,
+        monotone_enforce=bool(fs.get("kstar_cum_monotone", True)),
+    )
+
+    # ---- 5) v1.17: k* from plateau of cumulative curve (MAIN k*) ----
+    k_star_cum, kstar_dbg = kstar_from_cumulative_curve(
+        np.asarray(k_eval, dtype=float),
+        np.asarray(nrmse_cum, dtype=float),
+        eps_plateau=float(fs.get("kstar_plateau_eps", 1e-3)),
+        m_plateau=int(fs.get("kstar_plateau_m", 4)),
+        k_min_eval=float(k_min_eval),
+        prefer_last_if_not_found=bool(fs.get("kstar_prefer_last", True)),
+    )
+
+    # ---- 6) legacy k* (threshold on local curve) for DEBUG ONLY ----
+    k_star_legacy = kstar_from_radial_curve(
         k_centers_ref,
         nrmse_k_smooth,
         threshold=float(fs["kstar_thr"]),
     )
 
-    # ---- 5) band edges ----
+    # ---- 7) band edges ----
     band_scheme = fs["band_scheme"]
     band_names = list(fs["band_names"])
 
@@ -394,8 +448,7 @@ def _compute_fourier_for_setting(
     if len(band_names) != n_bands:
         band_names = [f"B{i+1}" for i in range(n_bands)]
 
-    # ---- 6) band nrmse from the SAME accumulated spectrum ----
-    # (no per-frame recompute; consistent with curve & k*)
+    # ---- 8) band nrmse from the SAME accumulated spectrum ----
     fourier_band_nrmse_out = fourier_band_nrmse(
         k_centers=k_centers_ref,
         E_true_k=np.asarray(Et_sum, dtype=float),
@@ -405,7 +458,7 @@ def _compute_fourier_for_setting(
         monotone_enforce=True,
     )
 
-    # ---- 7) curve export ----
+    # ---- 9) curve export ----
     fourier_curve_out = None
     if fs["save_curve"]:
         fourier_curve_out = {
@@ -413,17 +466,43 @@ def _compute_fourier_for_setting(
             "E_true_k": _safe_float_list(np.asarray(Et_sum)),
             "E_err_k": _safe_float_list(np.asarray(Ee_sum)),
 
+            # local curves (diagnostic)
             "nrmse_k": _safe_float_list(np.asarray(nrmse_k_smooth)),
             "nrmse_k_raw": _safe_float_list(np.asarray(nrmse_k_raw)),
+
+            # cumulative curve (MAIN)
+            "nrmse_cum": _safe_float_list(np.asarray(nrmse_cum)),
 
             "k_edges": [float(x) for x in interior_edges],
             "band_names": band_names,
 
-            "k_star": None if k_star_out is None else float(k_star_out),
-            "k_star_threshold": float(fs["kstar_thr"]),
+            # MAIN k*
+            "k_star_cum": None if (k_star_cum is None or not np.isfinite(float(k_star_cum))) else float(k_star_cum),
 
+            # legacy k* for debug
+            "k_star_legacy": None if k_star_legacy is None else float(k_star_legacy),
+            "k_star_threshold_legacy": float(fs["kstar_thr"]),
+
+            # plateau params (to keep math<->code traceable)
+            "k_min_eval": float(k_min_eval),
+            "kstar_plateau_eps": float(fs.get("kstar_plateau_eps", 1e-3)),
+            "kstar_plateau_m": int(fs.get("kstar_plateau_m", 4)),
+            "kstar_cum_monotone": bool(fs.get("kstar_cum_monotone", True)),
+            "kstar_prefer_last": bool(fs.get("kstar_prefer_last", True)),
+
+            # smoothing params for local curve
             "smooth_window": int(smooth_window),
             "smooth_on": "energy_weighted_moving_avg",
+
+            # debug meta (optional but useful for paper/repro)
+            "kstar_cum_debug": {
+                "found": bool(kstar_dbg.get("found", False)),
+                "reason": kstar_dbg.get("reason", None),
+                "k_star_idx": kstar_dbg.get("k_star_idx", None),
+            },
+            "cum_meta": {
+                "start_idx": cum_meta.get("start_idx", None),
+            },
         }
 
     meta_hint = {
@@ -433,9 +512,18 @@ def _compute_fourier_for_setting(
         "fourier_grid_meta": dict(fs.get("grid_meta", {}) or {}),
     }
 
+    # IMPORTANT:
+    # Return k_star as the NEW main definition (cumulative plateau).
+    k_star_main = None
+    try:
+        if k_star_cum is not None and np.isfinite(float(k_star_cum)) and float(k_star_cum) > 0:
+            k_star_main = float(k_star_cum)
+    except Exception:
+        k_star_main = None
+
     return (
         {k: float(v) for k, v in fourier_band_nrmse_out.items()},
-        (None if k_star_out is None else float(k_star_out)),
+        k_star_main,
         fourier_curve_out,
         meta_hint,
     )

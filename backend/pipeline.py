@@ -452,10 +452,10 @@ def build_eval_figures(
                 f"k* curve (linear) {cfg}",
                 lambda e=e_lin, fm_=fm: plot_kstar_curve_from_entry(
                     e,
-                    title=f"NRMSE(k) vs spatial scale ℓ [linear] | {cfg}",
+                    title=f"Cumulative NRMSE$_{{≤ K}}$ vs K (with diagnostic local NRMSE(k)) [linear] | {cfg}",
                     band_names=fm_.get("band_names", band_names_global),
-                    k_edges=fm_.get("k_edges", None),          # 可选：显式传，避免 entry 缺字段时画不出 band
-                    grid_meta=fm_.get("grid_meta", None),       # 用于 λ/D 标注等
+                    k_edges=fm_.get("k_edges", None),
+                    grid_meta=fm_.get("grid_meta", None),
                 ),
             )
             if fig is not None:
@@ -468,7 +468,7 @@ def build_eval_figures(
                 f"k* curve (mlp) {cfg}",
                 lambda e=e_mlp, fm_=fm: plot_kstar_curve_from_entry(
                     e,
-                    title=f"NRMSE(k) vs spatial scale ℓ [mlp] | {cfg}",
+                    title=f"Cumulative NRMSE$_{{≤ K}}$ vs K (with diagnostic local NRMSE(k)) [mlp] | {cfg}",
                     band_names=fm_.get("band_names", band_names_global),
                     k_edges=fm_.get("k_edges", None),
                     grid_meta=fm_.get("grid_meta", None),
@@ -1788,47 +1788,106 @@ def extract_and_save_figures(
         cfg_name: str,
     ) -> bool:
         """
-        Save raw curve data needed to redraw k* curve / ℓ curve.
-        Returns True if saved, False if no curve data.
+        v1.17: Save raw curve data for k* interpretability plots.
+
+        Required (new main definition):
+        - k_centers
+        - nrmse_cum            (cumulative low-pass NRMSE_{<=K})
+        - k_star_cum / entry.k_star (plateau onset k*)
+
+        Optional (diagnostic / legacy):
+        - nrmse_k              (local NRMSE(k))
+        - E_true_k, E_err_k
+        - k_edges, band_names
+        - k_star_legacy / k_star_threshold (legacy threshold crossing)
+        - grid_meta_json
         """
         fc = entry.get("fourier_curve", None)
         if not isinstance(fc, dict):
             return False
 
-        # Required for curve plot
+        # -------------------------
+        # required arrays (v1.17)
+        # -------------------------
         k_centers = fc.get("k_centers", None)
-        nrmse_k = fc.get("nrmse_k", None)
-        if not isinstance(k_centers, (list, tuple)) or not isinstance(nrmse_k, (list, tuple)):
+        nrmse_cum = fc.get("nrmse_cum", None)
+
+        if not isinstance(k_centers, (list, tuple)) or not isinstance(nrmse_cum, (list, tuple)):
+            return False
+        if len(k_centers) == 0 or len(nrmse_cum) == 0 or len(k_centers) != len(nrmse_cum):
             return False
 
-        # Optional fields
+        # -------------------------
+        # optional arrays
+        # -------------------------
+        nrmse_k = fc.get("nrmse_k", None)
+        if not isinstance(nrmse_k, (list, tuple)) or len(nrmse_k) != len(k_centers):
+            nrmse_k = None
+
         e_true = fc.get("E_true_k", None)
         e_err = fc.get("E_err_k", None)
         k_edges = fc.get("k_edges", None)
         band_names = fc.get("band_names", None)
 
-        k_star = fc.get("k_star", entry.get("k_star", None))
-        k_thr = fc.get("k_star_threshold", None)
+        # -------------------------
+        # k* values (new + legacy)
+        # -------------------------
+        # new main k* (plateau onset)
+        k_star_cum = (
+            fc.get("k_star_cum", None)
+            or entry.get("k_star", None)          # batch B makes this the main k*
+            or fc.get("k_star", None)             # fallback
+        )
 
-        # grid_meta: prefer embedded (if you add it later), else fallback
+        # legacy (threshold crossing) if you still keep it in fc
+        k_star_legacy = fc.get("k_star_legacy", None) or fc.get("k_star_threshold_cross", None)
+        k_thr_legacy = fc.get("k_star_threshold_legacy", None) or fc.get("k_star_threshold", None)
+
+        # -------------------------
+        # grid_meta json
+        # -------------------------
         gm = fc.get("grid_meta", None)
         if not isinstance(gm, dict):
             gm = grid_meta_fallback if isinstance(grid_meta_fallback, dict) else {}
 
+        def _to_float_or_nan(x):
+            try:
+                if x is None:
+                    return float("nan")
+                v = float(x)
+                return v if np.isfinite(v) else float("nan")
+            except Exception:
+                return float("nan")
+
         np.savez_compressed(
             out_path,
+            # identity
             model_type=str(model),
             cfg_name=str(cfg_name),
             mask_rate=float(entry.get("mask_rate", float("nan"))),
             noise_sigma=float(entry.get("noise_sigma", float("nan"))),
+
+            # main curve (v1.17)
             k_centers=np.asarray(k_centers, dtype=float),
-            nrmse_k=np.asarray(nrmse_k, dtype=float),
+            nrmse_cum=np.asarray(nrmse_cum, dtype=float),
+
+            # diagnostic curve (optional)
+            nrmse_k=np.asarray(nrmse_k, dtype=float) if nrmse_k is not None else np.asarray([], dtype=float),
+
+            # energies (optional)
             E_true_k=np.asarray(e_true, dtype=float) if isinstance(e_true, (list, tuple)) else np.asarray([], dtype=float),
             E_err_k=np.asarray(e_err, dtype=float) if isinstance(e_err, (list, tuple)) else np.asarray([], dtype=float),
+
+            # band meta (optional)
             k_edges=np.asarray(k_edges, dtype=float) if isinstance(k_edges, (list, tuple)) else np.asarray([], dtype=float),
             band_names=np.asarray([str(x) for x in band_names], dtype="U32") if isinstance(band_names, (list, tuple)) else np.asarray([], dtype="U32"),
-            k_star=np.nan if k_star is None else float(k_star),
-            k_star_threshold=np.nan if k_thr is None else float(k_thr),
+
+            # k* (new + legacy)
+            k_star_cum=_to_float_or_nan(k_star_cum),
+            k_star_legacy=_to_float_or_nan(k_star_legacy),
+            k_star_threshold_legacy=_to_float_or_nan(k_thr_legacy),
+
+            # grid meta
             grid_meta_json=json.dumps(gm, ensure_ascii=False),
         )
         return True
