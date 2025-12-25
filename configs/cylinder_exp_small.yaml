@@ -33,7 +33,7 @@ eval:
     binning: log    # linear | log
     num_bins: 64
     k_min_eval: 0.7    # 仅计算 k >= k_min_eval 的 NRMSE 曲线
-    sample_frames: 8
+    sample_frames: -1    # -1 表示用所有帧；否则为整数，表示随机采样该数量的帧进行评估
     kstar_threshold: 1.0
     mean_mode_true: global
     save_curve: true
@@ -45,6 +45,6 @@ train:
   hidden_dims: [64, 64]
   lr: 0.001
   batch_size: 64
-  max_epochs: 50
+  max_epochs: 100
   device: cuda
   save_dir: artifacts/nn
