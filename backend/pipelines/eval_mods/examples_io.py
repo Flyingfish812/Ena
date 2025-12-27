@@ -1,16 +1,28 @@
-# backend/pipelines/eval_mods/examples_io.py
+"""backend/pipelines/eval_mods/examples_io.py
+
+Level-4 examples IO helpers.
+
+This file is intentionally self-contained and only assumes the v2.0
+Level-4 context defined in `backend/pipelines/eval_mods/core.py`:
+
+  - ctx.exp_dir: Path
+  - ctx.out_dir: Path
+  - ctx.cfg: dict with keys {data_cfg, pod_cfg, eval_cfg, train_cfg}
+  - ctx.caches: dict
+
+No dependency on the legacy `backend.pipelines.eval.*` toolchain.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
+import json
 import numpy as np
 
-from backend.pipelines.eval.utils import read_json, load_npz  # 你已有的工具
-from backend.dataio.io_utils import ensure_dir  # 你项目里已有
-# 说明：pipelines_code.md 里 EvalContext / EvalPaths 定义在 eval_mods/fourier_io.py 段落附近
-# 这里直接使用 ctx 的属性与方法（ctx.load_l2 / ctx.l2_meta / ctx.paths 等）
+from backend.dataio.io_utils import ensure_dir
 
 
 @dataclass(frozen=True)
@@ -29,7 +41,7 @@ def _infer_pod_meta(pod_dir: Path) -> Tuple[int, int, int]:
     meta_path = pod_dir / "meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"POD meta.json not found under: {pod_dir}")
-    meta = read_json(meta_path)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     # 常见字段命名：H/W/C 或 height/width/channels
     H = int(meta.get("H", meta.get("height", 0)))
     W = int(meta.get("W", meta.get("width", 0)))
@@ -72,6 +84,52 @@ def _load_pod_basis(pod_dir: Path) -> PodBasis:
         )
 
     return PodBasis(Ur=Ur, mean_flat=mean_flat, H=H, W=W, C=C)
+
+
+def _pick_l2_root(exp_dir: Path) -> Path:
+    """Pick Level-2 root directory.
+
+    v2.0 convention (as documented in `pipelines_code.md`):
+      - exp_dir/L2
+      - exp_dir/L2_rebuild
+    """
+    cand = [exp_dir / "L2", exp_dir / "L2_rebuild"]
+    for p in cand:
+        if p.exists() and p.is_dir():
+            return p
+    raise FileNotFoundError(
+        f"Cannot find Level-2 root under {exp_dir} (expected L2/ or L2_rebuild/). Tried: {cand}"
+    )
+
+
+def _l2_entry_path(
+    l2_root: Path,
+    *,
+    model_type: str,
+    mask_rate: float,
+    noise_sigma: float,
+    scale: int = 10000,
+) -> Path:
+    """Flat filename convention: <model>_pXXXX_sXXXX.npz"""
+    p_code = int(np.round(float(mask_rate) * float(scale)))
+    s_code = int(np.round(float(noise_sigma) * float(scale)))
+    return l2_root / f"{str(model_type)}_p{p_code:04d}_s{s_code:04d}.npz"
+
+
+def load_l2_npz(
+    ctx: Any,
+    *,
+    model_type: str,
+    mask_rate: float,
+    noise_sigma: float,
+) -> "np.lib.npyio.NpzFile":
+    """Load a Level-2 entry NPZ (read-only handle)."""
+    exp_dir = Path(getattr(ctx, "exp_dir"))
+    l2_root = _pick_l2_root(exp_dir)
+    p = _l2_entry_path(l2_root, model_type=model_type, mask_rate=mask_rate, noise_sigma=noise_sigma)
+    if not p.exists():
+        raise FileNotFoundError(f"L2 entry not found: {p}")
+    return np.load(p)
 
 
 def _pick_frames(T: int, *, sample_frames: int, seed: int = 0) -> List[int]:
@@ -117,9 +175,9 @@ def reconstruct_fields_from_l2(
         "mask_hw": [H, W] 或 None,
       }
     """
-    assert ctx.paths is not None
     # ---- cache: POD basis ----
-    pod_dir = Path(getattr(ctx.pod_cfg, "save_dir", "artifacts/pod"))
+    pod_cfg = (getattr(ctx, "cfg", None) or {}).get("pod_cfg", None)
+    pod_dir = Path(getattr(pod_cfg, "save_dir", "artifacts/pod"))
     cache_key = ("pod_basis", str(pod_dir))
     if cache_key in ctx.caches:
         basis: PodBasis = ctx.caches[cache_key]
@@ -128,13 +186,18 @@ def reconstruct_fields_from_l2(
         ctx.caches[cache_key] = basis
 
     # ---- load L2 npz ----
-    z = ctx.load_l2(model_type, float(mask_rate), float(noise_sigma))
-    # 约定：save_level2_entry 里至少有 A_hat_all / A_true_all / mask_flat
-    A_hat = np.asarray(z.get("A_hat_all", z.get("A_hat", None)))
-    A_true = np.asarray(z.get("A_true_all", z.get("A_true", None)))
-
-    if A_hat is None or A_true is None:
-        raise KeyError(f"L2 npz missing A_hat/A_true for {(model_type, mask_rate, noise_sigma)}")
+    # 约定：Level-2 NPZ 至少包含 A_hat_all / A_true_all（或 A_hat / A_true）
+    with load_l2_npz(ctx, model_type=model_type, mask_rate=float(mask_rate), noise_sigma=float(noise_sigma)) as z:
+        A_hat_raw = z.get("A_hat_all", z.get("A_hat", None))
+        A_true_raw = z.get("A_true_all", z.get("A_true", None))
+        mf_raw = z.get("mask_flat", None)
+        if A_hat_raw is None or A_true_raw is None:
+            raise KeyError(
+                f"L2 npz missing A_hat/A_true for {(model_type, mask_rate, noise_sigma)}"
+            )
+        A_hat = np.asarray(A_hat_raw)
+        A_true = np.asarray(A_true_raw)
+        mask_flat = np.asarray(mf_raw).reshape(-1) if mf_raw is not None else None
 
     if A_hat.ndim != 2 or A_true.ndim != 2:
         raise ValueError(f"A_hat/A_true must be [T,r]. got {A_hat.shape}, {A_true.shape}")
@@ -167,11 +230,9 @@ def reconstruct_fields_from_l2(
     x_err = x_pred - x_true
 
     mask_hw = None
-    mf = z.get("mask_flat", None)
-    if mf is not None:
-        mf = np.asarray(mf).reshape(-1)
-        if mf.size == H * W:
-            mask_hw = mf.reshape(H, W)
+    if mask_flat is not None:
+        if mask_flat.size == H * W:
+            mask_hw = mask_flat.reshape(H, W)
         # 如果你存的是 C*H*W 的 mask，也可以扩展这里做降维
 
     return {
