@@ -305,3 +305,52 @@ def plot_example_from_npz(
             model_name=model_name,
             title_prefix=title_prefix,
         )
+    
+def plot_recon_triptych(
+    x_pred_hw: np.ndarray,
+    x_true_hw: np.ndarray,
+    *,
+    title: str = "reconstruction (pred/true/err)",
+    mask_hw: np.ndarray | None = None,
+    show_mask: bool = False,
+    cmap: str = "RdBu_r",
+) -> plt.Figure:
+    """
+    空间域三联图：pred / true / err，共用 colorbar。
+    （不画 input，因为你这次明确说 input 没意义）
+    """
+    x_pred_hw = np.asarray(x_pred_hw)
+    x_true_hw = np.asarray(x_true_hw)
+    x_err_hw = x_pred_hw - x_true_hw
+
+    # color range：pred & true 用同一套；err 单独范围也行，但你要共用 colorbar => 统一
+    vmin = float(np.nanmin([x_pred_hw.min(), x_true_hw.min(), x_err_hw.min()]))
+    vmax = float(np.nanmax([x_pred_hw.max(), x_true_hw.max(), x_err_hw.max()]))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = -1.0, 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+    ims = []
+    ims.append(axes[0].imshow(x_pred_hw, vmin=vmin, vmax=vmax, cmap=cmap))
+    axes[0].set_title("pred")
+    ims.append(axes[1].imshow(x_true_hw, vmin=vmin, vmax=vmax, cmap=cmap))
+    axes[1].set_title("true")
+    ims.append(axes[2].imshow(x_err_hw, vmin=vmin, vmax=vmax, cmap=cmap))
+    axes[2].set_title("err (pred-true)")
+
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    if show_mask and mask_hw is not None:
+        mhw = np.asarray(mask_hw)
+        # 用半透明叠一层：观测点更亮
+        for ax in axes:
+            ax.imshow(mhw, alpha=0.15)
+
+    # shared colorbar
+    cbar = fig.colorbar(ims[-1], ax=axes, shrink=0.85, pad=0.02)
+    cbar.set_label("value")
+
+    fig.suptitle(title)
+    return fig

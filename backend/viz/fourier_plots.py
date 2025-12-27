@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, Iterable, Sequence, Optional
+from typing import Dict, Any, Iterable, Sequence, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1242,6 +1242,86 @@ def plot_fourier_curve_from_entry(
         show_kstar=True,
         show_local_curve=True,
     )
+
+def _fft2_mag(x_hw: np.ndarray, *, log_scale: bool = True, eps: float = 1e-12) -> np.ndarray:
+    """
+    返回 |FFT2(x)| 的可视化幅度图（shift 后居中）
+    """
+    x_hw = np.asarray(x_hw, dtype=float)
+    F = np.fft.fft2(x_hw)
+    F = np.fft.fftshift(F)
+    mag = np.abs(F)
+    if log_scale:
+        mag = np.log10(mag + eps)
+    return mag
+
+
+def _k_axes(H: int, W: int, *, dx: float = 1.0, dy: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    生成 kx, ky 轴（shift 后对齐）。单位是 cycles/unit（与你 k=1/lambda 的定义一致）
+    """
+    kx = np.fft.fftshift(np.fft.fftfreq(W, d=dx))
+    ky = np.fft.fftshift(np.fft.fftfreq(H, d=dy))
+    return kx, ky
+
+
+def plot_fft2_spectrum_triptych(
+    x_pred_hw: np.ndarray,
+    x_true_hw: np.ndarray,
+    *,
+    title: str = "FFT2 magnitude (pred/true/err)",
+    dx: float = 1.0,
+    dy: float = 1.0,
+    log_scale: bool = True,
+    cmap: str = "viridis",
+) -> plt.Figure:
+    """
+    新增：FFT 空间频域联图（三联）：
+      pred / true / err 的 |FFT2|（shift后）可视化，共用同一个 colorbar。
+
+    说明：
+      - 你说“(kx,ky) in [0,40]*[0,40]”，但频谱天然是正负对称的；
+        这里用 shift 后的 [-kN, kN] 坐标。若你坚持只看第一象限，我下一批给你加 quadrant 参数。
+    """
+    x_pred_hw = np.asarray(x_pred_hw)
+    x_true_hw = np.asarray(x_true_hw)
+    x_err_hw = x_pred_hw - x_true_hw
+
+    A = _fft2_mag(x_pred_hw, log_scale=log_scale)
+    B = _fft2_mag(x_true_hw, log_scale=log_scale)
+    C = _fft2_mag(x_err_hw, log_scale=log_scale)
+
+    vmin = float(np.nanmin([A.min(), B.min(), C.min()]))
+    vmax = float(np.nanmax([A.max(), B.max(), C.max()]))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = -1.0, 1.0
+
+    H, W = x_pred_hw.shape
+    kx, ky = _k_axes(H, W, dx=dx, dy=dy)
+    extent = [float(kx[0]), float(kx[-1]), float(ky[0]), float(ky[-1])]
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+
+    im0 = axes[0].imshow(A, vmin=vmin, vmax=vmax, extent=extent, origin="lower", cmap=cmap, aspect="auto")
+    axes[0].set_title("pred |FFT2|")
+    axes[0].set_xlabel("kx")
+    axes[0].set_ylabel("ky")
+
+    im1 = axes[1].imshow(B, vmin=vmin, vmax=vmax, extent=extent, origin="lower", cmap=cmap, aspect="auto")
+    axes[1].set_title("true |FFT2|")
+    axes[1].set_xlabel("kx")
+    axes[1].set_ylabel("ky")
+
+    im2 = axes[2].imshow(C, vmin=vmin, vmax=vmax, extent=extent, origin="lower", cmap=cmap, aspect="auto")
+    axes[2].set_title("err |FFT2|")
+    axes[2].set_xlabel("kx")
+    axes[2].set_ylabel("ky")
+
+    cbar = fig.colorbar(im2, ax=axes, shrink=0.85, pad=0.02)
+    cbar.set_label("log10|FFT2|" if log_scale else "|FFT2|")
+
+    fig.suptitle(title)
+    return fig
 
 
 def plot_fourier_example_from_npz_data(

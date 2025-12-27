@@ -14,6 +14,7 @@ from backend.pipelines.eval_mods import (
     ModRegistry,
     run_mods,
     register_fourier_mods,
+    register_example_mods,
 )
 
 
@@ -71,6 +72,7 @@ def compute_level4_eval_mods(
 
     # 批次2：注册 Fourier 模组
     register_fourier_mods(registry)
+    register_example_mods(registry)
 
     # 后续批次你会继续 register_*_mods(...)
     pack = run_mods(
