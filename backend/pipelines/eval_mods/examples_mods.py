@@ -4,53 +4,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
-from backend.pipelines.eval_mods.examples_io import (
-    reconstruct_fields_from_l2,
-    ensure_subdir,
-    _pick_l2_root,
-)
+from backend.pipelines.eval.registry import EvalMod, register_mod
+from backend.pipelines.eval_mods.examples_io import reconstruct_fields_from_l2, ensure_subdir
 from backend.viz.field_plots import plot_recon_triptych
 from backend.viz.fourier_plots import (
     plot_fft2_spectrum_triptych,
     plot_spatial_fourier_band_decomposition,
 )
-
-
-def _infer_model_types_from_l2(ctx: Any) -> List[str]:
-    """Infer model types by scanning Level-2 flat npz filenames.
-
-    Expected pattern: <model>_pXXXX_sXXXX.npz
-    """
-    exp_dir = Path(getattr(ctx, "exp_dir"))
-    l2_root = _pick_l2_root(exp_dir)
-    names: set[str] = set()
-    for p in l2_root.glob("*.npz"):
-        stem = p.stem
-        # split at '_p'
-        if "_p" in stem:
-            names.add(stem.split("_p", 1)[0])
-    return sorted(names)
-
-
-def _iter_cfgs_from_eval_cfg(ctx: Any) -> List[tuple[float, float]]:
-    """Return list of (mask_rate, noise_sigma) from eval_cfg."""
-    eval_cfg = (getattr(ctx, "cfg", None) or {}).get("eval_cfg", None)
-    if eval_cfg is None:
-        raise ValueError("ctx.cfg['eval_cfg'] missing")
-    mask_rates = list(getattr(eval_cfg, "mask_rates", []))
-    noise_sigmas = list(getattr(eval_cfg, "noise_sigmas", []))
-    if not mask_rates or not noise_sigmas:
-        raise ValueError(
-            f"eval_cfg must provide non-empty mask_rates/noise_sigmas, got {mask_rates}/{noise_sigmas}"
-        )
-    out: List[tuple[float, float]] = []
-    for p in mask_rates:
-        for s in noise_sigmas:
-            out.append((float(p), float(s)))
-    return out
 
 
 def _save_fig(fig: plt.Figure, path: Path, *, dpi: int = 180) -> None:
@@ -61,24 +24,38 @@ def _save_fig(fig: plt.Figure, path: Path, *, dpi: int = 180) -> None:
 
 def _k_edges_from_lambda_edges(lambda_edges: List[float]) -> List[float]:
     """
-    你的工程里 k = 1/lambda（与之前的实现一致）。
-    lambda_edges: [1.0, 0.25] => k_edges: [1.0, 4.0]
+    k = 1/lambda
+    返回“分带边界（不含 0 与 inf）”
     """
     le = [float(x) for x in lambda_edges]
-    out = []
+    out: List[float] = []
     for x in le:
         if x <= 0:
             raise ValueError(f"lambda_edges must be positive, got {lambda_edges}")
         out.append(1.0 / x)
-    # 这里返回“分带边界（不含 0 与 inf）”，交给 plot_spatial_fourier_band_decomposition 自己处理
     return out
 
 
+def _require_fourier_grid_meta(ctx: Any) -> Dict[str, Any]:
+    fourier_cfg = getattr(ctx.eval_cfg, "fourier", None)
+    if fourier_cfg is None:
+        raise ValueError("eval_cfg.fourier missing (required for this examples mod)")
+
+    grid_meta = getattr(fourier_cfg, "grid_meta", None)
+    if grid_meta is None:
+        raise ValueError("eval_cfg.fourier.grid_meta missing (required; unified schema)")
+
+    if not isinstance(grid_meta, dict):
+        # 允许是 dataclass/namespace 风格，但最终要转 dict 使用
+        grid_meta = {k: getattr(grid_meta, k) for k in ("dx", "dy") if hasattr(grid_meta, k)}
+    return grid_meta
+
+
 def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    空间域：pred/true/err 三联图（每组 cfg 抽若干帧）
-    """
-    out_dir = ensure_subdir(Path(getattr(ctx, "out_dir")), "examples_triptych")
+    """空间域：pred/true/err 三联图（每组 cfg 抽若干帧）"""
+    assert ctx.paths is not None
+
+    out_dir = ensure_subdir(ctx.paths.l4_root, "examples_triptych")
     fig_paths: List[str] = []
 
     sample_frames = int(kwargs.get("sample_frames", 8))
@@ -87,14 +64,8 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     dpi = int(kwargs.get("dpi", 180))
     show_mask = bool(kwargs.get("show_mask", False))
 
-    # 遍历：model_types x (mask_rate, noise_sigma)
-    model_types = kwargs.get("model_types", None)
-    if model_types is None:
-        model_types = _infer_model_types_from_l2(ctx)
-    model_types = [str(x) for x in list(model_types)]
-
-    for mt in model_types:
-        for (p, s) in _iter_cfgs_from_eval_cfg(ctx):
+    for mt in (ctx.model_types or ()):
+        for (p, s) in ctx.iter_cfgs():
             pack = reconstruct_fields_from_l2(
                 ctx,
                 model_type=str(mt),
@@ -127,10 +98,10 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def mod_examples_fourier_band_decomp(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    空间域：傅里叶分带 iFFT 联图（pred/true/err）
-    """
-    out_dir = ensure_subdir(Path(getattr(ctx, "out_dir")), "examples_band_decomp")
+    """空间域：傅里叶分带 iFFT 联图（pred/true/err per band）"""
+    assert ctx.paths is not None
+
+    out_dir = ensure_subdir(ctx.paths.l4_root, "examples_band_decomp")
     fig_paths: List[str] = []
 
     sample_frames = int(kwargs.get("sample_frames", 4))
@@ -138,26 +109,22 @@ def mod_examples_fourier_band_decomp(ctx: Any, kwargs: Dict[str, Any]) -> Dict[s
     seed = int(kwargs.get("seed", 0))
     dpi = int(kwargs.get("dpi", 180))
 
-    eval_cfg = (getattr(ctx, "cfg", None) or {}).get("eval_cfg", None)
-    fourier_cfg = getattr(eval_cfg, "fourier", None) if eval_cfg is not None else None
+    fourier_cfg = getattr(ctx.eval_cfg, "fourier", None)
     if fourier_cfg is None:
         raise ValueError("eval_cfg.fourier missing (required for examples.fourier_band_decomp)")
 
     band_names = list(getattr(fourier_cfg, "band_names", ["L", "M", "H"]))
-    lambda_edges = list(getattr(fourier_cfg, "lambda_edges", [1.0, 0.25]))
+    lambda_edges = list(getattr(fourier_cfg, "lambda_edges", []))
+    if len(lambda_edges) == 0:
+        raise ValueError("eval_cfg.fourier.lambda_edges missing/empty (required; unified schema)")
     k_edges = _k_edges_from_lambda_edges(lambda_edges)
 
-    grid = getattr(fourier_cfg, "grid", None)
-    dx = float(getattr(grid, "dx", 1.0)) if grid is not None else 1.0
-    dy = float(getattr(grid, "dy", 1.0)) if grid is not None else 1.0
+    grid_meta = _require_fourier_grid_meta(ctx)
+    dx = float(grid_meta.get("dx", 1.0))
+    dy = float(grid_meta.get("dy", 1.0))
 
-    model_types = kwargs.get("model_types", None)
-    if model_types is None:
-        model_types = _infer_model_types_from_l2(ctx)
-    model_types = [str(x) for x in list(model_types)]
-
-    for mt in model_types:
-        for (p, s) in _iter_cfgs_from_eval_cfg(ctx):
+    for mt in (ctx.model_types or ()):
+        for (p, s) in ctx.iter_cfgs():
             pack = reconstruct_fields_from_l2(
                 ctx,
                 model_type=str(mt),
@@ -193,10 +160,10 @@ def mod_examples_fourier_band_decomp(ctx: Any, kwargs: Dict[str, Any]) -> Dict[s
 
 
 def mod_examples_fft2_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    新增：FFT2 空间频域联图
-    """
-    out_dir = ensure_subdir(Path(getattr(ctx, "out_dir")), "examples_fft2_triptych")
+    """FFT2 空间频域联图（pred vs true）"""
+    assert ctx.paths is not None
+
+    out_dir = ensure_subdir(ctx.paths.l4_root, "examples_fft2_triptych")
     fig_paths: List[str] = []
 
     sample_frames = int(kwargs.get("sample_frames", 4))
@@ -205,19 +172,12 @@ def mod_examples_fft2_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, An
     dpi = int(kwargs.get("dpi", 180))
     log_scale = bool(kwargs.get("log_scale", True))
 
-    eval_cfg = (getattr(ctx, "cfg", None) or {}).get("eval_cfg", None)
-    fourier_cfg = getattr(eval_cfg, "fourier", None) if eval_cfg is not None else None
-    grid = getattr(fourier_cfg, "grid", None) if fourier_cfg is not None else None
-    dx = float(getattr(grid, "dx", 1.0)) if grid is not None else 1.0
-    dy = float(getattr(grid, "dy", 1.0)) if grid is not None else 1.0
+    grid_meta = _require_fourier_grid_meta(ctx)
+    dx = float(grid_meta.get("dx", 1.0))
+    dy = float(grid_meta.get("dy", 1.0))
 
-    model_types = kwargs.get("model_types", None)
-    if model_types is None:
-        model_types = _infer_model_types_from_l2(ctx)
-    model_types = [str(x) for x in list(model_types)]
-
-    for mt in model_types:
-        for (p, s) in _iter_cfgs_from_eval_cfg(ctx):
+    for mt in (ctx.model_types or ()):
+        for (p, s) in ctx.iter_cfgs():
             pack = reconstruct_fields_from_l2(
                 ctx,
                 model_type=str(mt),
@@ -249,30 +209,33 @@ def mod_examples_fft2_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, An
     return {"fig_paths": fig_paths, "count": len(fig_paths), "out_dir": str(out_dir)}
 
 
-def register_example_mods(registry: Any) -> None:
+def register_example_mods() -> None:
     """
-    注册到 v2.0 的 ModRegistry（core.ModRegistry）
+    统一引擎注册入口：
+    - 不再接收 registry 参数
+    - 直接注册到 backend.pipelines.eval.registry 的全局注册表
     """
-    from backend.pipelines.eval_mods.core import EvalMod
-
-    registry.register(
+    register_mod(
         EvalMod(
             name="examples.triptych",
-            fn=mod_examples_triptych,
+            requires=(),
             description="Spatial-domain triptych (pred/true/err) from L2 coeffs + POD basis",
+            run=mod_examples_triptych,
         )
     )
-    registry.register(
+    register_mod(
         EvalMod(
             name="examples.fourier_band_decomp",
-            fn=mod_examples_fourier_band_decomp,
+            requires=(),
             description="Spatial Fourier band iFFT decomposition (pred/true/err) per frame",
+            run=mod_examples_fourier_band_decomp,
         )
     )
-    registry.register(
+    register_mod(
         EvalMod(
             name="examples.fft2_triptych",
-            fn=mod_examples_fft2_triptych,
-            description="2D FFT magnitude triptych (pred/true/err), shared colorbar",
+            requires=(),
+            description="2D FFT magnitude triptych (pred/true), shared params from grid_meta",
+            run=mod_examples_fft2_triptych,
         )
     )

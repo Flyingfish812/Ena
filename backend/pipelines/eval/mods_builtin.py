@@ -1,7 +1,6 @@
 # backend/pipelines/eval/mods_builtin.py
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List
 
 from backend.pipelines.eval.context import EvalContext
@@ -9,7 +8,7 @@ from backend.pipelines.eval.registry import EvalMod, register_mod
 from backend.pipelines.eval.utils import write_json
 
 
-def _mod_manifest(ctx: EvalContext) -> Dict[str, Any]:
+def _mod_manifest(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     assert ctx.paths is not None
 
     l2_meta = ctx.l2_meta()
@@ -45,37 +44,24 @@ def _mod_manifest(ctx: EvalContext) -> Dict[str, Any]:
         "l3": {
             "enabled": bool(l3_meta.get("enabled", False)) if l3_meta else False,
             "meta_path": str(ctx.paths.l3_root / "meta.json"),
+            "index_path": str(ctx.paths.l3_root / "index.json"),
             "has_meta": (ctx.paths.l3_root / "meta.json").exists(),
             "has_index": (ctx.paths.l3_root / "index.json").exists(),
             "npz_count": int(l3_count),
             "meta": l3_meta,
-            "index_summary": {
-                "entries": int(len(l3_index.get("entries", []))) if isinstance(l3_index, dict) else 0,
-                "model_types": l3_index.get("model_types", None) if isinstance(l3_index, dict) else None,
-            },
+            "index": l3_index,
         },
-        "note": "Batch-1 manifest only; plotting mods will be added in later batches.",
     }
 
-    out_path = ctx.paths.l4_root / "index.json"
+    out_path = ctx.paths.l4_root / "manifest.json"
     write_json(out_path, payload)
-
-    return {
-        "written": {"index_json": str(out_path)},
-        "summary": {"l2_npz": int(l2_count), "l3_npz": int(l3_count), "model_types": list(ctx.model_types or ())},
-    }
+    return {"written": {"manifest_json": str(out_path)}, "manifest": payload}
 
 
-def _mod_quick_check(ctx: EvalContext) -> Dict[str, Any]:
+def _mod_quick_check(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     assert ctx.paths is not None
-    missing: List[str] = []
 
-    # L1: POD artifacts (heuristic)
-    pod_dir = Path(getattr(ctx.pod_cfg, "save_dir", ""))
-    for name in ["Ur.npy", "mean_flat.npy", "pod_meta.json"]:
-        p = pod_dir / name
-        if not p.exists():
-            missing.append(str(p))
+    missing: List[str] = []
 
     # L2
     if not ctx.paths.l2_root.exists():

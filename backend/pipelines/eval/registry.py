@@ -12,15 +12,20 @@ class EvalMod:
     name: str
     requires: Tuple[str, ...] = ()
     description: str = ""
-    run: Callable[[EvalContext], Dict[str, Any]] = lambda ctx: {}
+    run: Callable[[EvalContext, Dict[str, Any]], Dict[str, Any]] = lambda ctx, kwargs: {}
 
 
 _REGISTRY: Dict[str, EvalMod] = {}
 
 
 def register_mod(mod: EvalMod) -> None:
+    """
+    Idempotent registration:
+    - If a mod with the same name is already registered, keep the existing one and skip.
+    This is useful for notebook re-runs / repeated start() calls.
+    """
     if mod.name in _REGISTRY:
-        raise KeyError(f"Eval mod '{mod.name}' already registered.")
+        return
     _REGISTRY[mod.name] = mod
 
 
@@ -40,9 +45,11 @@ def describe_mod(name: str) -> Dict[str, Any]:
 
 
 def resolve_mods(mods: Optional[Sequence[str]]) -> List[str]:
-    # Minimal v1:
-    #   - None -> default set
-    #   - explicit list -> run those (support "default" alias)
+    """
+    Minimal v1:
+      - None -> default set
+      - explicit list -> run those (support "default" alias)
+    """
     if mods is None:
         out = ["manifest"]
     else:

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
-from .core import EvalContext, EvalMod, ModRegistry
-from .fourier_io import (
+from backend.pipelines.eval.registry import EvalMod, register_mod
+
+from backend.pipelines.eval_mods.fourier_io import (
     read_l3_index,
     read_l3_meta,
     parse_l3_entries,
@@ -34,28 +35,42 @@ def _save_fig(fig, path: Path, *, dpi: int = 160) -> None:
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
 
 
-def _load_l3_cache(ctx: EvalContext) -> Dict[str, Any]:
-    # cache key: "L3"
-    if "L3" in ctx.caches:
-        return ctx.caches["L3"]
+def _ensure_ctx_caches(ctx: Any) -> Dict[str, Any]:
+    # 新引擎应当提供 ctx.caches；若你还没加，先在这里兜底挂上
+    if not hasattr(ctx, "caches") or getattr(ctx, "caches") is None:
+        setattr(ctx, "caches", {})
+    caches: Dict[str, Any] = getattr(ctx, "caches")
+    return caches
 
-    l3_index = read_l3_index(ctx.exp_dir)
-    l3_meta = read_l3_meta(ctx.exp_dir)
+
+def _load_l3_cache(ctx: Any) -> Dict[str, Any]:
+    """
+    统一缓存键：'L3'
+    读取仍复用 fourier_io.read_l3_index/read_l3_meta（它们按 exp_dir/L3_fft 查找）。
+    """
+    caches = _ensure_ctx_caches(ctx)
+    if "L3" in caches:
+        return caches["L3"]
+
+    assert ctx.paths is not None, "EvalContext must be resolved (ctx.paths is None)."
+    exp_dir = ctx.paths.exp_dir
+
+    l3_index = read_l3_index(exp_dir)
+    l3_meta = read_l3_meta(exp_dir)
     entries = parse_l3_entries(l3_index)
 
-    pack = {
-        "index": l3_index,
-        "meta": l3_meta,
-        "entries": entries,
-    }
-    ctx.caches["L3"] = pack
+    pack = {"index": l3_index, "meta": l3_meta, "entries": entries}
+    caches["L3"] = pack
     return pack
 
 
-def _resolve_fourier_cfg(ctx: EvalContext) -> Any:
-    eval_cfg = ctx.cfg.get("eval_cfg", None)
+def _resolve_fourier_cfg(ctx: Any) -> Any:
+    """
+    新引擎统一入口：ctx.eval_cfg.fourier
+    """
+    eval_cfg = getattr(ctx, "eval_cfg", None)
     if eval_cfg is None:
-        raise ValueError("ctx.cfg.eval_cfg missing")
+        raise ValueError("ctx.eval_cfg missing (new L4 unified schema expects eval_cfg on context).")
     f = getattr(eval_cfg, "fourier", None)
     if f is None:
         raise ValueError("eval_cfg.fourier missing")
@@ -66,7 +81,7 @@ def _resolve_fourier_cfg(ctx: EvalContext) -> Any:
 # Mod: k* heatmap
 # ----------------------------
 
-def mod_fourier_kstar_heatmap(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def mod_fourier_kstar_heatmap(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     pack = _load_l3_cache(ctx)
     entries = pack["entries"]
     fourier_cfg = _resolve_fourier_cfg(ctx)
@@ -75,7 +90,8 @@ def mod_fourier_kstar_heatmap(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[
         sorted(set([e.model_type for e in entries]))
     )
 
-    out_dir = Path(ctx.out_dir) / "fourier"
+    assert ctx.paths is not None
+    out_dir = Path(ctx.paths.l4_root) / "fourier"
     _ensure_dir(out_dir)
 
     fig_paths: List[str] = []
@@ -84,7 +100,8 @@ def mod_fourier_kstar_heatmap(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[
     for mt in model_types:
         df = build_fourier_df_from_l3(entries=entries, eval_cfg_fourier=fourier_cfg, model_type=str(mt))
         if df is None or len(df) == 0:
-            ctx.log(f"[L4:fourier.kstar_heatmap] skip {mt}: empty df")
+            # 新引擎不强制 ctx.log；这里用 print 保持最小依赖
+            print(f"[L4:fourier.kstar_heatmap] skip {mt}: empty df")
             continue
 
         fig = plot_kstar_heatmap(
@@ -111,7 +128,7 @@ def mod_fourier_kstar_heatmap(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[
 # Mod: Fourier band NRMSE curves
 # ----------------------------
 
-def mod_fourier_band_nrmse_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def mod_fourier_band_nrmse_curves(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     pack = _load_l3_cache(ctx)
     entries = pack["entries"]
     fourier_cfg = _resolve_fourier_cfg(ctx)
@@ -122,7 +139,8 @@ def mod_fourier_band_nrmse_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> D
 
     band_names = tuple(getattr(fourier_cfg, "band_names", ("L", "M", "H")))
 
-    out_dir = Path(ctx.out_dir) / "fourier"
+    assert ctx.paths is not None
+    out_dir = Path(ctx.paths.l4_root) / "fourier"
     _ensure_dir(out_dir)
 
     fig_paths: List[str] = []
@@ -132,7 +150,6 @@ def mod_fourier_band_nrmse_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> D
             continue
 
         figs = plot_fourier_band_nrmse_curves(df_lin=df, df_mlp=None, band_names=band_names)
-        # figs: dict[str, fig]
         for key, fig in (figs or {}).items():
             if fig is None:
                 continue
@@ -147,7 +164,7 @@ def mod_fourier_band_nrmse_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> D
 # Mod: E(k) + band edges (legend / explanation)
 # ----------------------------
 
-def mod_fourier_energy_spectrum_legend(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def mod_fourier_energy_spectrum_legend(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     pack = _load_l3_cache(ctx)
     entries = pack["entries"]
     if not entries:
@@ -176,7 +193,8 @@ def mod_fourier_energy_spectrum_legend(ctx: EvalContext, kwargs: Dict[str, Any])
     if fig is None:
         return {"fig_paths": []}
 
-    out_dir = Path(ctx.out_dir) / "fourier"
+    assert ctx.paths is not None
+    out_dir = Path(ctx.paths.l4_root) / "fourier"
     _ensure_dir(out_dir)
     png = out_dir / "energy_spectrum_with_band_edges.png"
     _save_fig(fig, png, dpi=int(kwargs.get("dpi", 180)))
@@ -188,7 +206,7 @@ def mod_fourier_energy_spectrum_legend(ctx: EvalContext, kwargs: Dict[str, Any])
 # Mod: per-cfg k* curve plots
 # ----------------------------
 
-def mod_fourier_kstar_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def mod_fourier_kstar_curves(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     pack = _load_l3_cache(ctx)
     entries = pack["entries"]
     if not entries:
@@ -199,14 +217,13 @@ def mod_fourier_kstar_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[s
     k_edges_interior = lambda_edges_to_k_edges_interior(fourier_cfg)
     grid_meta = dict(getattr(fourier_cfg, "grid_meta", {}) or {})
 
-    # 限制数量避免一次性爆炸（默认全画，但你可以传 max_plots）
     max_plots = kwargs.get("max_plots", None)
     max_plots = None if max_plots is None else int(max_plots)
 
-    # 排序：更“像基准”的配置优先（噪声小、观测多）
     entries_sorted = sorted(entries, key=lambda e: (e.model_type, e.noise_sigma, -e.mask_rate))
 
-    out_dir = Path(ctx.out_dir) / "fourier" / "kstar_curves"
+    assert ctx.paths is not None
+    out_dir = Path(ctx.paths.l4_root) / "fourier" / "kstar_curves"
     _ensure_dir(out_dir)
 
     fig_paths: List[str] = []
@@ -220,7 +237,6 @@ def mod_fourier_kstar_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[s
         if not npz_path.exists():
             continue
 
-        # 组装成旧版 plot_kstar_curve_from_entry 兼容的 entry dict
         with np.load(npz_path, allow_pickle=False) as z:
             curve = {
                 "k_centers": z["k_centers"].tolist(),
@@ -270,32 +286,39 @@ def mod_fourier_kstar_curves(ctx: EvalContext, kwargs: Dict[str, Any]) -> Dict[s
     return {"fig_paths": fig_paths, "count": n}
 
 
-def register_fourier_mods(registry: ModRegistry) -> None:
-    registry.register(
+def register_fourier_mods() -> None:
+    """
+    新引擎统一注册入口：直接注册到 backend.pipelines.eval.registry 的全局注册表
+    """
+    register_mod(
         EvalMod(
             name="fourier.kstar_heatmap",
-            fn=mod_fourier_kstar_heatmap,
+            requires=(),
             description="k* heatmap per model_type from L3_fft",
+            run=mod_fourier_kstar_heatmap,
         )
     )
-    registry.register(
+    register_mod(
         EvalMod(
             name="fourier.band_nrmse_curves",
-            fn=mod_fourier_band_nrmse_curves,
+            requires=(),
             description="Fourier band NRMSE curves (vs p / vs sigma) from L3_fft energies",
+            run=mod_fourier_band_nrmse_curves,
         )
     )
-    registry.register(
+    register_mod(
         EvalMod(
             name="fourier.energy_spectrum_legend",
-            fn=mod_fourier_energy_spectrum_legend,
+            requires=(),
             description="E(k) with band edges explanation plot",
+            run=mod_fourier_energy_spectrum_legend,
         )
     )
-    registry.register(
+    register_mod(
         EvalMod(
             name="fourier.kstar_curves",
-            fn=mod_fourier_kstar_curves,
+            requires=(),
             description="Per-(p,σ) k* curve plots from L3_fft npz",
+            run=mod_fourier_kstar_curves,
         )
     )
