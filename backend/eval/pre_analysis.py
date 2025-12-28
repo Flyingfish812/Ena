@@ -119,7 +119,7 @@ def run_pre_analysis_from_storage(
     # meta.json: record schema + npz keys for quick inspection
     l3_npz_keys = _level3_npz_key_spec()
     meta = {
-        "schema_version": "v2.0-L3",
+        "schema_version": "v2.1-L3",
         "enabled": True,
         "source": {
             "exp_dir": str(exp_dir),
@@ -143,6 +143,14 @@ def run_pre_analysis_from_storage(
     if verbose:
         print(f"[L3] Found {len(l2_items)} Level-2 pred files under {l2_root}")
 
+    # v2.1: 2D stats knobs
+    save_2d = bool(fs.get("save_fft2_2d_stats", False))
+    stats_what = tuple(fs.get("fft2_2d_stats_what", ()))
+    stats_dtype = str(fs.get("fft2_2d_stats_dtype", "complex64"))
+    stats_shift = bool(fs.get("fft2_2d_stats_store_shifted", False))
+    stats_avg = bool(fs.get("fft2_2d_stats_avg_over_frames", True))
+    stats_sample_frames = fs.get("fft2_2d_stats_sample_frames", None)
+
     for item in l2_items:
         model_type = str(item["model_type"])
         pred_path = Path(item["pred_path"])
@@ -160,12 +168,18 @@ def run_pre_analysis_from_storage(
         # Use only first r_eff columns of POD basis.
         Ur_eff = Ur[:, :r_eff]
 
-        # Select sampled frames
+        # Select sampled frames for radial packages (existing behavior)
         t_samples = _select_sample_frames(T, int(fs["sample_frames"]))
         if len(t_samples) == 0:
             if verbose:
                 print("  -> skip: no sample frames")
             continue
+
+        # Select sampled frames for 2D stats (can inherit, or differ)
+        if stats_sample_frames is None:
+            t_samples_2d = list(t_samples)
+        else:
+            t_samples_2d = _select_sample_frames(T, int(stats_sample_frames))
 
         # Accumulate radial spectra across sampled frames.
         B = int(fs["num_bins"])
@@ -177,6 +191,15 @@ def run_pre_analysis_from_storage(
         k_centers_ref = None
         k_edges_ref = None
 
+        # v2.1: 2D stats accumulators (frame-avg)
+        stats_acc = _fft2_stats_init(
+            what=stats_what,
+            H=H,
+            W=W,
+            dtype_spec=stats_dtype,
+            enabled=save_2d,
+        )
+
         it = _tqdm(
             t_samples,
             total=len(t_samples),
@@ -184,18 +207,23 @@ def run_pre_analysis_from_storage(
             disable=not verbose,
         )
 
+        # We compute F_true/F_pred anyway for radial; we can reuse them for 2D stats
+        # but only accumulate when t is in t_samples_2d.
+        t2d_set = set(int(x) for x in t_samples_2d) if (save_2d and len(t_samples_2d) > 0) else set()
+
         for t in it:
+            t = int(t)
             x_true = X_thwc[t]  # [H,W,C]
 
             a_hat = A_hat_all[t]  # [r_eff]
             x_pred = reconstruct_from_pod(a_hat, Ur_eff, mean_flat).reshape(H, W, C)
 
-            # FFT (supports HWC internally)
+            # FFT (supports HWC internally; output shape is 2D or (C,H,W))
             F_true = fft2_field(x_true, mean_mode=str(fs["mean_mode_true"]))
             F_pred = fft2_field(x_pred, mean_mode=str(fs["mean_mode_true"]))
             F_err = F_pred - F_true
 
-            # Radial spectra
+            # --- radial spectra (existing) ---
             k_centers, Et, k_edges, count_k = radial_bin_spectrum(
                 F_true,
                 grid,
@@ -244,6 +272,16 @@ def run_pre_analysis_from_storage(
             Ec_sum += np.asarray(Ec, dtype=np.float64)
             Ct_sum += np.asarray(count_k, dtype=np.float64)
 
+            # --- 2D FFT stats (optional) ---
+            if save_2d and (t in t2d_set):
+                _fft2_stats_accum(
+                    acc=stats_acc,
+                    F_true=F_true,
+                    F_pred=F_pred,
+                    F_err=F_err,
+                    N=float(H * W),
+                )
+
         if k_centers_ref is None or k_edges_ref is None:
             if verbose:
                 print("  -> skip: k bins not initialized")
@@ -282,13 +320,37 @@ def run_pre_analysis_from_storage(
             prefer_last_if_not_found=bool(fs.get("kstar_prefer_last", True)),
         )
 
-                # Save Level-3 npz (flat layout, same style as Level-2)
+        # v2.1: finalize 2D stats (compute coh/H, apply dtype, optional fftshift)
+        fft2_2d_payload: Dict[str, Any] = {}
+        if save_2d:
+            fft2_2d_payload = _fft2_stats_finalize(
+                acc=stats_acc,
+                what=stats_what,
+                n_frames=int(stats_acc.get("_n", 0)),
+                eps=1e-12,
+                dtype_spec=stats_dtype,
+                store_shifted=stats_shift,
+                grid=grid,
+            )
+            # attach minimal axis/meta so L4 can interpret 2D arrays robustly
+            fft2_2d_payload.update(
+                {
+                    "fft2_2d_hw": np.asarray([H, W], dtype=np.int32),
+                    "fft2_2d_dx": float(grid.dx),
+                    "fft2_2d_dy": float(grid.dy),
+                    "fft2_2d_angular": bool(getattr(grid, "angular", False)),
+                    # keep 1D kx/ky (reconstruct k via meshgrid if needed)
+                    "fft2_2d_kx": np.asarray(grid.kx, dtype=np.float64),
+                    "fft2_2d_ky": np.asarray(grid.ky, dtype=np.float64),
+                }
+            )
+
+        # Save Level-3 npz (flat layout, same style as Level-2)
         p_code, s_code = _encode_p_s_codes(mask_rate, noise_sigma, scale=10000)
         out_name = f"{model_type}_p{p_code:04d}_s{s_code:04d}.npz"
         out_path = l3_root / out_name
 
-        np.savez_compressed(
-            out_path,
+        base_payload = dict(
             # --- axes / binning ---
             k_centers=np.asarray(k_centers_ref, dtype=np.float64),
             k_edges=np.asarray(k_edges_ref, dtype=np.float64),
@@ -307,6 +369,17 @@ def run_pre_analysis_from_storage(
             k_star=float(k_star),
         )
 
+        # Merge optional 2D payload
+        if save_2d and len(fft2_2d_payload) > 0:
+            # If user asked for avg_over_frames=False in config, we currently still store frame-avg.
+            # Reason: storing per-frame 2D arrays would explode disk usage. This keeps L3 compact.
+            if not stats_avg and verbose:
+                print("[L3] NOTE: fft2_2d_stats_avg_over_frames=False requested, but L3 stores frame-avg 2D stats only.")
+
+            base_payload.update(fft2_2d_payload)
+
+        np.savez_compressed(out_path, **base_payload)
+
         entries_out.append(
             {
                 "model_type": model_type,
@@ -317,6 +390,7 @@ def run_pre_analysis_from_storage(
                 "l3_fft_path": str(out_path),
                 "r_eff": int(r_eff),
                 "frames": list(t_samples),
+                "frames_2d": list(t_samples_2d) if save_2d else [],
                 "k_star": float(k_star),
                 "kstar_debug": {
                     "found": bool(kstar_dbg.get("found", False)),
@@ -326,6 +400,13 @@ def run_pre_analysis_from_storage(
                 "cum_meta": {
                     "k_min_eval": cum_meta.get("k_min_eval", None),
                     "start_idx": int(cum_meta.get("start_idx")) if cum_meta.get("start_idx", None) is not None else None,
+                },
+                "fft2_2d_stats": {
+                    "enabled": bool(save_2d),
+                    "n_frames": int(stats_acc.get("_n", 0)) if save_2d else 0,
+                    "what": list(stats_what) if save_2d else [],
+                    "dtype": str(stats_dtype) if save_2d else None,
+                    "store_shifted": bool(stats_shift) if save_2d else None,
                 },
             }
         )
@@ -461,6 +542,18 @@ def _get_fft_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> Dict[str, Any]
     k_min = getattr(f, "k_min", None)
     drop_first_bin = bool(getattr(f, "drop_first_bin", False))
 
+    # ----------------------------
+    # v2.1: 2D FFT stats (optional; default off)
+    # ----------------------------
+    save_fft2_2d_stats = bool(getattr(f, "save_fft2_2d_stats", False))
+    fft2_2d_stats_what = tuple(getattr(f, "fft2_2d_stats_what", ("P_true", "P_pred", "P_err", "C_tp", "coh", "H")))
+    fft2_2d_stats_avg_over_frames = bool(getattr(f, "fft2_2d_stats_avg_over_frames", True))
+    fft2_2d_stats_dtype = str(getattr(f, "fft2_2d_stats_dtype", "complex64"))
+    fft2_2d_stats_store_shifted = bool(getattr(f, "fft2_2d_stats_store_shifted", False))
+    fft2_2d_stats_sample_frames = getattr(f, "fft2_2d_stats_sample_frames", None)
+    if fft2_2d_stats_sample_frames is not None:
+        fft2_2d_stats_sample_frames = int(fft2_2d_stats_sample_frames)
+
     return {
         "enabled": enabled,
         "dx": float(dx),
@@ -477,6 +570,14 @@ def _get_fft_settings(eval_cfg: EvalConfig, *, H: int, W: int) -> Dict[str, Any]
         "kstar_prefer_last": bool(prefer_last),
         "k_min": None if k_min is None else float(k_min),
         "drop_first_bin": bool(drop_first_bin),
+
+        # v2.1 additions
+        "save_fft2_2d_stats": bool(save_fft2_2d_stats),
+        "fft2_2d_stats_what": tuple(str(x) for x in fft2_2d_stats_what),
+        "fft2_2d_stats_avg_over_frames": bool(fft2_2d_stats_avg_over_frames),
+        "fft2_2d_stats_dtype": str(fft2_2d_stats_dtype),
+        "fft2_2d_stats_store_shifted": bool(fft2_2d_stats_store_shifted),
+        "fft2_2d_stats_sample_frames": fft2_2d_stats_sample_frames,  # None / -1 / int
     }
 
 
@@ -624,7 +725,8 @@ def _extract_A_hat_all(npz: np.lib.npyio.NpzFile, *, pred_path: Path) -> Tuple[n
 
 
 def _level3_npz_key_spec() -> Dict[str, Any]:
-    return {
+    # Base keys (v2.0-compatible)
+    spec = {
         "k_centers": "(B,) float64",
         "k_edges": "(B+1,) float64",
         "count_k": "(B,) float64",
@@ -638,6 +740,211 @@ def _level3_npz_key_spec() -> Dict[str, Any]:
         "nrmse_cum": "(B,) float64",
         "k_star": "float",
     }
+
+    # v2.1 optional 2D stats keys (only when eval_cfg.fourier.save_fft2_2d_stats=True)
+    spec.update(
+        {
+            "fft2_2d_hw": "(2,) int32 [H,W]",
+            "fft2_2d_dx": "float",
+            "fft2_2d_dy": "float",
+            "fft2_2d_angular": "bool",
+            "fft2_2d_kx": "(W,) float64",
+            "fft2_2d_ky": "(H,) float64",
+
+            # frame-avg 2D stats (dtype depends on fft2_2d_stats_dtype)
+            "fft2_2d_P_true": "(H,W) float/complex (mean_t sum_c |F_true|^2 / N)",
+            "fft2_2d_P_pred": "(H,W) float/complex (mean_t sum_c |F_pred|^2 / N)",
+            "fft2_2d_P_err": "(H,W) float/complex (mean_t sum_c |F_err|^2 / N)",
+            "fft2_2d_C_tp": "(H,W) complex (mean_t sum_c F_true * conj(F_pred) / N)",
+            "fft2_2d_coh": "(H,W) float (|C_tp|^2 / (P_true*P_pred+eps))",
+            "fft2_2d_H": "(H,W) complex (C_tp / (P_true+eps))",
+        }
+    )
+    return spec
+
+
+def _fft2_stats_init(
+    *,
+    what: Sequence[str],
+    H: int,
+    W: int,
+    dtype_spec: str,
+    enabled: bool,
+) -> Dict[str, Any]:
+    # 2D stats accumulator, frame-averaged.
+    # We store arrays as float64/complex128 during accumulation (numerically stable),
+    # then cast to user requested dtype at finalize step.
+    acc: Dict[str, Any] = {"_enabled": bool(enabled), "_n": 0, "_H": int(H), "_W": int(W)}
+    if not enabled:
+        return acc
+
+    want = set(str(x) for x in what)
+    if len(want) == 0:
+        # if user enabled saving but didn't specify what, do nothing
+        return acc
+
+    # allocate only requested raw stats
+    # P_* are real, C_tp is complex
+    if ("P_true" in want) or ("coh" in want) or ("H" in want) or ("C_tp" in want):
+        acc["P_true_sum"] = np.zeros((H, W), dtype=np.float64)
+    if ("P_pred" in want) or ("coh" in want):
+        acc["P_pred_sum"] = np.zeros((H, W), dtype=np.float64)
+    if ("P_err" in want):
+        acc["P_err_sum"] = np.zeros((H, W), dtype=np.float64)
+    if ("C_tp" in want) or ("coh" in want) or ("H" in want):
+        acc["C_tp_sum"] = np.zeros((H, W), dtype=np.complex128)
+
+    # remember intended dtype for finalize
+    acc["_dtype_spec"] = str(dtype_spec)
+    acc["_want"] = tuple(sorted(want))
+    return acc
+
+
+def _power2d_from_F(F: np.ndarray) -> np.ndarray:
+    # Returns (H,W) real array: sum over channels of |F|^2.
+    F = np.asarray(F)
+    if F.ndim == 2:
+        return (np.abs(F) ** 2).astype(np.float64, copy=False)
+    if F.ndim == 3:
+        # assume (C,H,W)
+        return np.sum(np.abs(F) ** 2, axis=0).astype(np.float64, copy=False)
+    raise ValueError(f"Unsupported FFT shape for power2d: {F.shape}")
+
+
+def _cross2d_from_F(F_true: np.ndarray, F_pred: np.ndarray) -> np.ndarray:
+    # Returns (H,W) complex array: sum over channels of (F_true * conj(F_pred)).
+    Ft = np.asarray(F_true)
+    Fp = np.asarray(F_pred)
+    if Ft.shape != Fp.shape:
+        raise ValueError(f"F_true shape {Ft.shape} != F_pred shape {Fp.shape}")
+
+    if Ft.ndim == 2:
+        return (Ft * np.conj(Fp)).astype(np.complex128, copy=False)
+    if Ft.ndim == 3:
+        return np.sum(Ft * np.conj(Fp), axis=0).astype(np.complex128, copy=False)
+    raise ValueError(f"Unsupported FFT shape for cross2d: {Ft.shape}")
+
+
+def _fft2_stats_accum(
+    *,
+    acc: Dict[str, Any],
+    F_true: np.ndarray,
+    F_pred: np.ndarray,
+    F_err: np.ndarray,
+    N: float,
+):
+    # Accumulate raw stats for one frame.
+    if not bool(acc.get("_enabled", False)):
+        return
+
+    # Normalize by N=H*W so magnitudes are comparable across shapes.
+    invN = 1.0 / float(N) if float(N) > 0 else 1.0
+
+    if "P_true_sum" in acc:
+        acc["P_true_sum"] += _power2d_from_F(F_true) * invN
+    if "P_pred_sum" in acc:
+        acc["P_pred_sum"] += _power2d_from_F(F_pred) * invN
+    if "P_err_sum" in acc:
+        acc["P_err_sum"] += _power2d_from_F(F_err) * invN
+    if "C_tp_sum" in acc:
+        acc["C_tp_sum"] += _cross2d_from_F(F_true, F_pred) * invN
+
+    acc["_n"] = int(acc.get("_n", 0)) + 1
+
+
+def _cast_dtype(arr: np.ndarray, dtype_spec: str) -> np.ndarray:
+    s = str(dtype_spec).lower().strip()
+    if s in ("float32", "f4"):
+        return np.asarray(arr, dtype=np.float32)
+    if s in ("float64", "f8"):
+        return np.asarray(arr, dtype=np.float64)
+    if s in ("complex64", "c8"):
+        return np.asarray(arr, dtype=np.complex64)
+    if s in ("complex128", "c16"):
+        return np.asarray(arr, dtype=np.complex128)
+    # fallback: keep as-is
+    return np.asarray(arr)
+
+
+def _maybe_fftshift_2d(arr: np.ndarray, *, axes: tuple[int, int] = (-2, -1)) -> np.ndarray:
+    # shift last two axes for (H,W) arrays
+    return np.fft.fftshift(arr, axes=axes)
+
+
+def _fft2_stats_finalize(
+    *,
+    acc: Dict[str, Any],
+    what: Sequence[str],
+    n_frames: int,
+    eps: float,
+    dtype_spec: str,
+    store_shifted: bool,
+    grid,
+) -> Dict[str, Any]:
+    # Produce payload keys: fft2_2d_* (frame-avg)
+    out: Dict[str, Any] = {}
+    if not bool(acc.get("_enabled", False)):
+        return out
+
+    n = int(n_frames)
+    if n <= 0:
+        return out
+
+    want = set(str(x) for x in what)
+    if len(want) == 0:
+        return out
+
+    # Compute frame means
+    if "P_true_sum" in acc:
+        P_true = acc["P_true_sum"] / float(n)
+    else:
+        P_true = None
+    if "P_pred_sum" in acc:
+        P_pred = acc["P_pred_sum"] / float(n)
+    else:
+        P_pred = None
+    if "P_err_sum" in acc:
+        P_err = acc["P_err_sum"] / float(n)
+    else:
+        P_err = None
+    if "C_tp_sum" in acc:
+        C_tp = acc["C_tp_sum"] / float(n)
+    else:
+        C_tp = None
+
+    # Optional derived fields
+    coh = None
+    H_tf = None
+    if ("coh" in want) and (C_tp is not None) and (P_true is not None) and (P_pred is not None):
+        coh = (np.abs(C_tp) ** 2) / (np.asarray(P_true, dtype=np.float64) * np.asarray(P_pred, dtype=np.float64) + float(eps))
+        coh = np.asarray(coh, dtype=np.float64)
+
+    if ("H" in want) and (C_tp is not None) and (P_true is not None):
+        H_tf = C_tp / (np.asarray(P_true, dtype=np.float64) + float(eps))
+
+    # Apply optional shift (for visualization convenience; keep default False)
+    def _shift_if_needed(a: np.ndarray) -> np.ndarray:
+        if not bool(store_shifted):
+            return a
+        # (H,W) arrays
+        return _maybe_fftshift_2d(a)
+
+    # Emit payload with consistent prefix
+    # (We only emit those requested OR required for derived)
+    if ("P_true" in want) and (P_true is not None):
+        out["fft2_2d_P_true"] = _cast_dtype(_shift_if_needed(P_true), dtype_spec if "complex" in str(dtype_spec).lower() else "float32")
+    if ("P_pred" in want) and (P_pred is not None):
+        out["fft2_2d_P_pred"] = _cast_dtype(_shift_if_needed(P_pred), dtype_spec if "complex" in str(dtype_spec).lower() else "float32")
+    if ("P_err" in want) and (P_err is not None):
+        out["fft2_2d_P_err"] = _cast_dtype(_shift_if_needed(P_err), dtype_spec if "complex" in str(dtype_spec).lower() else "float32")
+    if ("C_tp" in want) and (C_tp is not None):
+        out["fft2_2d_C_tp"] = _cast_dtype(_shift_if_needed(C_tp), dtype_spec)
+    if ("coh" in want) and (coh is not None):
+        out["fft2_2d_coh"] = _cast_dtype(_shift_if_needed(coh), "float32")
+    if ("H" in want) and (H_tf is not None):
+        out["fft2_2d_H"] = _cast_dtype(_shift_if_needed(H_tf), dtype_spec)
+
+    return out
 
 
 def _radial_bin_cross_energy(

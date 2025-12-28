@@ -12,6 +12,7 @@ from backend.pipelines.eval.runner import run_eval_mods
 
 from backend.pipelines.eval_mods.fourier_mods import register_fourier_mods
 from backend.pipelines.eval_mods.examples_mods import register_example_mods
+from backend.pipelines.eval_mods.scale_mods import register_scale_mods
 
 
 def compute_level4_eval_mods(
@@ -43,6 +44,7 @@ def compute_level4_eval_mods(
     register_builtin_mods()
     register_fourier_mods()
     register_example_mods()
+    register_scale_mods()
 
     # 统一执行器：eval/runner.py
     pack = run_eval_mods(

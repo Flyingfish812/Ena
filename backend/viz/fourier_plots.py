@@ -6,6 +6,7 @@ from typing import Dict, Any, Iterable, Sequence, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+from backend.fourier.filters import make_wavenumber_grid, fft2_field, ifft2_field
 
 def _ensure_hw(x: np.ndarray, *, channel: int = 0) -> np.ndarray:
     """
@@ -28,15 +29,18 @@ def _radial_k_grid(
     *,
     dx: float = 1.0,
     dy: float = 1.0,
+    angular: bool = False,
 ) -> np.ndarray:
     """
-    构造以 FFT 频率为基础的 radial wavenumber 网格 k(y,x)。
-    这里的单位是 cycles / length（即频率），不是角频率。
+    构造 radial wavenumber 网格 k(y,x)，与本项目统一 FFT 定义保持一致。
+
+    - 默认 angular=False：k 的单位是 cycles / length（即 1/λ）
+    - 若 angular=True：k 的单位是 rad / length（2π/λ）
+
+    注意：返回的 K 未做 fftshift；如需可视化居中，请对 K 做 fftshift。
     """
-    ky = np.fft.fftfreq(H, d=dy)  # cycles/len
-    kx = np.fft.fftfreq(W, d=dx)
-    KX, KY = np.meshgrid(kx, ky)
-    return np.sqrt(KX**2 + KY**2)
+    grid = make_wavenumber_grid(H=H, W=W, dx=float(dx), dy=float(dy), angular=bool(angular))
+    return np.asarray(grid.k, dtype=np.float64)
 
 
 def _fft_bandpass_2d(
@@ -46,17 +50,23 @@ def _fft_bandpass_2d(
     k_high: float | None,
     dx: float = 1.0,
     dy: float = 1.0,
+    angular: bool = False,
+    mean_mode: str = "none",
 ) -> np.ndarray:
     """
     在频域做一个“radial band-pass”并 iFFT 回空间域。
+
+    v2.1: 统一 FFT 定义：使用 fft2_field / ifft2_field，并用 make_wavenumber_grid 生成 k 网格。
+    - 默认 angular=False：k 单位 cycles/unit
     - k_low=None 表示 0
     - k_high=None 表示 +inf
     """
     x_hw = np.asarray(x_hw, dtype=float)
     H, W = x_hw.shape
-    K = _radial_k_grid(H, W, dx=dx, dy=dy)
+    K = _radial_k_grid(H, W, dx=dx, dy=dy, angular=angular)
 
-    X = np.fft.fft2(x_hw)
+    X = fft2_field(x_hw, mean_mode=mean_mode)
+
     mask = np.ones_like(K, dtype=bool)
     if k_low is not None:
         mask &= (K >= float(k_low))
@@ -64,8 +74,8 @@ def _fft_bandpass_2d(
         mask &= (K < float(k_high))
 
     X_f = X * mask
-    x_f = np.fft.ifft2(X_f).real
-    return x_f
+    x_f = ifft2_field(X_f, real_output=True)
+    return np.asarray(x_f, dtype=float)
 
 
 def plot_energy_spectrum_with_band_edges(
@@ -91,6 +101,39 @@ def plot_energy_spectrum_with_band_edges(
         return None
 
     fig, ax = plt.subplots(1, 1, figsize=(7.6, 4.1))
+
+    # drop invalid / floor-clipped points so the curve connects cleanly ----
+    k = np.asarray(k, dtype=float).reshape(-1)
+    e = np.asarray(e, dtype=float).reshape(-1)
+
+    m = np.isfinite(k) & np.isfinite(e)
+
+    # log axis requires positive values; drop non-positive
+    if loglog:
+        m &= (k > 0) & (e > 0)
+
+    # optional: if energy has a hard floor (common after log/clip), drop it to avoid spikes.
+    # Here we detect a "pile-up" at the minimum finite value and remove those points.
+    if m.any():
+        e_use = e[m]
+        # robust min (avoid tiny numerical noise): take the 0.5% quantile as "floor candidate"
+        floor = float(np.nanpercentile(e_use, 0.5))
+        # if lots of points are extremely close to floor, treat them as clipped floor and drop
+        close = np.abs(e_use - floor) <= (1e-12 + 1e-6 * max(1.0, abs(floor)))
+        if close.sum() >= max(16, int(0.2 * e_use.size)):  # "many points at floor" heuristic
+            m2 = np.ones_like(m, dtype=bool)
+            # only apply to points already valid
+            idx = np.where(m)[0]
+            m2[idx[close]] = False
+            m &= m2
+
+    k = k[m]
+    e = e[m]
+
+    if k.size == 0:
+        # nothing sensible to plot
+        return None
+
     ax.plot(k, e, linewidth=2.0)
 
     if loglog:
@@ -526,7 +569,6 @@ def plot_kstar_curve_from_entry(
     return fig
 
 
-
 def plot_spatial_fourier_band_decomposition(
     x_true_hw: np.ndarray,
     x_pred_hw: np.ndarray,
@@ -593,17 +635,25 @@ def plot_spatial_fourier_band_decomposition(
 
     # ---- unified, robust color limits ----
     # main：只用 Full 的 true 来定标（与你现在一致）
-    vals = true_comps[0].ravel()
-    max_abs_main = float(np.percentile(np.abs(vals), robust_q))
-    if max_abs_main == 0.0:
+    vals = np.asarray(true_comps[0], dtype=float).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
         max_abs_main = 1.0
+    else:
+        max_abs_main = float(np.nanpercentile(np.abs(vals), robust_q))
+        if not np.isfinite(max_abs_main) or max_abs_main == 0.0:
+            max_abs_main = 1.0
     vmin_main, vmax_main = -max_abs_main, max_abs_main
 
     # err：只用 Full 的 error 来定标
-    err0 = err_comps[0].ravel()
-    max_abs_err = float(np.percentile(np.abs(err0), robust_q))
-    if max_abs_err == 0.0:
+    err0 = np.asarray(err_comps[0], dtype=float).ravel()
+    err0 = err0[np.isfinite(err0)]
+    if err0.size == 0:
         max_abs_err = max_abs_main
+    else:
+        max_abs_err = float(np.nanpercentile(np.abs(err0), robust_q))
+        if not np.isfinite(max_abs_err) or max_abs_err == 0.0:
+            max_abs_err = max_abs_main
     vmin_err, vmax_err = -max_abs_err, max_abs_err
 
     # ---- layout with wrapping ----
@@ -1159,6 +1209,11 @@ def plot_fourier_band_nrmse_curves(
             for b in band_names:
                 y = sub[f"fourier_band_nrmse_{b}"].to_numpy()
                 x = sub["mask_rate"].to_numpy()
+                m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                x = x[m]
+                y = y[m]
+                if x.size == 0:
+                    continue
                 ax.plot(x, y, marker="o", linewidth=1.5, label=f"σ={s:.3g}  band={b}")
 
         ax.set_xscale("log")
@@ -1194,6 +1249,11 @@ def plot_fourier_band_nrmse_curves(
             for b in band_names:
                 y = sub[f"fourier_band_nrmse_{b}"].to_numpy()
                 x = sub["noise_sigma"].to_numpy()
+                m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                x = x[m]
+                y = y[m]
+                if x.size == 0:
+                    continue
                 ax.plot(x, y, marker="o", linewidth=1.5, label=f"p={p:.3g}  band={b}")
 
         ax.set_xscale("log")
@@ -1243,25 +1303,48 @@ def plot_fourier_curve_from_entry(
         show_local_curve=True,
     )
 
-def _fft2_mag(x_hw: np.ndarray, *, log_scale: bool = True, eps: float = 1e-12) -> np.ndarray:
+
+def _fft2_mag(
+    x_hw: np.ndarray,
+    *,
+    log_scale: bool = True,
+    eps: float = 1e-12,
+    mean_mode: str = "none",
+) -> np.ndarray:
     """
-    返回 |FFT2(x)| 的可视化幅度图（shift 后居中）
+    返回 |FFT2(x)| 的可视化幅度图（shift 后居中）。
+
+    v2.1: 统一 FFT 定义：内部调用 backend.fourier.filters.fft2_field，
+    以保证 mean_mode 与 (dx,dy,angular) 体系与科研指标一致。
     """
     x_hw = np.asarray(x_hw, dtype=float)
-    F = np.fft.fft2(x_hw)
+    if not np.isfinite(x_hw).all():
+        x_hw = np.nan_to_num(x_hw, nan=0.0, posinf=0.0, neginf=0.0)
+    F = fft2_field(x_hw, mean_mode=mean_mode)
     F = np.fft.fftshift(F)
     mag = np.abs(F)
     if log_scale:
-        mag = np.log10(mag + eps)
+        mag = np.log10(mag + float(eps))
     return mag
 
 
-def _k_axes(H: int, W: int, *, dx: float = 1.0, dy: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+def _k_axes(
+    H: int,
+    W: int,
+    *,
+    dx: float = 1.0,
+    dy: float = 1.0,
+    angular: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    生成 kx, ky 轴（shift 后对齐）。单位是 cycles/unit（与你 k=1/lambda 的定义一致）
+    生成 kx, ky 轴（shift 后对齐）。
+
+    - 默认 angular=False：单位 cycles/unit（与你 k=1/λ 的定义一致）
+    - angular=True：单位 rad/unit
     """
-    kx = np.fft.fftshift(np.fft.fftfreq(W, d=dx))
-    ky = np.fft.fftshift(np.fft.fftfreq(H, d=dy))
+    grid = make_wavenumber_grid(H=H, W=W, dx=float(dx), dy=float(dy), angular=bool(angular))
+    kx = np.fft.fftshift(np.asarray(grid.kx, dtype=np.float64))
+    ky = np.fft.fftshift(np.asarray(grid.ky, dtype=np.float64))
     return kx, ky
 
 
@@ -1298,7 +1381,20 @@ def plot_fft2_spectrum_triptych(
 
     H, W = x_pred_hw.shape
     kx, ky = _k_axes(H, W, dx=dx, dy=dy)
-    extent = [float(kx[0]), float(kx[-1]), float(ky[0]), float(ky[-1])]
+    kx_arr = np.asarray(kx)
+    ky_arr = np.asarray(ky)
+
+    if kx_arr.ndim == 2:
+        x0, x1 = float(np.nanmin(kx_arr)), float(np.nanmax(kx_arr))
+    else:
+        x0, x1 = float(kx_arr[0]), float(kx_arr[-1])
+
+    if ky_arr.ndim == 2:
+        y0, y1 = float(np.nanmin(ky_arr)), float(np.nanmax(ky_arr))
+    else:
+        y0, y1 = float(ky_arr[0]), float(ky_arr[-1])
+
+    extent = [x0, x1, y0, y1]
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
 

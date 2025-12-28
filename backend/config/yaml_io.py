@@ -153,6 +153,33 @@ def load_experiment_yaml(
     lambda_edges_raw = fourier_raw.get("lambda_edges", (1.0, 0.25))
     lambda_edges = [float(v) for v in lambda_edges_raw]
 
+    # v2.1: 2D FFT stats saving options (all optional; default to schema defaults)
+    save_fft2_2d_stats = bool(fourier_raw.get("save_fft2_2d_stats", False))
+
+    fft2_2d_stats_what_raw = fourier_raw.get(
+        "fft2_2d_stats_what",
+        ("P_true", "P_pred", "P_err", "C_tp", "coh", "H"),
+    )
+    # YAML may contain list; keep as tuple[str,...]
+    fft2_2d_stats_what = tuple(str(x) for x in (fft2_2d_stats_what_raw or ()))
+
+    fft2_2d_stats_avg_over_frames = bool(
+        fourier_raw.get("fft2_2d_stats_avg_over_frames", True)
+    )
+    fft2_2d_stats_dtype = str(
+        fourier_raw.get("fft2_2d_stats_dtype", "complex64")
+    )
+    fft2_2d_stats_store_shifted = bool(
+        fourier_raw.get("fft2_2d_stats_store_shifted", False)
+    )
+
+    # None means "inherit sample_frames"; -1 means "all frames"
+    fft2_2d_stats_sample_frames_raw = fourier_raw.get("fft2_2d_stats_sample_frames", None)
+    if fft2_2d_stats_sample_frames_raw is None:
+        fft2_2d_stats_sample_frames = None
+    else:
+        fft2_2d_stats_sample_frames = int(fft2_2d_stats_sample_frames_raw)
+
     fourier_cfg = FourierConfig(
         enabled=enabled,
         band_scheme=band_scheme,
@@ -166,6 +193,14 @@ def load_experiment_yaml(
         save_curve=save_curve,
         band_names=band_names,
         lambda_edges=lambda_edges,
+
+        # v2.1 additions
+        save_fft2_2d_stats=save_fft2_2d_stats,
+        fft2_2d_stats_what=fft2_2d_stats_what,
+        fft2_2d_stats_avg_over_frames=fft2_2d_stats_avg_over_frames,
+        fft2_2d_stats_dtype=fft2_2d_stats_dtype,
+        fft2_2d_stats_store_shifted=fft2_2d_stats_store_shifted,
+        fft2_2d_stats_sample_frames=fft2_2d_stats_sample_frames,
     )
 
     eval_cfg = EvalConfig(

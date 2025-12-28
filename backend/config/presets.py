@@ -115,6 +115,14 @@ def default_eval_config() -> EvalConfig:
         save_curve=True,
         band_names=("L", "M", "H"),
         lambda_edges=(1.0, 0.25),
+
+        # --- v2.1: L3 额外存盘 2D FFT 统计量（默认关闭；需要时在 notebook/GUI 打开） ---
+        save_fft2_2d_stats=False,
+        fft2_2d_stats_what=("P_true", "P_pred", "P_err", "C_tp", "coh", "H"),
+        fft2_2d_stats_avg_over_frames=True,
+        fft2_2d_stats_dtype="complex64",
+        fft2_2d_stats_store_shifted=False,
+        fft2_2d_stats_sample_frames=None,
     )
 
     return EvalConfig(

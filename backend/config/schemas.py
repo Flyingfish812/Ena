@@ -88,7 +88,7 @@ class FourierConfig:
     """
     eval.fourier.* 频域多尺度配置（仅保留新版本 YAML 写法）。
 
-    YAML 期望结构示例：
+    YAML 期望结构示例（v2.1 增补了 fft2_2d_stats_*）：
       fourier:
         enabled: true
         band_scheme: physical
@@ -106,6 +106,14 @@ class FourierConfig:
         save_curve: true
         band_names: [L, M, H]
         lambda_edges: [1.0, 0.25]
+
+        # --- v2.1: L3 额外存盘：2D FFT 统计量（用于 coherence / transfer function 等新指标） ---
+        save_fft2_2d_stats: false
+        fft2_2d_stats_what: [P_true, P_pred, P_err, C_tp, coh, H]
+        fft2_2d_stats_avg_over_frames: true
+        fft2_2d_stats_dtype: complex64
+        fft2_2d_stats_store_shifted: false
+        fft2_2d_stats_sample_frames: null
     """
     enabled: bool = True
     band_scheme: str = "physical"   # e.g. "physical"
@@ -122,6 +130,33 @@ class FourierConfig:
     save_curve: bool = False
     band_names: Sequence[str] = ("L", "M", "H")
     lambda_edges: Sequence[float] = (1.0, 0.25)
+
+    # v2.1 additions: L3 额外存盘 2D FFT 统计量（默认关闭）
+    # 是否在 L3 产物里保存 2D FFT 的“帧平均统计量”
+    save_fft2_2d_stats: bool = False
+
+    # 保存哪些 2D 统计量（用字符串约定）
+    # - P_true: mean(|F_true|^2)
+    # - P_pred: mean(|F_pred|^2)
+    # - P_err : mean(|F_err|^2)
+    # - C_tp  : mean(F_true * conj(F_pred))  (cross spectrum)
+    # - coh   : |C_tp|^2 / (P_true * P_pred)
+    # - H     : C_tp / (P_true)
+    fft2_2d_stats_what: Sequence[str] = ("P_true", "P_pred", "P_err", "C_tp", "coh", "H")
+
+    # 是否对抽样帧做平均后再保存（推荐 True：体积可控且足够支撑指标）
+    fft2_2d_stats_avg_over_frames: bool = True
+
+    # 2D 统计量写盘 dtype（约定字符串，实际落盘由实现决定）
+    # - "float32"/"float64": 仅适用于纯实数阵列
+    # - "complex64"/"complex128": 适用于互谱/传递函数
+    fft2_2d_stats_dtype: str = "complex64"
+
+    # 是否保存为 fftshift 后的布局（默认 False；建议只在纯可视化需求时 True）
+    fft2_2d_stats_store_shifted: bool = False
+
+    # 2D 统计量计算时的抽帧数（None 表示沿用 sample_frames；-1 表示全量帧）
+    fft2_2d_stats_sample_frames: int | None = None
 
 
 @dataclass
