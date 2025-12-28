@@ -22,6 +22,7 @@ from backend.viz.fourier_plots import (
     plot_kstar_heatmap,
     plot_fourier_band_nrmse_curves,
     plot_energy_spectrum_with_band_edges,
+    plot_energy_spectra_with_band_edges,
     plot_kstar_curve_from_entry,
 )
 
@@ -180,26 +181,59 @@ def mod_fourier_energy_spectrum_legend(ctx: Any, kwargs: Dict[str, Any]) -> Dict
 
     with np.load(pick, allow_pickle=False) as z:
         k_centers = np.asarray(z["k_centers"], dtype=float)
-        E_true_k = np.asarray(z["E_true_k"], dtype=float)
 
-    fig = plot_energy_spectrum_with_band_edges(
+        E_true_k = np.asarray(z["E_true_k"], dtype=float)
+        E_pred_k = np.asarray(z["E_pred_k"], dtype=float) if "E_pred_k" in z.files else None
+        E_err_k  = np.asarray(z["E_err_k"], dtype=float)  if "E_err_k"  in z.files else None
+        E_cross_k = np.asarray(z["E_cross_k"], dtype=float) if "E_cross_k" in z.files else None
+
+    grid_meta = dict(getattr(fourier_cfg, "grid_meta", {}) or {})
+
+    # ---- Fig A: keep the original "true spectrum + edges" ----
+    fig_true = plot_energy_spectrum_with_band_edges(
         k_centers=k_centers,
         energy_k=E_true_k,
         k_edges=k_edges_interior,
         band_names=band_names,
-        grid_meta=dict(getattr(fourier_cfg, "grid_meta", {}) or {}),
-        title=str(kwargs.get("title", "Energy spectrum E(k) with band edges")),
+        grid_meta=grid_meta,
+        title=str(kwargs.get("title_true", "True energy spectrum E_true(k) with band edges")),
     )
-    if fig is None:
-        return {"fig_paths": []}
+
+    # ---- Fig B: comparison plot (true/pred/err/cross) ----
+    curves = {"E_true_k": E_true_k}
+    if E_pred_k is not None:
+        curves["E_pred_k"] = E_pred_k
+    if E_err_k is not None:
+        curves["E_err_k"] = E_err_k
+    if E_cross_k is not None:
+        curves["E_cross_k"] = E_cross_k  # function will plot abs if needed on log axis
+
+    fig_cmp = plot_energy_spectra_with_band_edges(
+        k_centers=k_centers,
+        curves=curves,
+        k_edges=k_edges_interior,
+        band_names=band_names,
+        grid_meta=grid_meta,
+        title=str(kwargs.get("title_cmp", "Energy spectra comparison with band edges")),
+    )
 
     assert ctx.paths is not None
     out_dir = Path(ctx.paths.l4_root) / "fourier"
     _ensure_dir(out_dir)
-    png = out_dir / "energy_spectrum_with_band_edges.png"
-    _save_fig(fig, png, dpi=int(kwargs.get("dpi", 180)))
 
-    return {"fig_paths": [str(png)], "source_npz": str(pick)}
+    fig_paths: List[str] = []
+
+    if fig_true is not None:
+        png_true = out_dir / "energy_spectrum_true_with_band_edges.png"
+        _save_fig(fig_true, png_true, dpi=int(kwargs.get("dpi", 180)))
+        fig_paths.append(str(png_true))
+
+    if fig_cmp is not None:
+        png_cmp = out_dir / "energy_spectrum_compare_with_band_edges.png"
+        _save_fig(fig_cmp, png_cmp, dpi=int(kwargs.get("dpi", 180)))
+        fig_paths.append(str(png_cmp))
+
+    return {"fig_paths": fig_paths, "source_npz": str(pick)}
 
 
 # ----------------------------

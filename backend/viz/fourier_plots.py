@@ -218,6 +218,248 @@ def plot_energy_spectrum_with_band_edges(
     return fig
 
 
+def plot_energy_spectra_with_band_edges(
+    k_centers: np.ndarray,
+    curves: Dict[str, np.ndarray],
+    *,
+    k_edges: Sequence[float] | None = None,
+    band_names: Sequence[str] = ("L", "M", "H"),
+    grid_meta: dict | None = None,
+    title: str = "Energy spectra E(k) with band edges",
+    xlabel: str = "wavenumber k (cycles / length unit)",
+    ylabel: str = "E(k)",
+    loglog: bool = True,
+    eps: float = 1e-12,
+    abs_keys: Sequence[str] = ("E_cross_k", "cross", "E_cross", "E_cross_abs"),
+    style_map: Dict[str, dict] | None = None,
+    mark_every: int = 6,
+    zorder_map: Dict[str, int] | None = None,
+) -> Optional[plt.Figure]:
+    """
+    多曲线版本：在同一张图上画多条 E(k)，并叠加 band edges / 顶轴 λ=1/k。
+
+    重要：同步移植单曲线版本的“floor pile-up”剔除逻辑，避免低 k 段出现尖峰/断崖。
+    """
+
+    k0 = np.asarray(k_centers, dtype=float).reshape(-1)
+    if k0.size == 0:
+        return None
+
+    def _drop_floor_pileup_mask(e_valid: np.ndarray) -> np.ndarray:
+        """
+        输入：已经筛过 finite 的 e（且若 loglog=True 则 e>0）。
+        输出：同长度 bool mask，True 表示保留。
+        逻辑与 plot_energy_spectrum_with_band_edges 保持一致。
+        """
+        if e_valid.size == 0:
+            return np.zeros((0,), dtype=bool)
+
+        # robust floor candidate
+        floor = float(np.nanpercentile(e_valid, 0.5))
+        close = np.abs(e_valid - floor) <= (1e-12 + 1e-6 * max(1.0, abs(floor)))
+
+        # "many points at floor" heuristic
+        if close.sum() >= max(16, int(0.2 * e_valid.size)):
+            keep = ~close
+            return keep
+        return np.ones_like(e_valid, dtype=bool)
+
+    def _sanitize_one_curve(name: str, arr: np.ndarray) -> tuple[str, np.ndarray, np.ndarray] | None:
+        """
+        返回：(label, k_plot, e_plot)；若无可用点，返回 None。
+        """
+        if arr is None:
+            return None
+
+        k = np.asarray(k0, dtype=float).reshape(-1)
+        e = np.asarray(arr, dtype=float).reshape(-1)
+        if e.size != k.size:
+            return None
+
+        # ---- abs handling (for log + cross) ----
+        needs_abs = False
+        if loglog:
+            if np.any(e < 0):
+                needs_abs = True
+            if any(key.lower() in str(name).lower() for key in abs_keys):
+                needs_abs = True
+
+        label = str(name)
+        if needs_abs:
+            e = np.abs(e)
+            label = f"|{label}|"
+
+        # ---- base validity mask ----
+        m = np.isfinite(k) & np.isfinite(e)
+        if loglog:
+            m &= (k > 0) & (e > 0)
+
+        if not m.any():
+            return None
+
+        # ---- floor pile-up removal (same spirit as single-curve) ----
+        e_use = e[m]
+        keep_use = _drop_floor_pileup_mask(e_use)
+
+        if keep_use.size != e_use.size:
+            return None
+
+        # map back to full mask
+        idx = np.where(m)[0]
+        m2 = np.ones_like(m, dtype=bool)
+        m2[idx[~keep_use]] = False
+        m &= m2
+
+        k = k[m]
+        e = e[m]
+        if k.size == 0:
+            return None
+
+        # avoid zeros for log scale (keep consistent with your multi-curve behavior)
+        if loglog:
+            e = np.maximum(e, eps)
+
+        return label, k, e
+
+    # ---- build cleaned curves ----
+    cleaned: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for name, arr in (curves or {}).items():
+        res = _sanitize_one_curve(str(name), arr)
+        if res is not None:
+            cleaned.append(res)
+
+    if not cleaned:
+        return None
+
+    # ---- plot ----
+    fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.2))
+
+    # --- default styles to make overlaps visible (color + linestyle + marker + alpha) ---
+    default_style_map: Dict[str, dict] = {
+        "E_true_k": {"linewidth": 2.6, "linestyle": "-",  "marker": None, "alpha": 0.95},
+        "E_pred_k": {"linewidth": 2.2, "linestyle": "--", "marker": "o",  "alpha": 0.85},
+        "E_err_k":  {"linewidth": 2.2, "linestyle": "-.", "marker": "s",  "alpha": 0.85},
+        "|E_cross_k|": {"linewidth": 2.2, "linestyle": ":", "marker": "x", "alpha": 0.85},
+    }
+    # allow caller override
+    if style_map:
+        default_style_map.update({str(k): dict(v) for k, v in style_map.items()})
+
+    # higher zorder for key curves so they don't hide under others
+    default_zorder_map: Dict[str, int] = {
+        "E_true_k": 4,
+        "E_pred_k": 3,
+        "E_err_k":  2,
+        "|E_cross_k|": 1,
+    }
+    if zorder_map:
+        default_zorder_map.update({str(k): int(v) for k, v in zorder_map.items()})
+
+    # When curves overlap heavily, markers are the quickest tell.
+    # Use markevery so markers don't saturate the plot.
+    for label, k, e in cleaned:
+        st = dict(default_style_map.get(label, {}))
+
+        # if marker is specified, thin it out
+        mk = st.get("marker", None)
+        if mk is not None:
+            st.setdefault("markersize", 4.2)
+            st.setdefault("markevery", max(1, int(mark_every)))
+            st.setdefault("markerfacecolor", "none")  # hollow markers: overlap-friendly
+            st.setdefault("markeredgewidth", 0.9)
+
+        st.setdefault("linewidth", 2.0)
+        st.setdefault("alpha", 0.9)
+        st.setdefault("zorder", default_zorder_map.get(label, 1))
+
+        # add slight antialias + capstyle for visibility
+        st.setdefault("solid_capstyle", "round")
+        st.setdefault("dash_capstyle", "round")
+
+        ax.plot(k, e, label=label, **st)
+
+    if loglog:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # ---- top axis: wavelength λ = 1/k ----
+    def k_to_lam(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    def lam_to_k(x):
+        x = np.asarray(x, dtype=float)
+        return 1.0 / np.maximum(x, eps)
+
+    secax = ax.secondary_xaxis("top", functions=(k_to_lam, lam_to_k))
+    secax.set_xlabel("wavelength λ (length unit)")
+
+    # optional note: λ/D
+    g = dict(grid_meta or {})
+    D = g.get("obstacle_diameter", None)
+    if D is not None and float(D) > 0:
+        secax.set_xlabel("wavelength λ (length unit)   [λ/D shown in band labels]")
+
+    # ---- band edges + labels (unchanged) ----
+    if k_edges is not None:
+        edges = sorted([float(v) for v in k_edges if v is not None and np.isfinite(v) and v > 0])
+        for ke in edges:
+            ax.axvline(ke, linestyle="--", linewidth=1.0)
+
+        x_min, x_max = ax.get_xlim()
+        segs = [max(x_min, eps)] + [ke for ke in edges if x_min < ke < x_max] + [x_max]
+        nb = max(1, len(segs) - 1)
+
+        for i in range(nb):
+            a, b = segs[i], segs[i + 1]
+            if not (np.isfinite(a) and np.isfinite(b) and a > 0 and b > 0 and b > a):
+                continue
+
+            xm = np.sqrt(a * b)
+            name = band_names[i] if i < len(band_names) else f"B{i}"
+
+            lam_hi = 1.0 / max(a, eps)
+            lam_lo = 1.0 / max(b, eps)
+
+            if i == 0:
+                lam_text = f"λ ≥ {lam_lo:.3g}"
+            elif i == nb - 1:
+                lam_text = f"λ < {lam_hi:.3g}"
+            else:
+                lam_text = f"{lam_lo:.3g} ≤ λ < {lam_hi:.3g}"
+
+            if D is not None and float(D) > 0:
+                Df = float(D)
+                if i == 0:
+                    lamD_text = f"λ/D ≥ {lam_lo/Df:.3g}"
+                elif i == nb - 1:
+                    lamD_text = f"λ/D < {lam_hi/Df:.3g}"
+                else:
+                    lamD_text = f"{lam_lo/Df:.3g} ≤ λ/D < {lam_hi/Df:.3g}"
+                label = f"{name}\n({lam_text})\n({lamD_text})"
+            else:
+                label = f"{name}\n({lam_text})"
+
+            y_top = ax.get_ylim()[1]
+            ax.text(xm, y_top, label, ha="center", va="top")
+
+    ax.legend(
+        fontsize=9,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0.0,
+        frameon=True,
+    )
+    fig.subplots_adjust(right=0.78)
+    fig.tight_layout()
+    return fig
+
+
 def plot_kstar_curve_from_entry(
     entry: Dict[str, Any],
     *,
