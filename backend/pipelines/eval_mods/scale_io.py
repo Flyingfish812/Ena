@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Sequence
 
 import numpy as np
 
@@ -31,6 +31,13 @@ class ScaleL3Entry:
     mask_rate: float
     noise_sigma: float
     l3_fft_path: str
+
+_1D_KEY_ALIASES: Dict[str, List[str]] = {
+    "k_centers": ["k_centers", "k_center", "k"],
+    "rho_k": ["rho_k", "rho", "rho_profile"],
+    "coh_k": ["coh_k", "coherence_k", "coherence"],
+    "snr_k": ["snr_k", "SNR_k", "log10SNR_k"],
+}
 
 # Accept a few common aliases to be tolerant to earlier experiments.
 _2D_KEY_ALIASES: Dict[str, List[str]] = {
@@ -256,3 +263,139 @@ def snr_from_l3_1d_energy(
     if log10:
         snr = np.log10(np.maximum(snr, float(eps)))
     return k, snr
+
+
+def rho_from_l3_1d(
+    z: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load rho_k from L3 if present:
+      - returns (k_centers, rho_k)
+    """
+    if "k_centers" not in z:
+        raise KeyError("L3 npz missing k_centers; cannot load rho_k.")
+    if "rho_k" not in z:
+        raise KeyError("L3 npz missing rho_k; cannot load rho_k.")
+    k = np.asarray(z["k_centers"], dtype=float).reshape(-1)
+    rho = np.asarray(z["rho_k"], dtype=float).reshape(-1)
+    return k, rho
+
+
+def score_from_l3_1d_energy(
+    z,
+    *,
+    eps: float = 1e-12,
+    clip_rho_to_01: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build (k, rho(k), gain(k), score(k)) from existing L3 1D spectra.
+
+    Required keys:
+      - k_centers
+      - E_true_k, E_pred_k, E_cross_k
+    Optional:
+      - rho_k (if present, use it; otherwise compute)
+
+    Definitions:
+      rho(k)  = E_cross / sqrt(E_true * E_pred)     (clipped to [-1,1])
+      gain(k) = sqrt(E_pred / E_true)               (>=0)
+      score(k)= clip(rho,0,1) * exp(-abs(log(gain)))  in [0,1]
+    """
+    if "k_centers" not in z:
+        raise KeyError("L3 npz missing k_centers; cannot compute score.")
+    for key in ("E_true_k", "E_pred_k", "E_cross_k"):
+        if key not in z:
+            raise KeyError(f"L3 npz missing {key}; cannot compute score.")
+
+    k = np.asarray(z["k_centers"], dtype=float).reshape(-1)
+    Et = np.asarray(z["E_true_k"], dtype=float).reshape(-1)
+    Ep = np.asarray(z["E_pred_k"], dtype=float).reshape(-1)
+    Ec = np.asarray(z["E_cross_k"], dtype=float).reshape(-1)
+
+    if not (k.size == Et.size == Ep.size == Ec.size):
+        raise ValueError("L3 1D arrays shape mismatch; cannot compute score.")
+
+    # rho
+    if "rho_k" in z:
+        rho = np.asarray(z["rho_k"], dtype=float).reshape(-1)
+        if rho.size != k.size:
+            raise ValueError("rho_k shape mismatch with k_centers.")
+    else:
+        denom = np.sqrt(np.maximum(Et, eps) * np.maximum(Ep, eps))
+        rho = Ec / np.maximum(denom, eps)
+
+    rho = np.clip(rho, -1.0, 1.0)
+
+    # gain: amplitude ratio (symmetric on log-scale)
+    gain = np.sqrt(np.maximum(Ep, eps) / np.maximum(Et, eps))
+
+    # score
+    rho01 = np.clip(rho, 0.0, 1.0) if clip_rho_to_01 else rho
+    score = rho01 * np.exp(-np.abs(np.log(np.maximum(gain, eps))))
+    score = np.clip(score, 0.0, 1.0)
+
+    return k, rho, gain, score
+
+
+def _as_real_power(x: np.ndarray) -> np.ndarray:
+    """
+    L3 may store power-like arrays as complex (complex64) by accident or by design.
+    For power spectra, we want a non-negative real magnitude.
+    Strategy:
+      - if complex: use real part if imag is negligible; else use abs.
+      - if real: keep.
+    """
+    a = np.asarray(x)
+    if np.iscomplexobj(a):
+        im = np.abs(np.imag(a))
+        re = np.abs(np.real(a))
+        # heuristic: if imag is tiny relative to real, treat as numerical noise
+        if np.nanmax(im) <= 1e-6 * max(1.0, float(np.nanmax(re))):
+            a = np.real(a)
+        else:
+            a = np.abs(a)
+    return np.asarray(a, dtype=float)
+
+
+def derive_rho2d_from_stats(
+    *,
+    P_true2d: np.ndarray,
+    P_pred2d: np.ndarray,
+    C_tp2d: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    rho2d = Re(C_tp) / sqrt(P_true * P_pred)
+    """
+    Pt = _as_real_power(P_true2d)
+    Pp = _as_real_power(P_pred2d)
+    C = np.asarray(C_tp2d)
+    num = np.real(C).astype(float)
+    den = np.sqrt(np.maximum(Pt, 0.0) * np.maximum(Pp, 0.0)) + float(eps)
+    rho2d = num / den
+    # clip to [-1,1] to avoid tiny numerical overshoots
+    return np.clip(rho2d, -1.0, 1.0)
+
+
+def derive_gain2d_from_stats(
+    *,
+    P_true2d: np.ndarray,
+    C_tp2d: np.ndarray,
+    eps: float = 1e-12,
+    mode: str = "mag_over_true",  # or "re_over_true"
+) -> np.ndarray:
+    """
+    A simple transfer-amplitude diagnostic.
+    - mag_over_true: gain2d = |C_tp| / (P_true + eps)
+    - re_over_true : gain2d = Re(C_tp) / (P_true + eps)  (signed)
+    """
+    Pt = _as_real_power(P_true2d)
+    C = np.asarray(C_tp2d)
+    if mode == "mag_over_true":
+        num = np.abs(C).astype(float)
+    elif mode == "re_over_true":
+        num = np.real(C).astype(float)
+    else:
+        raise ValueError("mode must be 'mag_over_true' or 're_over_true'")
+    den = Pt + float(eps)
+    return num / den

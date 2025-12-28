@@ -367,3 +367,71 @@ def plot_cutoff_heatmap(
     ax_info.text(0.0, 1.0, "\n".join(info), ha="left", va="top", fontsize=10)
 
     return fig
+
+
+def plot_kspace_heatmap(
+    field2d: np.ndarray,
+    *,
+    kx: np.ndarray | None = None,
+    ky: np.ndarray | None = None,
+    title: str = "k-space heatmap",
+    cbar_label: str = "value",
+    grid_meta: dict | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    symmetric: bool = False,   # good for rho2d
+    show_nyquist_box: bool = True,
+) -> Optional[plt.Figure]:
+    """
+    Generic k-space heatmap for coh2d / rho2d / gain2d.
+    If kx/ky provided (meshgrid-like arrays), use them to set extent in axes units.
+    Otherwise fall back to pixel coordinates.
+    """
+    a = np.asarray(field2d)
+    if a.size == 0:
+        return None
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.8))
+    ax.set_title(title)
+    ax.set_xlabel("$k_x$")
+    ax.set_ylabel("$k_y$")
+
+    extent = None
+    if kx is not None and ky is not None:
+        KX = np.asarray(kx, dtype=float)
+        KY = np.asarray(ky, dtype=float)
+        if KX.shape == a.shape and KY.shape == a.shape:
+            extent = [float(np.nanmin(KX)), float(np.nanmax(KX)),
+                      float(np.nanmin(KY)), float(np.nanmax(KY))]
+
+    if symmetric:
+        m = np.nanmax(np.abs(a))
+        if np.isfinite(m) and m > 0:
+            vmin = -m if vmin is None else vmin
+            vmax = +m if vmax is None else vmax
+
+    im = ax.imshow(
+        a,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.grid(False)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.92, pad=0.02)
+    cbar.set_label(cbar_label)
+
+    # optional Nyquist box (very lightweight and robust)
+    if show_nyquist_box and grid_meta is not None and extent is not None:
+        dx, dy, angular = _resolve_dxdyangular(grid_meta)
+        kN, _ = _nyquist_k(dx, dy, angular)
+        if kN is not None and np.isfinite(kN):
+            # draw a square box at +/- kN in both axes
+            ax.axvline(+kN, linestyle=":", linewidth=1.0, alpha=0.8)
+            ax.axvline(-kN, linestyle=":", linewidth=1.0, alpha=0.8)
+            ax.axhline(+kN, linestyle=":", linewidth=1.0, alpha=0.8)
+            ax.axhline(-kN, linestyle=":", linewidth=1.0, alpha=0.8)
+
+    fig.tight_layout()
+    return fig
