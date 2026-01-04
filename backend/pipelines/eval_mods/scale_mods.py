@@ -444,7 +444,7 @@ def mod_scale_cutoff_heatmap(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     for it in items:
         mr = float(it["mask_rate"])
         ns = float(it["noise_sigma"])
-        val = float(it.get("k_eff", float("nan")))
+        val = float(it.get("k_eff") or float("nan"))
         yi = nss.index(ns)
         xi = mrs.index(mr)
         mat[yi, xi] = val

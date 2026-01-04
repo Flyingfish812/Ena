@@ -2,13 +2,16 @@ data:
   nc_path: data/cylinder2d.nc
   var_keys: ["u", "v"]
   cache_dir: null
+
 pod:
   r: 128
   center: true
   save_dir: artifacts/pod
+
 eval:
   mask_rates: [0.0001, 0.0005, 0.001, 0.002, 0.005]
   noise_sigmas: [0, 0.001, 0.01, 0.1]
+
   pod_bands:
     L1: [0, 16]
     L2: [16, 32]
@@ -18,33 +21,64 @@ eval:
     H1: [80, 96]
     H2: [96, 112]
     H3: [112, 128]
+
   centered_pod: true
   save_dir: artifacts/eval
+
   fourier:
     enabled: true
     band_scheme: physical
+
     grid_meta:
       Lx: 8.0
       Ly: 1.0
       obstacle_diameter: 0.125
       dx: 0.0125
       dy: 0.0125
-      angular: false      # angular: true 表示 rad/length，需要 2π 的换算，除非全链路都统一用角波数
-    binning: log    # linear | log
+      angular: false   # false: cycles/length; true: rad/length (pi/dx Nyquist)
+
+    binning: log
     num_bins: 64
-    k_min_eval: 0.25    # 仅计算 k >= k_min_eval 的 NRMSE 曲线
-    sample_frames: 128
+    k_min_eval: 0.7
+    sample_frames: 128          # -1 表示全帧（如果你的实现支持；否则改成 1501 或其它整数）
     kstar_threshold: 1.0
     mean_mode_true: global
     save_curve: true
+
     band_names: [Background, Big, Medium, Small, Tiny]
-    lambda_edges: [1.0, 0.5, 0.25, 0.125]   # 物理尺度切分：用波长 λ 的分界（length unit）.例：λ_LM=1.0（一个通道高度级别），λ_MH=0.25（约 2D）
+    lambda_edges: [1.0, 0.5, 0.25, 0.125]
+
+    # ===== v2.1: 2D FFT stats saving options =====
+    save_fft2_2d_stats: true
+
+    # what 支持的 token 以代码实现为准；loader 默认就是这 6 个
+    # - P_true: |F_true|^2 (2D power)
+    # - P_pred: |F_pred|^2
+    # - P_err : |F_pred - F_true|^2
+    # - C_tp  : F_true * conj(F_pred) (cross spectrum)
+    # - coh   : |C_tp|^2 / (P_true * P_pred + eps) (magnitude-squared coherence)
+    # - H     : (若你实现了 transfer / gain 之类的额外量；否则可以先删掉)
+    fft2_2d_stats_what: ["P_true", "P_pred", "P_err", "C_tp", "coh", "H"]
+
+    # True: across frames accumulate then average (推荐：得到稳定的统计量)
+    # False: 可能会存每帧（体积会膨胀，不建议）
+    fft2_2d_stats_avg_over_frames: true
+
+    # complex64 够用且省空间；如果你实现里 P_* 最终是 float32，也可以用 float32
+    fft2_2d_stats_dtype: complex64
+
+    # shifted 更适合做 2D 谱图可视化；统计径向 bin 两者都行，但要全链路统一
+    fft2_2d_stats_store_shifted: true
+
+    # None 表示继承 sample_frames；-1 表示全帧；整数表示抽样数量
+    fft2_2d_stats_sample_frames: null
+
 train:
-  mask_rate: 0.0004  # <- 没用的，可以删
-  noise_sigma: 0.1
+  # 对照基线，不设置任何噪声，确认所有流程正确
+  noise_sigma: 0.0
   hidden_dims: [64, 64]
   lr: 0.001
   batch_size: 64
-  max_epochs: 50
+  max_epochs: 500
   device: cuda
   save_dir: artifacts/nn
