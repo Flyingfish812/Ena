@@ -6,6 +6,7 @@ from typing import Dict, Any, Iterable, Sequence, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from backend.fourier.filters import make_wavenumber_grid, fft2_field, ifft2_field
 
 def _ensure_hw(x: np.ndarray, *, channel: int = 0) -> np.ndarray:
@@ -1415,9 +1416,11 @@ def plot_fourier_band_nrmse_curves(
     """
     画频域 band NRMSE 的两类曲线：
     - 固定 σ：band_nrmse vs p
-    - 固定 p：band_nrmse vs σ
+    - 固定 p：band_nrmse vs σ（注意包含 σ=0）
     需要列名: fourier_band_nrmse_<band>
+    需要列: mask_rate, noise_sigma
     """
+
     figs: Dict[str, Optional[plt.Figure]] = {
         "fig_fourier_band_vs_mask_linear": None,
         "fig_fourier_band_vs_mask_mlp": None,
@@ -1425,38 +1428,139 @@ def plot_fourier_band_nrmse_curves(
         "fig_fourier_band_vs_noise_mlp": None,
     }
 
+    band_names = tuple(band_names)
+
     def _has_cols(df) -> bool:
         if df is None or len(df) == 0:
+            return False
+        need = {"mask_rate", "noise_sigma"}
+        if not need.issubset(set(df.columns)):
             return False
         for b in band_names:
             if f"fourier_band_nrmse_{b}" not in df.columns:
                 return False
         return True
 
+    # ---------- 样式生成：band->颜色（动态），condition->线型/透明度（动态） ----------
+    def _band_color_map(names: Sequence[str]):
+        # 用 tab20 / tab20b / tab20c 拼一个更长的离散色表，band 多的时候也尽量不撞色
+        # 颜色只负责区分 band，不再承担 σ/p 的区分
+        cmaps = [plt.get_cmap("tab20"), plt.get_cmap("tab20b"), plt.get_cmap("tab20c")]
+        palette = []
+        for cmap in cmaps:
+            # tab20 系列本质是离散表，取它的 N 个色
+            for i in range(getattr(cmap, "N", 20)):
+                palette.append(cmap(i))
+        if len(palette) == 0:
+            palette = [plt.get_cmap("tab10")(i) for i in range(10)]
+
+        m = {}
+        for i, b in enumerate(names):
+            m[b] = palette[i % len(palette)]
+        return m
+
+    def _linestyle_cycle(n: int):
+        # 比四种更丰富的线型集合，避免 σ/p 多时线型也撞
+        base = [
+            "-",
+            "--",
+            "-.",
+            ":",
+            (0, (5, 1)),          # long dash
+            (0, (3, 1)),          # medium dash
+            (0, (1, 1)),          # dotted
+            (0, (5, 1, 1, 1)),    # dash-dot-dash
+            (0, (3, 1, 1, 1)),
+            (0, (2, 1, 2, 1)),    # equal dash
+        ]
+        out = []
+        for i in range(n):
+            out.append(base[i % len(base)])
+        return out
+
+    def _alpha_rank(i: int, n: int) -> float:
+        # 透明度轻微分级：在同一 band 色系下区分不同 σ/p
+        if n <= 1:
+            return 0.90
+        return float(0.35 + 0.55 * (i / (n - 1)))  # 0.35~0.90
+
+    band_colors = _band_color_map(band_names)
+
+    # ---------- 图例：拆成 band（颜色）+ 条件（线型）两块 ----------
+    def _add_split_legends(ax, *, cond_title: str, cond_items: Sequence[tuple[str, object]]):
+        # band legend
+        band_handles = [
+            Line2D([0], [0], color=band_colors[b], lw=2.2, label=f"band={b}")
+            for b in band_names
+        ]
+        leg1 = ax.legend(
+            handles=band_handles,
+            title="Bands",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+            title_fontsize=9,
+        )
+        ax.add_artist(leg1)
+
+        # condition legend (σ or p)
+        cond_handles = [
+            Line2D([0], [0], color="k", lw=2.0, linestyle=ls, label=lab)
+            for (lab, ls) in cond_items
+        ]
+        ax.legend(
+            handles=cond_handles,
+            title=cond_title,
+            loc="lower left",
+            bbox_to_anchor=(1.02, 0.0),
+            borderaxespad=0.0,
+            fontsize=8,
+            title_fontsize=9,
+        )
+
+    # ---------- 绘制：NRMSE vs mask_rate ----------
     def _plot_vs_mask(df, model: str) -> Optional[plt.Figure]:
         if not _has_cols(df):
             return None
 
-        # 每个 sigma 一条曲线；每条曲线内部对 band 画多条
         sigmas = sorted(set(df["noise_sigma"].tolist()))
         ps = sorted(set(df["mask_rate"].tolist()))
         if not sigmas or not ps:
             return None
 
-        fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.2))
-        for s in sigmas:
+        linestyles = _linestyle_cycle(len(sigmas))
+
+        fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.3))
+
+        # σ 用线型/透明度编码；band 用颜色编码
+        for i_s, s in enumerate(sigmas):
             sub = df[df["noise_sigma"] == s].sort_values("mask_rate")
             if len(sub) == 0:
                 continue
+
+            ls = linestyles[i_s]
+            alpha = _alpha_rank(i_s, len(sigmas))
+
             for b in band_names:
                 y = sub[f"fourier_band_nrmse_{b}"].to_numpy()
                 x = sub["mask_rate"].to_numpy()
+
+                # mask_rate 必须 >0 才能 log；y 也必须 >0 才能 log
                 m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-                x = x[m]
-                y = y[m]
-                if x.size == 0:
+                if not m.any():
                     continue
-                ax.plot(x, y, marker="o", linewidth=1.5, label=f"σ={s:.3g}  band={b}")
+
+                ax.plot(
+                    x[m],
+                    y[m],
+                    color=band_colors[b],
+                    linestyle=ls,
+                    alpha=alpha,
+                    marker="o",
+                    markersize=3.2,
+                    linewidth=1.6,
+                )
 
         ax.set_xscale("log")
         ax.set_yscale("log")
@@ -1464,16 +1568,15 @@ def plot_fourier_band_nrmse_curves(
         ax.set_ylabel("Fourier band NRMSE (log)")
         ax.set_title(f"Fourier band NRMSE vs mask_rate ({model})")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend(
-            fontsize=8,
-            loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
-            borderaxespad=0.0,
-        )
 
-        fig.subplots_adjust(right=0.78)
+        # 拆分图例：band / σ
+        cond_items = [(f"σ={s:.3g}", linestyles[i]) for i, s in enumerate(sigmas)]
+        _add_split_legends(ax, cond_title="Noise σ", cond_items=cond_items)
+
+        fig.subplots_adjust(right=0.72)
         return fig
 
+    # ---------- 绘制：NRMSE vs noise_sigma（包含 σ=0） ----------
     def _plot_vs_noise(df, model: str) -> Optional[plt.Figure]:
         if not _has_cols(df):
             return None
@@ -1483,35 +1586,75 @@ def plot_fourier_band_nrmse_curves(
         if not ps or not sigmas:
             return None
 
-        fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.2))
-        for p in ps:
+        linestyles = _linestyle_cycle(len(ps))
+
+        # symlog 的线性阈值：用最小的正 sigma / 10，避免 0 附近挤成一团
+        pos_sigmas = [s for s in sigmas if np.isfinite(s) and s > 0]
+        if len(pos_sigmas) > 0:
+            linthresh = float(min(pos_sigmas) / 10.0)
+        else:
+            linthresh = 1e-6  # 兜底
+
+        fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.3))
+
+        for i_p, p in enumerate(ps):
             sub = df[df["mask_rate"] == p].sort_values("noise_sigma")
             if len(sub) == 0:
                 continue
+
+            ls = linestyles[i_p]
+            alpha = _alpha_rank(i_p, len(ps))
+
             for b in band_names:
                 y = sub[f"fourier_band_nrmse_{b}"].to_numpy()
                 x = sub["noise_sigma"].to_numpy()
-                m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-                x = x[m]
-                y = y[m]
-                if x.size == 0:
-                    continue
-                ax.plot(x, y, marker="o", linewidth=1.5, label=f"p={p:.3g}  band={b}")
 
-        ax.set_xscale("log")
+                # noise_sigma 允许 ==0；y 仍需 >0 才能 log
+                m = np.isfinite(x) & np.isfinite(y) & (x >= 0) & (y > 0)
+                if not m.any():
+                    continue
+
+                ax.plot(
+                    x[m],
+                    y[m],
+                    color=band_colors[b],
+                    linestyle=ls,
+                    alpha=alpha,
+                    marker="o",
+                    markersize=3.2,
+                    linewidth=1.6,
+                )
+
+        # 关键：x 轴用 symlog，让 0 和 1e-3/1e-2/1e-1 同屏可读
+        ax.set_xscale("symlog", linthresh=linthresh, linscale=1.0)
         ax.set_yscale("log")
-        ax.set_xlabel("noise_sigma σ (log)")
+        ax.set_xlabel("noise_sigma σ (symlog, includes 0)")
         ax.set_ylabel("Fourier band NRMSE (log)")
         ax.set_title(f"Fourier band NRMSE vs noise_sigma ({model})")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend(
-            fontsize=8,
-            loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
-            borderaxespad=0.0,
-        )
 
-        fig.subplots_adjust(right=0.78)
+        # 明确把 σ=0、以及常见正数刻度放出来（不依赖 matplotlib 自己猜）
+        # 这里用当前数据里的 sigma 集合优先；再补你提到的典型刻度
+        preferred = [0.0, 1e-3, 1e-2, 1e-1]
+        ticks = []
+        seen = set()
+        for v in preferred + sigmas:
+            if not np.isfinite(v) or v < 0:
+                continue
+            key = float(v)
+            if key in seen:
+                continue
+            seen.add(key)
+            ticks.append(key)
+        ticks = sorted(ticks)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(["0" if t == 0 else f"{t:.0e}" for t in ticks])
+
+        # 拆分图例：band / p
+        cond_items = [(f"p={p:.3g}", linestyles[i]) for i, p in enumerate(ps)]
+        _add_split_legends(ax, cond_title="Mask p", cond_items=cond_items)
+
+        fig.subplots_adjust(right=0.72)
         return fig
 
     figs["fig_fourier_band_vs_mask_linear"] = _plot_vs_mask(df_lin, "linear")

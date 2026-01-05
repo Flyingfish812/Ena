@@ -312,45 +312,124 @@ def plot_recon_triptych(
     *,
     title: str = "reconstruction (pred/true/err)",
     mask_hw: np.ndarray | None = None,
-    show_mask: bool = False,
+    show_mask: bool = True,
     cmap: str = "RdBu_r",
+    main_q: float = 99.5,      # 主场稳健分位数
+    err_scale: float = 1.0,    # 误差色标相对主场的缩放（默认同尺度）
 ) -> plt.Figure:
     """
-    空间域三联图：pred / true / err，共用 colorbar。
-    （不画 input，因为你这次明确说 input 没意义）
+    空间域三联图：pred / true / err（pred-true）。
+
+    对齐 plot_recon_quadruple 的风格：
+      - pred/true 做「减 target 空间均值」的中心化
+      - 主场色标：由 target 扰动的稳健分位数设定，且对称于 0
+      - 误差色标：默认与主场同尺度（err_scale 可调）
+      - 底部两条短而细的横向 colorbar（主场 + 误差）
+      - mask 用 scatter 画在 true（中间）图上
     """
     x_pred_hw = np.asarray(x_pred_hw)
     x_true_hw = np.asarray(x_true_hw)
-    x_err_hw = x_pred_hw - x_true_hw
 
-    # color range：pred & true 用同一套；err 单独范围也行，但你要共用 colorbar => 统一
-    vmin = float(np.nanmin([x_pred_hw.min(), x_true_hw.min(), x_err_hw.min()]))
-    vmax = float(np.nanmax([x_pred_hw.max(), x_true_hw.max(), x_err_hw.max()]))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-        vmin, vmax = -1.0, 1.0
+    # ---------- 中心化：围绕 target 均值 ----------
+    mu_tg = float(np.nanmean(x_true_hw))
+    if not np.isfinite(mu_tg):
+        mu_tg = 0.0
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
-    ims = []
-    ims.append(axes[0].imshow(x_pred_hw, vmin=vmin, vmax=vmax, cmap=cmap))
-    axes[0].set_title("pred")
-    ims.append(axes[1].imshow(x_true_hw, vmin=vmin, vmax=vmax, cmap=cmap))
-    axes[1].set_title("true")
-    ims.append(axes[2].imshow(x_err_hw, vmin=vmin, vmax=vmax, cmap=cmap))
-    axes[2].set_title("err (pred-true)")
+    x_pred_c = x_pred_hw - mu_tg
+    x_true_c = x_true_hw - mu_tg
+    x_err = x_pred_hw - x_true_hw  # 注意：误差不需要再减均值，(pred-mu)-(true-mu)=pred-true
+
+    # ---------- 主场色标：target 扰动稳健分位数，对称于 0 ----------
+    vals_tg = x_true_c.ravel()
+    vals_tg = vals_tg[np.isfinite(vals_tg)]
+    if vals_tg.size == 0:
+        max_abs_main = 1.0
+    else:
+        max_abs_main = float(np.percentile(np.abs(vals_tg), main_q))
+        if not np.isfinite(max_abs_main) or max_abs_main == 0.0:
+            max_abs_main = 1.0
+    vmin_main, vmax_main = -max_abs_main, max_abs_main
+
+    # ---------- 误差色标：与主场同尺度（可调倍数） ----------
+    max_abs_err = max_abs_main * float(err_scale)
+    if not np.isfinite(max_abs_err) or max_abs_err == 0.0:
+        max_abs_err = 1.0
+    vmin_err, vmax_err = -max_abs_err, max_abs_err
+
+    # ---------- 三联图布局：对齐 quadruple 的“扁平风格” ----------
+    fig, axes = plt.subplots(1, 3, figsize=(10.0, 2.4))
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.78, bottom=0.32, wspace=0.25)
+
+    im0 = axes[0].imshow(
+        x_pred_c, origin="lower", cmap=cmap, vmin=vmin_main, vmax=vmax_main
+    )
+    axes[0].set_title("Output (reconstructed)", fontsize=9)
+
+    im1 = axes[1].imshow(
+        x_true_c, origin="lower", cmap=cmap, vmin=vmin_main, vmax=vmax_main
+    )
+    axes[1].set_title("Target (reference)", fontsize=9)
+
+    im2 = axes[2].imshow(
+        x_err, origin="lower", cmap=cmap, vmin=vmin_err, vmax=vmax_err
+    )
+    axes[2].set_title("Error (output - target)", fontsize=9)
 
     for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
 
+    # ---------- mask scatter：画在 target（中间）上 ----------
     if show_mask and mask_hw is not None:
         mhw = np.asarray(mask_hw)
-        # 用半透明叠一层：观测点更亮
-        for ax in axes:
-            ax.imshow(mhw, alpha=0.15)
+        # 防呆：如果误传 HxWxC，降成 HxW
+        if mhw.ndim == 3:
+            mhw = np.any(mhw.astype(bool), axis=2)
+        mhw = mhw.astype(bool)
 
-    # shared colorbar
-    cbar = fig.colorbar(ims[-1], ax=axes, shrink=0.85, pad=0.02)
-    cbar.set_label("value")
+        yy, xx = np.where(mhw)
+        if xx.size > 0:
+            axes[1].scatter(
+                xx,
+                yy,
+                s=6,
+                facecolors="none",
+                edgecolors="k",
+                linewidths=0.4,
+                zorder=2,
+            )
 
-    fig.suptitle(title)
+    # 主场 colorbar：放在第 1、2 张之间的下方
+    pos0 = axes[0].get_position()
+    pos1 = axes[1].get_position()
+    left = pos0.x0
+    right = pos1.x1
+    width = right - left
+
+    cbar_width = width * 0.6        # 比两张图略窄，显得“轻”
+    cbar_height = pos0.height * 0.25
+    cbar_left = left + (width - cbar_width) / 2
+    cbar_bottom = pos0.y0 - 0.75 * pos0.height
+
+    cax_main = fig.add_axes([
+        cbar_left,
+        cbar_bottom,
+        cbar_width,
+        cbar_height,
+    ])
+    fig.colorbar(im1, cax=cax_main, orientation="horizontal")
+
+    # 误差 colorbar：挂在第 3 个子图下面（axes[2]）
+    pos_err = axes[2].get_position()
+    cbar_width_err = pos_err.width * 0.75
+    cbar_height_err = pos_err.height * 0.25
+    cbar_left_err = pos_err.x0 + (pos_err.width - cbar_width_err) / 2
+    cbar_bottom_err = pos_err.y0 - 0.75 * pos_err.height
+
+    cax_err = fig.add_axes([cbar_left_err, cbar_bottom_err, cbar_width_err, cbar_height_err])
+    fig.colorbar(im2, cax=cax_err, orientation="horizontal")
+
+    if title:
+        fig.suptitle(title, fontsize=12, y=0.96)
+
     return fig

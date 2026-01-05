@@ -145,18 +145,16 @@ def mod_fourier_band_nrmse_curves(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str,
     _ensure_dir(out_dir)
 
     fig_paths: List[str] = []
-    for mt in model_types:
-        df = build_fourier_df_from_l3(entries=entries, eval_cfg_fourier=fourier_cfg, model_type=str(mt))
-        if df is None or len(df) == 0:
+    df_lin = build_fourier_df_from_l3(entries=entries, eval_cfg_fourier=fourier_cfg, model_type="linear")
+    df_mlp = build_fourier_df_from_l3(entries=entries, eval_cfg_fourier=fourier_cfg, model_type="mlp")
+    figs = plot_fourier_band_nrmse_curves(df_lin=df_lin, df_mlp=df_mlp, band_names=band_names)
+    for key, fig in (figs or {}).items():
+        if fig is None:
+            print(f"[L4:fourier.band_nrmse_curves] Warning: skip {key}: no figure")
             continue
-
-        figs = plot_fourier_band_nrmse_curves(df_lin=df, df_mlp=None, band_names=band_names)
-        for key, fig in (figs or {}).items():
-            if fig is None:
-                continue
-            png = out_dir / f"{key}_{mt}.png"
-            _save_fig(fig, png, dpi=int(kwargs.get("dpi", 180)))
-            fig_paths.append(str(png))
+        png = out_dir / f"{key}.png"
+        _save_fig(fig, png, dpi=int(kwargs.get("dpi", 180)))
+        fig_paths.append(str(png))
 
     return {"fig_paths": fig_paths}
 

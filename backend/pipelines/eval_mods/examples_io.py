@@ -191,8 +191,22 @@ def reconstruct_fields_from_l2(
     mf = z.get("mask_flat", None)
     if mf is not None:
         mf = np.asarray(mf).reshape(-1)
-        if mf.size == H * W:
-            mask_hw = mf.reshape(H, W)
+        expected_hw = H * W
+        expected_hwc = H * W * C
+        print(f"[reconstruct] mask_flat size: {mf.size}, expected hw: {expected_hw}, expected hwc: {expected_hwc}")
+
+        if mf.size == expected_hw:
+            mask_hw = mf.reshape(H, W).astype(bool)
+
+        elif mf.size == expected_hwc:
+            # mask stored per-channel: [H, W, C] flattened
+            mask_hwc = mf.reshape(H, W, C).astype(bool)
+            # reduce to position mask: sampled if any channel sampled
+            mask_hw = np.any(mask_hwc, axis=2)
+
+        else:
+            print(f"[warn] Unrecognized mask_flat size {mf.size}; cannot convert to HxW mask.")
+            mask_hw = None
 
     return {
         "H": H,

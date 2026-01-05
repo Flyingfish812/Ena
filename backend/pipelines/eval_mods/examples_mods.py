@@ -62,7 +62,7 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     channel = int(kwargs.get("channel", 0))
     seed = int(kwargs.get("seed", 0))
     dpi = int(kwargs.get("dpi", 180))
-    show_mask = bool(kwargs.get("show_mask", False))
+    show_mask = bool(kwargs.get("show_mask", True))
 
     for mt in (ctx.model_types or ()):
         for (p, s) in ctx.iter_cfgs():
@@ -78,7 +78,7 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
             frames = pack["frames"]
             x_pred = pack["x_pred"]
             x_true = pack["x_true"]
-            mask_hw = pack.get("mask_hw", None)
+            mask_hw = pack["mask_hw"]
 
             for i, t in enumerate(frames):
                 fig = plot_recon_triptych(
