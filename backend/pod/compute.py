@@ -11,6 +11,8 @@ import numpy as np
 from backend.config.schemas import DataConfig, PodConfig
 from backend.dataio.nc_loader import load_raw_nc
 from backend.dataio.io_utils import ensure_dir, save_numpy, save_json
+from backend.pod.scaler import build_scale_table, build_basis_spectrum
+from pathlib import Path
 
 
 def _build_phi_groups(r_used: int, group_size: int = 16):
@@ -178,6 +180,91 @@ def build_pod(
     if verbose:
         print(f"  -> φ 被分成 {len(phi_groups)} 组，每组最多 16 个模态")
 
+    # === Level-1 扩展产物：模态尺度表 & 频谱字典 ===
+    q_modes_full = Vr.T.reshape(r, H, W, C)  # [r,H,W,C]
+
+    if verbose:
+        print("=== [POD:L1] 构建模态尺度表与频谱字典 ===")
+        print(f"  -> q_modes_full shape = {q_modes_full.shape}  (r,H,W,C)")
+        print(f"  -> scale_channel_reduce = {getattr(pod_cfg, 'scale_channel_reduce', 'l2')}")
+
+    # 将多通道聚合成单标量场用于“尺度”主线
+    reduce_mode = getattr(pod_cfg, "scale_channel_reduce", "l2")
+    if reduce_mode == "l2":
+        q_modes = np.sqrt(
+            np.sum(q_modes_full.astype(np.float64) ** 2, axis=-1)
+        ).astype(np.float32)
+    elif reduce_mode == "sum":
+        q_modes = np.sum(q_modes_full, axis=-1).astype(np.float32)
+    elif reduce_mode == "u":
+        q_modes = q_modes_full[..., 0].astype(np.float32)
+    elif reduce_mode == "v":
+        q_modes = q_modes_full[..., 1].astype(np.float32)
+    else:
+        raise ValueError(f"Unknown scale_channel_reduce: {reduce_mode}")
+
+    if verbose:
+        print(f"  -> q_modes (for scale) shape = {q_modes.shape}  (r,H,W)")
+        vmin = float(np.nanmin(q_modes))
+        vmax = float(np.nanmax(q_modes))
+        vmean = float(np.nanmean(q_modes))
+        print(f"     value range: min={vmin:.3e}, max={vmax:.3e}, mean={vmean:.3e}")
+
+    grid_meta = {
+        "H": H,
+        "W": W,
+        "C": C,
+        "dx": getattr(pod_cfg, "dx", 1.0),
+        "dy": getattr(pod_cfg, "dy", 1.0),
+        "scale_channel_reduce": reduce_mode,
+    }
+
+    if verbose:
+        print(f"  -> grid_meta: H={H}, W={W}, C={C}, dx={grid_meta['dx']}, dy={grid_meta['dy']}")
+
+    # --- ScaleTable ---
+    if getattr(pod_cfg, "enable_scale_analysis", False):
+        if verbose:
+            print("  -> 生成 ScaleTable (scale_table.csv)")
+            print(f"     scale_analysis cfg = {pod_cfg.scale_analysis}")
+
+        df_scale = build_scale_table(
+            q_modes=q_modes,
+            grid_meta=grid_meta,
+            cfg_scale=pod_cfg.scale_analysis,
+            out_csv=pod_cfg.save_dir / "scale_table.csv",
+            out_meta=pod_cfg.save_dir / "scale_meta.json",
+            preview=verbose,
+        )
+
+        if verbose:
+            print("     ScaleTable 写入完成")
+
+    else:
+        df_scale = None
+        if verbose:
+            print("  -> 跳过 ScaleTable（enable_scale_analysis = False）")
+
+    # --- Basis spectrum (Q_i) ---
+    if getattr(pod_cfg, "enable_basis_spectrum", False):
+        if verbose:
+            print("  -> 生成 basis_spectrum.npz（模态复数频谱字典）")
+            print(f"     fft_basis cfg = {pod_cfg.fft_basis}")
+
+        build_basis_spectrum(
+            q_modes=q_modes_full,   # [r,H,W,C]
+            grid_meta=grid_meta,
+            out_npz=pod_cfg.save_dir / "basis_spectrum.npz",
+            fft_cfg=pod_cfg.fft_basis,
+        )
+
+        if verbose:
+            print("     basis_spectrum.npz 写入完成")
+
+    else:
+        if verbose:
+            print("  -> 跳过 basis_spectrum（enable_basis_spectrum = False）")
+
     # 释放大数组（除了 Vr / mean_flat32 / A_true 这些后续要用的）
     del U_svd, Vh, X_flat, Xc
 
@@ -241,26 +328,26 @@ def build_pod(
         try:
             import matplotlib.pyplot as plt
 
-            # 整体风格稍微紧凑一点
+            # ------------------------
+            # 图 1：奇异值谱 + 剩余能量
+            # ------------------------
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 3.5))
 
             k = np.arange(1, len(S) + 1)
 
-            # --- 左：奇异值谱（半对数，线+小点） ---
             ax1.semilogy(
                 k,
                 S,
                 marker="o",
-                markersize=2,      # 点缩小
-                linewidth=0.5,     # 细线
+                markersize=2,
+                linewidth=0.5,
             )
             ax1.set_xlabel("Mode index k")
             ax1.set_ylabel("Singular value σ_k")
             ax1.set_title("POD Singular Value Spectrum")
             ax1.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.5)
-            ax1.set_ylim(1e-4, S.max()*1.1)
+            ax1.set_ylim(1e-4, S.max() * 1.1)
 
-            # --- 右：剩余能量 (1 - cumulative energy) 的对数图 ---
             cum = cum_energy
             residual = 1 - cum
             K_zoom = min(500, len(cum))
@@ -272,24 +359,134 @@ def build_pod(
                 markersize=2,
                 linewidth=0.5,
             )
-
             ax2.set_xlabel("Mode index k (zoomed)")
             ax2.set_ylabel("Remaining energy 1 - cum(k)")
             ax2.set_title(f"Log-scale Remaining Energy (first {K_zoom} modes)")
 
-            # 参考线：不同数量级的“剩余能量阈值”
             for thr in [1e-1, 1e-2, 1e-3, 1e-4, 1e-6, 1e-8]:
                 ax2.axhline(thr, ls="--", lw=0.6, label=f"{thr:.0e}")
 
-            ax2.set_ylim(
-                residual[:K_zoom].min() * 0.8,
-                1.0
-            )
+            ax2.set_ylim(residual[:K_zoom].min() * 0.8, 1.0)
             ax2.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.5)
             ax2.legend(fontsize=7, loc="upper right")
 
             fig.tight_layout()
             result["fig_pod"] = fig
+
+            # ------------------------
+            # 图 2：模态堆叠数 - 有效尺度（三图均标注数值）
+            # ------------------------
+            if getattr(pod_cfg, "enable_scale_analysis", False) and ("df_scale" in locals()) and (df_scale is not None):
+                fig2, (bx, by, bc) = plt.subplots(3, 1, figsize=(7.5, 7.8), sharex=True)
+
+                r = df_scale["mode"].values + 1
+                step = 20  # 每隔多少个模态标一次
+
+                # ========= X 方向 =========
+                yx = df_scale["ell_x_eff"].values
+                bx.plot(
+                    r, yx,
+                    linewidth=0.8,
+                    marker="o",
+                    markersize=3,
+                    markevery=step,
+                )
+                for idx in range(0, len(r), step):
+                    bx.annotate(
+                        f"{yx[idx]:.3f}",
+                        (r[idx], yx[idx]),
+                        textcoords="offset points",
+                        xytext=(0, 6),
+                        ha="center",
+                        fontsize=8,
+                        alpha=0.9,
+                    )
+                bx.set_ylabel("ell_x_eff")
+                bx.set_title("Effective Scale vs Mode Count (X / Y / Combined)")
+                bx.grid(True, linestyle="--", linewidth=0.3, alpha=0.5)
+                bx.set_yscale("log")
+
+                # ========= Y 方向 =========
+                yy = df_scale["ell_y_eff"].values
+                by.plot(
+                    r, yy,
+                    linewidth=0.8,
+                    marker="s",
+                    markersize=3,
+                    markevery=step,
+                )
+                for idx in range(0, len(r), step):
+                    by.annotate(
+                        f"{yy[idx]:.3f}",
+                        (r[idx], yy[idx]),
+                        textcoords="offset points",
+                        xytext=(0, 6),
+                        ha="center",
+                        fontsize=8,
+                        alpha=0.9,
+                    )
+                by.set_ylabel("ell_y_eff")
+                by.grid(True, linestyle="--", linewidth=0.3, alpha=0.5)
+                by.set_yscale("log")
+
+                # ========= 综合尺度 =========
+                y_min = df_scale["ell_min_eff"].values
+                y_geo = df_scale["ell_geo_eff"].values
+
+                bc.plot(
+                    r, y_min,
+                    linewidth=1.0,
+                    marker="o",
+                    markersize=4,
+                    markevery=step,
+                    label="ell_min_eff",
+                )
+                bc.plot(
+                    r, y_geo,
+                    linewidth=0.8,
+                    linestyle="--",
+                    marker="^",
+                    markersize=3,
+                    markevery=step,
+                    alpha=0.85,
+                    label="ell_geo_eff",
+                )
+
+                # 数值标注：ell_min_eff（下方）
+                for idx in range(0, len(r), step):
+                    bc.annotate(
+                        f"{y_min[idx]:.3f}",
+                        (r[idx], y_min[idx]),
+                        textcoords="offset points",
+                        xytext=(0, -10),
+                        ha="center",
+                        fontsize=8,
+                        alpha=0.95,
+                    )
+
+                # 数值标注：ell_geo_eff（右上）
+                for idx in range(0, len(r), step):
+                    bc.annotate(
+                        f"{y_geo[idx]:.3f}",
+                        (r[idx], y_geo[idx]),
+                        textcoords="offset points",
+                        xytext=(6, 6),
+                        ha="left",
+                        fontsize=8,
+                        alpha=0.85,
+                    )
+
+                bc.set_xlabel("Mode count r (1-based)")
+                bc.set_ylabel("effective scale")
+                bc.grid(True, linestyle="--", linewidth=0.3, alpha=0.5)
+                bc.set_yscale("log")
+                bc.legend(fontsize=8, loc="best")
+
+                fig2.tight_layout()
+                out_fig = pod_cfg.save_dir / "fig_scale_eff.png"
+                fig2.savefig(out_fig, dpi=180, bbox_inches="tight")
+                result["fig_scale_eff"] = fig2
+
 
         except Exception as e:
             if verbose:

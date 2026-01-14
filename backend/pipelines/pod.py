@@ -1,42 +1,9 @@
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 from backend.pod.compute import build_pod
 from backend.config.schemas import DataConfig, PodConfig
-from typing import Any, Dict
-from pathlib import Path
 
-
-"""
-POD 构建的一站式入口 (Notebook / GUI 推荐接口)
-
-功能：
-- 从 NetCDF 文件读取原始数据
-- 执行 SVD / POD 分解
-- 按 r 截断并保存基底与均值
-- 返回能量谱、累计能量、实际使用模态数等元信息
-
-示例 (ipynb): 
-from backend.pipeline_pod import quick_build_pod
-res = quick_build_pod(
-    nc_path="data/cylinder2d.nc",
-    r=128,
-    center=True,
-    var_keys=("u", "v"),
-    verbose=True,
-    plot=True,
-)
-print(res["r_used"], res["cum_energy"][:10])
-
-参数：
-- nc_path: NetCDF 文件路径
-- save_dir: POD 基底输出目录
-- r: 截断模态数
-- center: 是否去均值
-- var_keys: 读取的变量名
-- verbose: 是否打印中间信息
-- plot: 是否绘制奇异值谱与累计能量图
-
-返回：
-- Dict[str, Any]，结构与 build_pod 返回一致
-"""
 
 def quick_build_pod(
     nc_path: str | Path,
@@ -45,29 +12,56 @@ def quick_build_pod(
     center: bool = True,
     var_keys: tuple[str, ...] = ("u", "v"),
     *,
+    # ===== v2.x additions for Level-1 =====
+    dx: float = 1.0,
+    dy: float = 1.0,
+    enable_scale_analysis: bool = False,
+    scale_analysis: Optional[Dict[str, Any]] = None,
+    scale_channel_reduce: str = "l2",   # "l2" | "sum" | "u" | "v"
+    enable_basis_spectrum: bool = False,
+    fft_basis: Optional[Dict[str, Any]] = None,
+    # ===== misc =====
     verbose: bool = True,
     plot: bool = True,
 ) -> Dict[str, Any]:
-    # 构造 DataConfig
+    # DataConfig
     data_cfg = DataConfig(
         nc_path=Path(nc_path),
         var_keys=var_keys,
         cache_dir=None,
     )
 
-    # 构造 PodConfig
+    # PodConfig
     pod_cfg = PodConfig(
         r=r,
         center=center,
         save_dir=Path(save_dir),
+
+        dx=dx,
+        dy=dy,
+
+        enable_scale_analysis=enable_scale_analysis,
+        scale_analysis=scale_analysis if scale_analysis is not None else {
+            "method": "B_robust_energy_centroid",
+            "k_min": None,
+            "k_max": None,
+            "demean_line": True,
+        },
+        scale_channel_reduce=scale_channel_reduce,
+
+        enable_basis_spectrum=enable_basis_spectrum,
+        fft_basis=fft_basis if fft_basis is not None else {
+            "demean": True,
+            "window": None,
+            "norm": None,
+        },
     )
 
-    # 执行 POD 构建
+    # Run
     result = build_pod(
         data_cfg,
         pod_cfg,
         verbose=verbose,
         plot=plot,
     )
-
     return result

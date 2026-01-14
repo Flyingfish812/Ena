@@ -1,54 +1,17 @@
 # backend/config/yaml_io.py
 
-"""
-实验配置的 YAML 读写工具。
-
-约定 YAML 结构大致如下：
-
-data:
-  nc_path: data/cylinder2d.nc
-  var_keys: [u, v]
-
-pod:
-  r: 128
-  center: true
-  save_dir: artifacts/pod_r128
-
-eval:
-  mask_rates: [0.01, 0.02, 0.05, 0.1]
-  noise_sigmas: [0.0, 0.01, 0.02]
-  pod_bands:
-    L: [0, 16]
-    M: [16, 64]
-    H: [64, 128]
-  save_dir: artifacts/eval
-
-train:
-  mask_rate: 0.02
-  noise_sigma: 0.01
-  hidden_dims: [256, 256]
-  lr: 0.001
-  batch_size: 64
-  max_epochs: 50
-  device: cuda
-  save_dir: artifacts/nn
-"""
-
 from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-import yaml  # 需要 pip install pyyaml
+import yaml
 
 from .schemas import DataConfig, PodConfig, EvalConfig, FourierConfig, TrainConfig
 
 
 def _to_serializable(obj: Any) -> Any:
-    """
-    将 dataclass 字典中的 Path 等对象转为 YAML 友好的类型。
-    """
     if isinstance(obj, Path):
         return str(obj)
     if isinstance(obj, dict):
@@ -65,12 +28,6 @@ def save_experiment_yaml(
     eval_cfg: EvalConfig,
     train_cfg: TrainConfig | None = None,
 ) -> None:
-    """
-    将当前的一整套实验配置写入 YAML 文件。
-
-    - path: YAML 文件路径
-    - train_cfg 可以为 None（例如只做线性基线）
-    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -99,7 +56,7 @@ def load_experiment_yaml(
         config = yaml.safe_load(f) or {}
 
     # ---------- data ----------
-    data_raw: Dict[str, Any] = config.get("data", {})
+    data_raw: Dict[str, Any] = config.get("data", {}) or {}
     nc_path = Path(data_raw.get("nc_path", "data/cylinder2d.nc"))
     var_keys = tuple(data_raw.get("var_keys", ("u", "v")))
     cache_dir = data_raw.get("cache_dir", None)
@@ -113,34 +70,52 @@ def load_experiment_yaml(
     )
 
     # ---------- pod ----------
-    pod_raw: Dict[str, Any] = config.get("pod", {})
+    pod_raw: Dict[str, Any] = config.get("pod", {}) or {}
     pod_save_dir = Path(pod_raw.get("save_dir", "artifacts/pod"))
+
+    dx = float(pod_raw.get("dx", 1.0))
+    dy = float(pod_raw.get("dy", 1.0))
+
+    scale_channel_reduce = str(pod_raw.get("scale_channel_reduce", "l2")),
+    enable_scale_analysis = bool(pod_raw.get("enable_scale_analysis", False))
+    scale_analysis = dict(pod_raw.get("scale_analysis", {}) or {})
+
+    enable_basis_spectrum = bool(pod_raw.get("enable_basis_spectrum", False))
+    fft_basis = dict(pod_raw.get("fft_basis", {}) or {})
+
     pod_cfg = PodConfig(
         r=int(pod_raw.get("r", 128)),
         center=bool(pod_raw.get("center", True)),
         save_dir=pod_save_dir,
+
+        dx=dx,
+        dy=dy,
+
+        scale_channel_reduce=scale_channel_reduce,
+        enable_scale_analysis=enable_scale_analysis,
+        scale_analysis=scale_analysis,
+
+        enable_basis_spectrum=enable_basis_spectrum,
+        fft_basis=fft_basis,
     )
 
     # ---------- eval ----------
-    eval_raw: Dict[str, Any] = config.get("eval", {})
+    eval_raw: Dict[str, Any] = config.get("eval", {}) or {}
     mask_rates = list(eval_raw.get("mask_rates", [0.0001, 0.0004, 0.0016]))
     noise_sigmas = list(eval_raw.get("noise_sigmas", [0.0, 0.01, 0.1]))
 
-    pod_bands_raw = eval_raw.get("pod_bands", {})
-    pod_bands = {
-        name: (int(v[0]), int(v[1]))
-        for name, v in (pod_bands_raw or {}).items()
-    }
+    pod_bands_raw = eval_raw.get("pod_bands", {}) or {}
+    pod_bands = {name: (int(v[0]), int(v[1])) for name, v in pod_bands_raw.items()}
     centered_pod = bool(eval_raw.get("centered_pod", True))
     eval_save_dir = Path(eval_raw.get("save_dir", "artifacts/eval"))
 
-    # ----- Fourier (NEW SCHEMA ONLY) -----
+    # ----- Fourier -----
     fourier_raw: Dict[str, Any] = eval_raw.get("fourier", {}) or {}
 
     enabled = bool(fourier_raw.get("enabled", True))
     band_scheme = str(fourier_raw.get("band_scheme", "physical"))
-
     grid_meta = dict(fourier_raw.get("grid_meta", {}) or {})
+
     binning = str(fourier_raw.get("binning", "log"))
     num_bins = int(fourier_raw.get("num_bins", 64))
     k_min_eval = float(fourier_raw.get("k_min_eval", 0.25))
@@ -153,27 +128,21 @@ def load_experiment_yaml(
     lambda_edges_raw = fourier_raw.get("lambda_edges", (1.0, 0.25))
     lambda_edges = [float(v) for v in lambda_edges_raw]
 
-    # v2.1: 2D FFT stats saving options (all optional; default to schema defaults)
     save_fft2_2d_stats = bool(fourier_raw.get("save_fft2_2d_stats", False))
-
     fft2_2d_stats_what_raw = fourier_raw.get(
         "fft2_2d_stats_what",
         ("P_true", "P_pred", "P_err", "C_tp", "coh", "H"),
     )
-    # YAML may contain list; keep as tuple[str,...]
     fft2_2d_stats_what = tuple(str(x) for x in (fft2_2d_stats_what_raw or ()))
 
     fft2_2d_stats_avg_over_frames = bool(
         fourier_raw.get("fft2_2d_stats_avg_over_frames", True)
     )
-    fft2_2d_stats_dtype = str(
-        fourier_raw.get("fft2_2d_stats_dtype", "complex64")
-    )
+    fft2_2d_stats_dtype = str(fourier_raw.get("fft2_2d_stats_dtype", "complex64"))
     fft2_2d_stats_store_shifted = bool(
         fourier_raw.get("fft2_2d_stats_store_shifted", False)
     )
 
-    # None means "inherit sample_frames"; -1 means "all frames"
     fft2_2d_stats_sample_frames_raw = fourier_raw.get("fft2_2d_stats_sample_frames", None)
     if fft2_2d_stats_sample_frames_raw is None:
         fft2_2d_stats_sample_frames = None
@@ -193,8 +162,6 @@ def load_experiment_yaml(
         save_curve=save_curve,
         band_names=band_names,
         lambda_edges=lambda_edges,
-
-        # v2.1 additions
         save_fft2_2d_stats=save_fft2_2d_stats,
         fft2_2d_stats_what=fft2_2d_stats_what,
         fft2_2d_stats_avg_over_frames=fft2_2d_stats_avg_over_frames,
