@@ -256,6 +256,8 @@ def plot_pod_outputs(
         for name, y, marker in series:
             y = np.asarray(y, dtype=np.float64)
 
+            color = ax._get_lines.get_next_color()
+
             # 1) 全量散点：真实点（淡）
             ax.scatter(
                 r, y,
@@ -263,18 +265,20 @@ def plot_pod_outputs(
                 marker=marker,
                 alpha=0.35,
                 linewidths=0.0,
+                color=color,
             )
 
             # 2) 提取阶梯拐点（用于拟合）
             r_step, y_step = _extract_step_points(r, y)
 
-            # 拐点更醒目一些（便于直观看“有效尺度下降节点”）
+            # 拐点更醒目一些（同色、更不透明）
             ax.scatter(
                 r_step, y_step,
                 s=28,
                 marker=marker,
                 alpha=0.9,
                 linewidths=0.0,
+                color=color,
             )
 
             # 3) 在拐点上做带下限指数拟合：y = c + a*exp(bx)
@@ -285,7 +289,13 @@ def plot_pod_outputs(
             )
             if np.isfinite(a) and np.isfinite(b) and np.isfinite(c):
                 y_fit = c + a * np.exp(b * r.astype(np.float64))
-                ax.plot(r, y_fit, linestyle="--", linewidth=1.2, label=f"{name}: {eq}")
+                ax.plot(
+                    r, y_fit,
+                    linestyle="--",
+                    linewidth=2.0,
+                    color=color,
+                    label=f"{name}: {eq}",
+                )
             else:
                 ax.plot([], [], label=f"{name}: {eq}")
 
