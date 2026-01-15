@@ -8,6 +8,27 @@ pod:
   center: true
   save_dir: artifacts/pod
 
+  # 和 eval.fourier.grid_meta.dx/dy 对齐
+  dx: 0.0125
+  dy: 0.0125
+
+  # ===== Level-1: ScaleTable =====
+  scale_channel_reduce: l2
+  enable_scale_analysis: true
+  scale_analysis:
+    method: B_robust_energy_centroid
+    # 角波数(rad/len)，None 表示不截断；建议先不截断，等你看 preview 再收紧
+    k_min: null
+    k_max: null
+    demean_line: true
+
+  # ===== Level-1: Basis spectrum dict (Q_i) =====
+  enable_basis_spectrum: true
+  fft_basis:
+    demean: true
+    window: null
+    norm: null
+
 eval:
   mask_rates: [0.0004]
   noise_sigmas: [0.0]
