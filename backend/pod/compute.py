@@ -61,7 +61,7 @@ def plot_pod_outputs(
     - cum_energy: 参数传入；若为空则由 singular_values 计算得到
 
     输出：
-    - 返回 {"fig_pod": fig, "fig_scale_eff": fig2, "fig_paths": [...]}（有就返回）
+    - 返回 {"fig_pod": fig, "fig_scale_med": fig2a, "fig_scale_prefix": fig2b, "fig_scale_tail": fig2c, "fig_paths": [...]}（有就返回）
     - 同时将 png 保存到 save_dir 下
     """
     out: Dict[str, Any] = {}
@@ -167,150 +167,85 @@ def plot_pod_outputs(
                 df_scale = None
 
     # ------------------------
-    # 图 2：模态堆叠数 - 有效尺度（散点 + 拐点拟合线，四条曲线同图）
+    # 图 2：尺度相关图（出三张图保存）
+    #   - Fig2A: (ell_x_med,    ell_y_med)    每模态尺度
+    #   - Fig2B: (ell_x_prefix, ell_y_prefix) 前缀有效尺度（= 旧 ell_x_eff/ell_y_eff）
+    #   - Fig2C: (ell_x_tail,   ell_y_tail)   尾部“最大可预测尺度”
+    # 约束：
+    #   - 取消拟合线
+    #   - 常数间隔纵坐标（不使用 log-scale 轴）
+    #   - 不再区分拐点/阶梯段透明度（统一散点样式）
     # ------------------------
     enable_scale = getattr(pod_cfg, "enable_scale_analysis", None)
     # 外部调用时 pod_cfg 可能为 None：只要 scale_table.csv 存在就画
     if (enable_scale is None or bool(enable_scale)) and (df_scale is not None):
-        fig2, ax = plt.subplots(1, 1, figsize=(7.8, 5.2))
-
         r = df_scale["mode"].values.astype(np.int64) + 1  # 1-based
 
-        def _extract_step_points(x: np.ndarray, y: np.ndarray, *, eps: float = 1e-12):
-            """
-            从“有效尺度”（通常是 cummin / 单调包络）中提取阶梯拐点：
-            只保留 y 发生“严格下降”的那些点（以及第一个点）。
-            返回：x_step, y_step
-            """
-            x = np.asarray(x, dtype=np.float64)
-            y = np.asarray(y, dtype=np.float64)
-            m = np.isfinite(x) & np.isfinite(y)
-            x = x[m]
-            y = y[m]
-            if x.size == 0:
-                return x, y
-
-            idx = [0]
-            cur = y[0]
-            for i in range(1, len(y)):
-                if y[i] < cur - eps:
-                    idx.append(i)
-                    cur = y[i]
-            return x[idx], y[idx]
-
-        def _fit_exp_floor(
-            x: np.ndarray,
-            y: np.ndarray,
+        def _plot_two_scatter(
             *,
-            floor_quantile: float = 0.05,
-            floor_eps: float = 1e-6,
+            title: str,
+            y1_name: str,
+            y1: np.ndarray,
+            y2_name: str,
+            y2: np.ndarray,
+            png_name: str,
         ):
-            """
-            带下限指数拟合：y = c + a * exp(b*x)
+            """画一张图：两条散点（x/y 方向），线性 y 轴（常数间隔），不做拟合。"""
+            fig, ax = plt.subplots(1, 1, figsize=(7.8, 5.2))
 
-            轻量实现（无 scipy）：
-            - c 用 y 的低分位数估计（地板）
-            - 对 (y-c) 做 ln 线性拟合：ln(y-c) = ln(a) + b*x
+            y1 = np.asarray(y1, dtype=np.float64)
+            y2 = np.asarray(y2, dtype=np.float64)
 
-            返回：a, b, c, eq_str
-            """
-            x = np.asarray(x, dtype=np.float64)
-            y = np.asarray(y, dtype=np.float64)
+            ax.scatter(r, y1, s=18, marker="o", alpha=0.85, linewidths=0.0, label=y1_name)
+            ax.scatter(r, y2, s=18, marker="s", alpha=0.85, linewidths=0.0, label=y2_name)
 
-            m0 = np.isfinite(x) & np.isfinite(y) & (y > 0)
-            if np.count_nonzero(m0) < 4:
-                return float("nan"), float("nan"), float("nan"), "y = c + a·exp(bx) (fit failed)"
+            ax.set_title(title)
+            ax.set_xlabel("Mode count r (1-based)")
+            ax.set_ylabel("scale (constant spacing)")
+            ax.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.5)
+            ax.legend(fontsize=9, loc="upper right", frameon=True)
 
-            xx = x[m0]
-            yy = y[m0]
+            fig.tight_layout()
+            png = save_dir / png_name
+            fig.savefig(png, dpi=dpi, bbox_inches="tight")
+            fig_paths.append(str(png))
+            return fig
 
-            # floor 估计：低分位数比 min 更抗离群
-            c0 = float(np.quantile(yy, np.clip(floor_quantile, 0.0, 0.49)))
-            c = max(0.0, c0 - floor_eps)
+        # 2A: 每模态尺度 (med)
+        fig2a = _plot_two_scatter(
+            title="Per-mode Scale (median): ell_x_med & ell_y_med",
+            y1_name="ell_x_med",
+            y1=df_scale["ell_x_med"].values,
+            y2_name="ell_y_med",
+            y2=df_scale["ell_y_med"].values,
+            png_name="fig_scale_med_scatter.png",
+        )
 
-            y_shift = yy - c
-            m1 = y_shift > 0
-            if np.count_nonzero(m1) < 3:
-                # 退回到 min 附近
-                c = max(0.0, float(np.min(yy)) - floor_eps)
-                y_shift = yy - c
-                m1 = y_shift > 0
-                if np.count_nonzero(m1) < 3:
-                    return float("nan"), float("nan"), c, "y = c + a·exp(bx) (fit failed)"
+        # 2B: 前缀有效尺度 (prefix) —— 统一以新列名为准
+        #     旧代码里用的 ell_x_eff/ell_y_eff 在 scaler.py 中仍保留为 prefix 的 alias，
+        #     但这里直接引用 ell_x_prefix/ell_y_prefix。
+        fig2b = _plot_two_scatter(
+            title="Prefix Effective Scale: ell_x_prefix & ell_y_prefix",
+            y1_name="ell_x_prefix",
+            y1=df_scale["ell_x_prefix"].values,
+            y2_name="ell_y_prefix",
+            y2=df_scale["ell_y_prefix"].values,
+            png_name="fig_scale_prefix_scatter.png",
+        )
 
-            xx2 = xx[m1]
-            ly = np.log(y_shift[m1])
+        # 2C: 尾部最大可预测尺度 (tail)
+        fig2c = _plot_two_scatter(
+            title="Tail Predictable Scale (max over tail): ell_x_tail & ell_y_tail",
+            y1_name="ell_x_tail",
+            y1=df_scale["ell_x_tail"].values,
+            y2_name="ell_y_tail",
+            y2=df_scale["ell_y_tail"].values,
+            png_name="fig_scale_tail_scatter.png",
+        )
 
-            b, ln_a = np.polyfit(xx2, ly, deg=1)
-            a = float(np.exp(ln_a))
-            eq = f"y = {c:.3g} + {a:.3g}·exp({b:.3g}x)"
-            return a, float(b), float(c), eq
-
-        series = [
-            ("ell_x_eff",   df_scale["ell_x_eff"].values,   "o"),
-            ("ell_y_eff",   df_scale["ell_y_eff"].values,   "s"),
-            ("ell_min_eff", df_scale["ell_min_eff"].values, "D"),
-            ("ell_geo_eff", df_scale["ell_geo_eff"].values, "^"),
-        ]
-
-        for name, y, marker in series:
-            y = np.asarray(y, dtype=np.float64)
-
-            color = ax._get_lines.get_next_color()
-
-            # 1) 全量散点：真实点（淡）
-            ax.scatter(
-                r, y,
-                s=14,
-                marker=marker,
-                alpha=0.35,
-                linewidths=0.0,
-                color=color,
-            )
-
-            # 2) 提取阶梯拐点（用于拟合）
-            r_step, y_step = _extract_step_points(r, y)
-
-            # 拐点更醒目一些（同色、更不透明）
-            ax.scatter(
-                r_step, y_step,
-                s=28,
-                marker=marker,
-                alpha=0.9,
-                linewidths=0.0,
-                color=color,
-            )
-
-            # 3) 在拐点上做带下限指数拟合：y = c + a*exp(bx)
-            a, b, c, eq = _fit_exp_floor(
-                r_step, y_step,
-                floor_quantile=0.05,
-                floor_eps=1e-6,
-            )
-            if np.isfinite(a) and np.isfinite(b) and np.isfinite(c):
-                y_fit = c + a * np.exp(b * r.astype(np.float64))
-                ax.plot(
-                    r, y_fit,
-                    linestyle="--",
-                    linewidth=2.0,
-                    color=color,
-                    label=f"{name}: {eq}",
-                )
-            else:
-                ax.plot([], [], label=f"{name}: {eq}")
-
-        ax.set_title("Effective Scale vs Mode Count (scatter + step-fit exp-with-floor)")
-        ax.set_xlabel("Mode count r (1-based)")
-        ax.set_ylabel("effective scale")
-        ax.set_yscale("log")
-        ax.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.5)
-        ax.legend(fontsize=8, loc="upper right", frameon=True)
-
-        fig2.tight_layout()
-        png2 = save_dir / "fig_scale_eff_scatter_fit.png"
-        fig2.savefig(png2, dpi=dpi, bbox_inches="tight")
-        fig_paths.append(str(png2))
-        out["fig_scale_eff"] = fig2
+        out["fig_scale_med"] = fig2a
+        out["fig_scale_prefix"] = fig2b
+        out["fig_scale_tail"] = fig2c
 
     out["fig_paths"] = fig_paths
     return out

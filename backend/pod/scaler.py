@@ -248,15 +248,60 @@ def build_scale_table(
     df = pd.DataFrame(rows)
 
     # ------------------------
-    # 新增：有效尺度（前 n 个模态可达到的最小尺度）
-    # 定义：ell_eff(n) = min_{i<=n} ell_i
-    # 这里用每个模态的稳健代表尺度（*_med / ell_min / ell_geo）
+    # 新增：三类尺度信息
+    # 1) ell_x_med / ell_y_med：单模态尺度（已由 estimate_mode_scales 给出）
+    # 2) ell_x_prefix / ell_y_prefix：前 r 个模态的累积有效尺度（最细尺度）
+    #    定义：ell_prefix(r) = min_{i<=r} ell_i
+    # 3) ell_x_tail / ell_y_tail：后 R-r 个模态的“最大可预测尺度”（最粗尺度）
+    #    定义：ell_tail(r) = max_{i>r} ell_i
+    #
+    # 备注：
+    # - 这里仍保留旧字段 ell_x_eff/ell_y_eff 作为兼容别名（= ell_x_prefix/ell_y_prefix）。
+    # - ell_min_eff / ell_geo_eff 先保留并放在最后两列（用于后续研究尺度塌缩时再启用）。
     # ------------------------
-    # 注意：cummin 对 NaN 的行为较“传染”，这里先确保是 float 并尽量不引入 NaN
-    df["ell_x_eff"] = pd.Series(df["ell_x_med"], dtype="float64").cummin()
-    df["ell_y_eff"] = pd.Series(df["ell_y_med"], dtype="float64").cummin()
+
+    def _suffix_nanmax_exclusive(v: np.ndarray) -> np.ndarray:
+        """tail[i] = nanmax(v[i+1:])；若后缀为空或全为 NaN/Inf，则返回 NaN。"""
+        vv = np.asarray(v, dtype=np.float64)
+        vv = np.where(np.isfinite(vv), vv, np.nan)
+        n = int(vv.size)
+        out = np.full((n,), np.nan, dtype=np.float64)
+        if n <= 1:
+            return out
+        cur = np.nan
+        # 从后往前滚动维护 nanmax（exclusive 版本：先写 out，再更新 cur）
+        for i in range(n - 1, -1, -1):
+            out[i] = cur
+            x = vv[i]
+            if np.isnan(cur):
+                cur = x
+            elif not np.isnan(x) and x > cur:
+                cur = x
+        return out
+
+    sx = pd.Series(df["ell_x_med"], dtype="float64")
+    sy = pd.Series(df["ell_y_med"], dtype="float64")
+
+    # prefix：最细尺度（前缀最小值）
+    df["ell_x_prefix"] = sx.cummin()
+    df["ell_y_prefix"] = sy.cummin()
+
+    # tail：最大可预测尺度（尾部最大值，exclusive）
+    df["ell_x_tail"] = _suffix_nanmax_exclusive(sx.to_numpy())
+    df["ell_y_tail"] = _suffix_nanmax_exclusive(sy.to_numpy())
+
+    # 兼容字段（旧名）
+    df["ell_x_eff"] = df["ell_x_prefix"]
+    df["ell_y_eff"] = df["ell_y_prefix"]
+
+    # 先保留：尺度塌缩相关（仍用 prefix-cummin 定义）
     df["ell_min_eff"] = pd.Series(df["ell_min"], dtype="float64").cummin()
     df["ell_geo_eff"] = pd.Series(df["ell_geo"], dtype="float64").cummin()
+
+    # 确保 ell_min_eff / ell_geo_eff 位于最后两列
+    last2 = ["ell_min_eff", "ell_geo_eff"]
+    cols = [c for c in df.columns if c not in last2] + last2
+    df = df[cols]
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
@@ -266,8 +311,14 @@ def build_scale_table(
         "scale_cfg": cfg_scale,
         "n_modes": int(q_modes.shape[0]),
         "effective_scale_def": {
-            "ell_x_eff": "cummin(ell_x_med)",
-            "ell_y_eff": "cummin(ell_y_med)",
+            "ell_x_med": "per-mode robust scale in x (median over lines)",
+            "ell_y_med": "per-mode robust scale in y (median over lines)",
+            "ell_x_prefix": "cummin(ell_x_med)",
+            "ell_y_prefix": "cummin(ell_y_med)",
+            "ell_x_tail": "suffix max (exclusive): max_{i>r} ell_x_med(i)",
+            "ell_y_tail": "suffix max (exclusive): max_{i>r} ell_y_med(i)",
+            "ell_x_eff": "alias of ell_x_prefix (backward compatible)",
+            "ell_y_eff": "alias of ell_y_prefix (backward compatible)",
             "ell_min_eff": "cummin(ell_min)",
             "ell_geo_eff": "cummin(ell_geo)",
         },
@@ -278,7 +329,7 @@ def build_scale_table(
     if preview:
         print("=== ScaleTable Preview ===")
         print(df.head())
-        print(df[["mode", "ell_x_eff", "ell_y_eff", "ell_min_eff", "ell_geo_eff"]].head(10))
+        print(df[["mode", "ell_x_prefix", "ell_y_prefix", "ell_x_tail", "ell_y_tail", "ell_min_eff", "ell_geo_eff"]].head(10))
         print(df[["ell_min", "ell_min_eff", "ell_geo", "ell_geo_eff"]].describe())
 
     return df
