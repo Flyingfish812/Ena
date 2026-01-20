@@ -15,6 +15,7 @@ from backend.pipelines.eval.utils import load_npz, read_json
 # POD (L1) artifacts
 # -----------------------------
 
+
 @dataclass(frozen=True)
 class PodArtifactsPaths:
     pod_dir: Path
@@ -26,10 +27,7 @@ class PodArtifactsPaths:
 
 
 def resolve_pod_dir(ctx) -> Path:
-    """
-    单一可信来源：ctx.pod_cfg.save_dir
-    不做猜路径。
-    """
+    """单一可信来源：ctx.pod_cfg.save_dir。不做猜路径。"""
     pod_cfg = getattr(ctx, "pod_cfg", None)
     if pod_cfg is None:
         raise ValueError("ctx.pod_cfg is None; cannot resolve POD save_dir.")
@@ -70,7 +68,6 @@ def try_read_json(path: Path) -> Dict[str, Any]:
     try:
         obj = read_json(path)
         rep["ok"] = True
-        # 只 peek 一点，避免把大 json 全塞进报告
         rep["keys"] = sorted(list(obj.keys())) if isinstance(obj, dict) else None
         rep["peek"] = obj if not isinstance(obj, dict) else {k: obj.get(k) for k in list(obj.keys())[:8]}
     except Exception as e:
@@ -97,10 +94,16 @@ def try_peek_scale_table_csv(path: Path, *, max_rows: int = 3) -> Dict[str, Any]
 
 
 def load_scale_table_csv(path: Path) -> Dict[str, Any]:
-    """
-    轻量 CSV loader（不依赖 pandas）：
-    返回 dict: { "columns": [...], "rows": [...], "data": {col: np.ndarray} }
-    注意：此处只负责 IO，不做统计。
+    """轻量 CSV loader（不依赖 pandas）。
+
+    返回：
+      {
+        "columns": [...],
+        "rows": [ {col: raw_str, ...}, ... ],
+        "data": {col: np.ndarray}
+      }
+
+    说明：这里只负责 IO 与类型推断（能转 float 的列转 float），不做任何统计。
     """
     if not path.exists():
         raise FileNotFoundError(str(path))
@@ -108,15 +111,11 @@ def load_scale_table_csv(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         cols = list(reader.fieldnames or [])
-        rows: List[Dict[str, Any]] = []
-        for r in reader:
-            rows.append(r)
+        rows: List[Dict[str, Any]] = [r for r in reader]
 
-    # 尝试把能转成 float 的列都转成 float ndarray
     data: Dict[str, Any] = {}
     for c in cols:
         col_vals = [rows[i].get(c, "") for i in range(len(rows))]
-        # try numeric
         ok_num = True
         out_num: List[float] = []
         for v in col_vals:
@@ -125,17 +124,115 @@ def load_scale_table_csv(path: Path) -> Dict[str, Any]:
             except Exception:
                 ok_num = False
                 break
-        if ok_num:
-            data[c] = np.asarray(out_num, dtype=float)
-        else:
-            data[c] = np.asarray(col_vals, dtype=object)
+        data[c] = np.asarray(out_num, dtype=float) if ok_num else np.asarray(col_vals, dtype=object)
 
     return {"columns": cols, "rows": rows, "data": data}
 
 
 # -----------------------------
-# L2 helpers
+# POD scales (L1) loader (Batch-0)
 # -----------------------------
+
+
+def load_pod_mode_scales_standardized(ctx) -> Dict[str, Any]:
+    """读取 POD save_dir/scale_table.csv，并一次性输出后续画图需要的全部尺度列（长度均为 R）。
+
+    期望 scale_table.csv 至少包含这些列（大小写必须精确匹配）：
+      - mode
+      - ell_x_med, ell_x_prefix, ell_x_tail
+      - ell_y_med, ell_y_prefix, ell_y_tail
+
+    返回：
+      {
+        "r_grid": np.ndarray[int]    # 1..R
+        "mode": np.ndarray[int]      # 与 r_grid 同序（1-based）
+        "R": int,
+        "ell_x_med": np.ndarray[float],
+        "ell_x_prefix": np.ndarray[float],
+        "ell_x_tail": np.ndarray[float],
+        "ell_y_med": np.ndarray[float],
+        "ell_y_prefix": np.ndarray[float],
+        "ell_y_tail": np.ndarray[float],
+        "colmap": Dict[str,str],
+        "scale_table_path": str,
+      }
+
+    说明：
+      - 仅做“按 mode 排序 + 0/1-based 对齐 + 数值列提取”。
+      - 不做任何拟合/统计，避免在 IO 层混入分析逻辑。
+    """
+    pp = pod_artifacts_paths(ctx)
+    tab = load_scale_table_csv(pp.scale_table_csv)
+    cols: List[str] = tab.get("columns", [])
+    data: Dict[str, Any] = tab.get("data", {})
+
+    required_cols = [
+        "mode",
+        "ell_x_med",
+        "ell_x_prefix",
+        "ell_x_tail",
+        "ell_y_med",
+        "ell_y_prefix",
+        "ell_y_tail",
+    ]
+    missing = [c for c in required_cols if c not in data]
+    if missing:
+        raise KeyError(f"[cumulate_io] scale_table.csv missing columns: {missing}. cols={cols}")
+
+    mode_raw = np.asarray(data["mode"], dtype=np.int64)
+    if mode_raw.size == 0:
+        raise ValueError("[cumulate_io] empty 'mode' column in scale_table.csv")
+
+    # 0-based -> 1-based
+    if int(mode_raw.min()) == 0:
+        mode_raw = mode_raw + 1
+
+    order = np.argsort(mode_raw)
+    mode_sorted = mode_raw[order]
+
+    def _as_float(col: str) -> np.ndarray:
+        return np.asarray(data[col], dtype=float)[order]
+
+    ell_x_med = _as_float("ell_x_med")
+    ell_x_prefix = _as_float("ell_x_prefix")
+    ell_x_tail = _as_float("ell_x_tail")
+
+    ell_y_med = _as_float("ell_y_med")
+    ell_y_prefix = _as_float("ell_y_prefix")
+    ell_y_tail = _as_float("ell_y_tail")
+
+    R = int(len(mode_sorted))
+    r_grid = np.arange(1, R + 1, dtype=np.int32)
+
+    colmap = {
+        "r": "mode",
+        "ell_x_med": "ell_x_med",
+        "ell_x_prefix": "ell_x_prefix",
+        "ell_x_tail": "ell_x_tail",
+        "ell_y_med": "ell_y_med",
+        "ell_y_prefix": "ell_y_prefix",
+        "ell_y_tail": "ell_y_tail",
+    }
+
+    return {
+        "r_grid": r_grid,
+        "mode": mode_sorted.astype(np.int32, copy=False),
+        "R": R,
+        "ell_x_med": ell_x_med,
+        "ell_x_prefix": ell_x_prefix,
+        "ell_x_tail": ell_x_tail,
+        "ell_y_med": ell_y_med,
+        "ell_y_prefix": ell_y_prefix,
+        "ell_y_tail": ell_y_tail,
+        "colmap": colmap,
+        "scale_table_path": str(pp.scale_table_csv),
+    }
+
+
+# -----------------------------
+# L2 helpers (kept minimal)
+# -----------------------------
+
 
 def find_any_l2_npz(l2_root: Path) -> Optional[Path]:
     l2_root = Path(l2_root)
@@ -160,9 +257,7 @@ def peek_l2_npz(path: Path) -> Dict[str, Any]:
             if k not in z:
                 return None
             v = z[k]
-            if isinstance(v, np.ndarray):
-                return tuple(v.shape)
-            return None
+            return tuple(v.shape) if isinstance(v, np.ndarray) else None
 
         rep["peek"] = {
             "A_hat_all.shape": _shape("A_hat_all"),
@@ -178,7 +273,8 @@ def peek_l2_npz(path: Path) -> Dict[str, Any]:
         rep["error"] = f"{type(e).__name__}: {e}"
     return rep
 
-def _pick_first_key(z: dict, keys: tuple[str, ...]) -> str | None:
+
+def _pick_first_key(z: dict, keys: Tuple[str, ...]) -> Optional[str]:
     for k in keys:
         if k in z:
             return k
@@ -186,14 +282,13 @@ def _pick_first_key(z: dict, keys: tuple[str, ...]) -> str | None:
 
 
 def load_coeff_pair_from_l2(z: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    """
-    从 L2 npz(dict) 中抽取 A_hat / A_true（并做形状校验与兼容 key）。
-    返回 (A_hat, A_true, meta_peek)
-    """
+    """从 L2 npz(dict) 中抽取 A_hat / A_true（并做形状校验与兼容 key）。"""
     k_hat = _pick_first_key(z, ("A_hat_all", "A_hat"))
     k_tru = _pick_first_key(z, ("A_true_all", "A_true"))
     if k_hat is None or k_tru is None:
-        raise KeyError(f"L2 missing coeff keys: need A_hat_all/A_hat and A_true_all/A_true. keys={list(z.keys())}")
+        raise KeyError(
+            f"L2 missing coeff keys: need A_hat_all/A_hat and A_true_all/A_true. keys={list(z.keys())}"
+        )
 
     A_hat = z[k_hat]
     A_true = z[k_tru]
@@ -226,90 +321,14 @@ def load_coeff_pair_from_l2(z: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, 
     return A_hat, A_true, meta
 
 
-def load_coeff_pair(ctx, model_type: str, mask_rate: float, noise_sigma: float) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Path]:
-    """
-    从 ctx.load_l2 读取后抽系数对。
+def load_coeff_pair(
+    ctx, model_type: str, mask_rate: float, noise_sigma: float
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Path]:
+    """从 ctx.load_l2 读取后抽系数对。
+
     返回 (A_hat, A_true, meta_peek, npz_path)
     """
     npz_path = ctx.get_l2_path(model_type, mask_rate, noise_sigma)
     z = ctx.load_l2(model_type, mask_rate, noise_sigma)
     A_hat, A_true, meta = load_coeff_pair_from_l2(z)
     return A_hat, A_true, meta, Path(npz_path)
-
-# === Batch-2: POD cumulative effective scales loader ===
-
-def _pick_col(data_cols: List[str], candidates: Tuple[str, ...]) -> Optional[str]:
-    """优先精确匹配，其次大小写不敏感匹配。"""
-    s = set(data_cols)
-    for c in candidates:
-        if c in s:
-            return c
-    lower_map = {c.lower(): c for c in data_cols}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    return None
-
-def load_pod_mode_scales_standardized(ctx, *, agg_kind: str = "min") -> Dict[str, Any]:
-    """
-    读取 POD save_dir/scale_table.csv 并标准化输出（按你的 scale_table 列名规范）。
-
-    CSV header (given):
-      mode, ..., ell_x_eff, ell_y_eff, ell_min_eff, ell_geo_eff
-
-    输出：
-      r_grid: 1..R
-      leff_x/leff_y/leff_agg: np.ndarray[float]
-      colmap: 使用到的列名映射
-    """
-    pp = pod_artifacts_paths(ctx)
-    tab = load_scale_table_csv(pp.scale_table_csv)
-    cols: List[str] = tab.get("columns", [])
-    data: Dict[str, Any] = tab.get("data", {})
-
-    required = ["mode", "ell_x_eff", "ell_y_eff"]
-    for k in required:
-        if k not in data:
-            raise KeyError(f"[cumulate_io] scale_table.csv missing column '{k}'. cols={cols}")
-
-    if agg_kind not in ("min", "geo"):
-        raise ValueError(f"[cumulate_io] agg_kind must be 'min' or 'geo', got '{agg_kind}'")
-    agg_col = "ell_min_eff" if agg_kind == "min" else "ell_geo_eff"
-    if agg_col not in data:
-        raise KeyError(f"[cumulate_io] scale_table.csv missing column '{agg_col}'. cols={cols}")
-
-    mode_raw = np.asarray(data["mode"], dtype=np.int64)
-    if mode_raw.size == 0:
-        raise ValueError("[cumulate_io] empty 'mode' column in scale_table.csv")
-
-    # 0-based -> 1-based
-    if int(mode_raw.min()) == 0:
-        mode_raw = mode_raw + 1
-
-    order = np.argsort(mode_raw)
-
-    leff_x = np.asarray(data["ell_x_eff"], dtype=float)[order]
-    leff_y = np.asarray(data["ell_y_eff"], dtype=float)[order]
-    leff_agg = np.asarray(data[agg_col], dtype=float)[order]
-
-    R = int(len(mode_raw))
-    # 统一输出 r_grid 为 1..R 的前缀，确保后续合并用“长度对齐”不会错位
-    r_grid = np.arange(1, R + 1, dtype=np.int32)
-
-    colmap = {
-        "r": "mode",
-        "x": "ell_x_eff",
-        "y": "ell_y_eff",
-        "agg": agg_col,
-        "agg_kind": agg_kind,
-    }
-
-    return {
-        "r_grid": r_grid,
-        "leff_x": leff_x,
-        "leff_y": leff_y,
-        "leff_agg": leff_agg,
-        "colmap": colmap,
-        "R": R,
-        "scale_table_path": str(pp.scale_table_csv),
-    }

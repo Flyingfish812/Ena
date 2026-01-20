@@ -1,7 +1,7 @@
 # backend/metrics/cumulate_metrics.py
 from __future__ import annotations
 
-from typing import Literal, Tuple, Any, Dict, Optional
+from typing import Literal, Tuple, Any, Dict, Optional, List
 import numpy as np
 
 
@@ -65,9 +65,9 @@ def compute_nrmse_prefix(
     return r_grid, nrmse_r, "coeff"
 
 
-def merge_leff_and_nrmse(
+def merge_scales_and_nrmse(
     *,
-    leff_pack: Dict[str, Any],
+    scales_pack: Dict[str, Any],
     r_grid_nrmse: np.ndarray,
     nrmse_r: np.ndarray,
     max_r_cfg: Optional[int] = None,
@@ -75,10 +75,31 @@ def merge_leff_and_nrmse(
     """
     对齐并截断到共同 r_grid，输出联合 payload（供 L4 json 落盘/绘图）。
     规则：R_used = min(R_scale, R_nrmse, max_r_cfg(if provided))
+
+    scales_pack 期望来自 cumulate_io.load_pod_mode_scales_standardized(ctx)，包含：
+      - r_grid, R
+      - ell_x_med/prefix/tail
+      - ell_y_med/prefix/tail
+      - colmap, scale_table_path
+
+    返回：
+      {
+        "r_grid": [1..R_used],
+        "R_used": int,
+        "R_scale": int,
+        "R_nrmse": int,
+        "scales": {
+          "ell_x_med": [...], "ell_x_prefix": [...], "ell_x_tail": [...],
+          "ell_y_med": [...], "ell_y_prefix": [...], "ell_y_tail": [...],
+          "colmap": {...},
+          "scale_table_path": "...",
+        },
+        "nrmse_r": [...],
+      }
     """
-    r_grid_scale = leff_pack.get("r_grid", None)
+    r_grid_scale = scales_pack.get("r_grid", None)
     if r_grid_scale is None:
-        raise ValueError("leff_pack missing r_grid")
+        raise ValueError("scales_pack missing r_grid")
     r_grid_scale = np.asarray(r_grid_scale)
 
     r_grid_nrmse = np.asarray(r_grid_nrmse)
@@ -92,33 +113,39 @@ def merge_leff_and_nrmse(
         R_used = min(R_used, int(max_r_cfg))
 
     if R_used <= 0:
-        raise ValueError(f"Invalid R_used={R_used} (R_scale={R_scale}, R_nrmse={R_nrmse}, max_r_cfg={max_r_cfg})")
+        raise ValueError(
+            f"Invalid R_used={R_used} (R_scale={R_scale}, R_nrmse={R_nrmse}, max_r_cfg={max_r_cfg})"
+        )
 
     # 统一输出 r_grid 为 1..R_used
     r_grid = np.arange(1, R_used + 1, dtype=np.int32)
 
-    def _cut(v):
-        if v is None:
-            return None
+    def _cut_arr(v: Any) -> List[float]:
         vv = np.asarray(v, dtype=float)
-        return vv[:R_used].tolist()
+        return vv[:R_used].astype(float).tolist()
 
-    leff_x = _cut(leff_pack.get("leff_x", None))
-    leff_y = _cut(leff_pack.get("leff_y", None))
-    leff_agg = _cut(leff_pack.get("leff_agg", None))
+    required_scale_keys = [
+        "ell_x_med",
+        "ell_x_prefix",
+        "ell_x_tail",
+        "ell_y_med",
+        "ell_y_prefix",
+        "ell_y_tail",
+    ]
+    missing = [k for k in required_scale_keys if k not in scales_pack]
+    if missing:
+        raise KeyError(f"scales_pack missing keys: {missing}")
+
+    scales = {k: _cut_arr(scales_pack[k]) for k in required_scale_keys}
+    scales["colmap"] = scales_pack.get("colmap", None)
+    scales["scale_table_path"] = scales_pack.get("scale_table_path", None)
 
     payload = {
         "r_grid": r_grid.tolist(),
         "R_used": int(R_used),
         "R_scale": int(R_scale),
         "R_nrmse": int(R_nrmse),
-        "leff": {
-            "x": leff_x,
-            "y": leff_y,
-            "agg": leff_agg,
-            "colmap": leff_pack.get("colmap", None),
-            "scale_table_path": leff_pack.get("scale_table_path", None),
-        },
+        "scales": scales,
         "nrmse_r": nrmse_r[:R_used].astype(float).tolist(),
     }
     return payload
