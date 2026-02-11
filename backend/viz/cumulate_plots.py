@@ -21,43 +21,6 @@ def _finite_mask(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.isfinite(x) & np.isfinite(y)
 
 
-def _annotate_r(
-    ax: plt.Axes,
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    every: int = 20,
-    fontsize: int = 9,
-    prefix: str = "r=",
-    digits: int = 0,
-) -> None:
-    """
-    在曲线上每隔 every 个点标注一次 r。
-    改动点：不再用 ri=i+1，而是用 x[i]（通常 r_grid 就是 1..R）。
-    digits=0 表示 r 取整显示；如果 x 不是整数可提高 digits。
-    """
-    if every is None or int(every) <= 0:
-        return
-    n = int(len(x))
-    if n <= 0:
-        return
-
-    step = int(every)
-    idxs = list(range(0, n, step))
-    if (n - 1) not in idxs:
-        idxs.append(n - 1)
-
-    for i in idxs:
-        xi = float(x[i])
-        yi = float(y[i])
-        ax.plot([xi], [yi], marker="o", markersize=5, linestyle="None")
-        if digits <= 0:
-            tag = f"{prefix}{int(round(xi))}"
-        else:
-            tag = f"{prefix}{xi:.{int(digits)}f}"
-        ax.text(xi, yi, tag, fontsize=fontsize, ha="left", va="bottom", alpha=0.9)
-
-
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -70,336 +33,331 @@ def _save_close(fig, path: Path, *, dpi: int = 200) -> None:
     plt.close(fig)
 
 
-def plot_nrmse_vs_r_curves(
+def plot_nrmse_family_vs_r_curves(
     curves: Sequence[Dict[str, Any]],
     *,
-    title: str = "NRMSE(r) vs r",
+    title: str = "NRMSE family vs r",
     xlabel: str = "r (number of modes)",
-    ylabel: str = "NRMSE(r)",
-    plot_mode: str = "line",            # "line" | "scatter"
-    linewidth: float = 2.2,
-    alpha: float = 0.9,
-    yscale: str = "log",                # 默认 log 更符合误差曲线
-    ymin: Optional[float] = None,
-    y_eps: float = 1e-12,
-    annotate_every: int = 20,
-    annotate_fontsize: int = 9,
-    annotate_digits: int = 0,
-    legend_mode: str = "short",         # "short"|"none"
+    ylabel: str = "NRMSE (relative error)",
+    nrmse_kinds: Sequence[str] = ("nrmse_full", "nrmse_prefix", "nrmse_tail"),
     legend_outside: bool = True,
-    make_zoom: bool = False,
-    zoom_ymax: float = 0.05,
-    return_extra_figs: bool = False,
 ):
+    """
+    画 “NRMSE_{full/prefix/tail} vs r”（线性坐标，不拟合）：
+
+    - 同一条配置(label)的多种 nrmse：同色，不同线型
+        nrmse_full   : 实线，alpha=0.9
+        nrmse_prefix : 虚线，alpha=0.5
+        nrmse_tail   : 点虚线，alpha=0.5
+    - 标点：每隔 20 个 r 打一个点，但不标注 r=...
+    - marker 颜色与对应线条颜色一致
+    - legend 放到图外（双 legend）
+    """
     if curves is None or len(curves) == 0:
-        return (None, {}) if return_extra_figs else None
+        return None
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.0))
-    extra_figs: Dict[str, Any] = {}
+    want = [str(e).strip() for e in list(nrmse_kinds)]
+    want = [e for e in want if e in ("nrmse_full", "nrmse_prefix", "nrmse_tail")]
+    if not want:
+        want = ["nrmse_full", "nrmse_prefix", "nrmse_tail"]
+
+    style = {
+        "nrmse_full": "-",
+        "nrmse_prefix": "--",
+        "nrmse_tail": "-.",
+    }
+    alpha_map = {
+        "nrmse_full": 0.9,
+        "nrmse_prefix": 0.5,
+        "nrmse_tail": 0.5,
+    }
+
+    step = 20  # 每隔 20 个 r 打一个点
+
+    fig, ax = plt.subplots(figsize=(10.8, 6.2))
+
+    config_handles, config_labels = [], []
+    type_handles, type_labels = [], []
     any_plotted = False
-
-    yscale = str(yscale).lower().strip()
-    if yscale not in ("linear", "log"):
-        yscale = "log"
 
     for c in curves:
         label = str(c.get("label", ""))
         x = _as_1d_float(c.get("x", None))
-        y = _as_1d_float(c.get("y", None))
-        if x is None or y is None:
+        nrmse = c.get("nrmse", {}) or {}
+
+        if x is None or len(x) <= 1:
             continue
 
-        n = min(len(x), len(y))
-        if n <= 1:
-            continue
-        x = x[:n]
-        y = y[:n]
+        def _get_series(k: str):
+            y = nrmse.get(k, None)
+            if y is None:
+                return None
+            y = _as_1d_float(y)
+            if y is None:
+                return None
+            n = min(len(x), len(y))
+            if n <= 1:
+                return None
+            xx = x[:n]
+            yy = y[:n]
+            m = _finite_mask(xx, yy)
+            xx = xx[m]
+            yy = yy[m]
+            if len(xx) <= 1:
+                return None
+            return xx, yy
 
-        m = _finite_mask(x, y)
-        x = x[m]
-        y = y[m]
-        if len(x) <= 1:
-            continue
+        base_color = None
+        first_key = None
 
-        leg = (label if legend_mode != "none" else "_nolegend_")
-
-        if plot_mode == "scatter":
-            ax.scatter(x, y, s=18, alpha=0.55, label=leg)
-        else:
-            ax.plot(x, y, linewidth=float(linewidth), alpha=float(alpha), label=leg)
-
-        if annotate_every and int(annotate_every) > 0:
-            _annotate_r(
-                ax, x, y,
-                every=int(annotate_every),
-                fontsize=int(annotate_fontsize),
-                prefix="r=",
-                digits=int(annotate_digits),
+        # ---- 先画第一条曲线，用来“占位”颜色 ----
+        for k in want:
+            got = _get_series(k)
+            if got is None:
+                continue
+            xx, yy = got
+            ln, = ax.plot(
+                xx, yy,
+                linestyle=style[k],
+                linewidth=2.2,
+                alpha=alpha_map[k],
+                label="_nolegend_",
             )
+            base_color = ln.get_color()
+            first_key = k
+            any_plotted = True
 
-        any_plotted = True
+            # 每隔 step 个点打 marker（不标文字）
+            ax.scatter(
+                xx[::step],
+                yy[::step],
+                s=20,
+                color=base_color,
+                zorder=3,
+            )
+            break
+
+        if base_color is None:
+            continue
+
+        # 配置 legend（颜色）
+        config_handles.append(
+            plt.Line2D([0], [0], color=base_color, linestyle="-", linewidth=2.6)
+        )
+        config_labels.append(label)
+
+        # ---- 画同一配置的其它 nrmse 曲线（同色，不同线型/透明度） ----
+        for k in want:
+            if k == first_key:
+                continue
+            got = _get_series(k)
+            if got is None:
+                continue
+            xx, yy = got
+            ax.plot(
+                xx, yy,
+                color=base_color,
+                linestyle=style[k],
+                linewidth=2.2,
+                alpha=alpha_map[k],
+                label="_nolegend_",
+            )
+            any_plotted = True
+
+            # 每隔 step 个点打 marker（不标文字）
+            ax.scatter(
+                xx[::step],
+                yy[::step],
+                s=20,
+                color=base_color,
+                zorder=3,
+            )
 
     if not any_plotted:
         plt.close(fig)
-        return (None, {}) if return_extra_figs else None
+        return None
 
-    if yscale == "log":
-        floor = float(y_eps if y_eps is not None else 1e-12)
-        if ymin is not None:
-            floor = max(floor, float(ymin))
-        ax.set_yscale("log")
-        ax.set_ylim(bottom=floor)
-    else:
-        if ymin is not None:
-            ax.set_ylim(bottom=float(ymin))
+    # ---- nrmse 类型 legend（线型） ----
+    for k in want:
+        type_handles.append(
+            plt.Line2D(
+                [0], [0],
+                color="black",
+                linestyle=style[k],
+                linewidth=2.2,
+                alpha=alpha_map[k],
+                marker="o",
+                markersize=4,
+            )
+        )
+        type_labels.append(k)
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25, which="both" if yscale == "log" else "major")
+    ax.set_yscale("linear")
+    ax.grid(True, alpha=0.25)
 
-    if legend_mode != "none":
-        handles, labels = ax.get_legend_handles_labels()
-        if legend_outside and len(labels) > 0:
-            n_legend = len(labels)
-            right = 0.86 if n_legend <= 2 else (0.80 if n_legend <= 5 else 0.74)
-            fig.subplots_adjust(left=0.10, right=right, top=0.92, bottom=0.12)
-            fig.legend(
-                handles, labels,
-                loc="center right",
-                bbox_to_anchor=(0.985, 0.5),
-                bbox_transform=fig.transFigure,
-                frameon=True,
-                borderaxespad=0.0,
-            )
-        else:
-            ax.legend(loc="best")
-            fig.tight_layout()
-    else:
-        fig.tight_layout()
-
-    # zoom figure (linear y)
-    if make_zoom:
-        figz, axz = plt.subplots(figsize=(10.5, 6.0))
-        for c in curves:
-            label = str(c.get("label", ""))
-            x = _as_1d_float(c.get("x", None))
-            y = _as_1d_float(c.get("y", None))
-            if x is None or y is None:
-                continue
-            n = min(len(x), len(y))
-            if n <= 1:
-                continue
-            x = x[:n]
-            y = y[:n]
-            m = _finite_mask(x, y)
-            x = x[m]
-            y = y[m]
-            if len(x) <= 1:
-                continue
-
-            leg = (label if legend_mode != "none" else "_nolegend_")
-            if plot_mode == "scatter":
-                axz.scatter(x, y, s=18, alpha=0.55, label=leg)
-            else:
-                axz.plot(x, y, linewidth=float(linewidth), alpha=float(alpha), label=leg)
-
-        axz.set_title(title + f" (zoom y≤{zoom_ymax:g})")
-        axz.set_xlabel(xlabel)
-        axz.set_ylabel(ylabel)
-        axz.set_ylim(0.0, float(zoom_ymax))
-        axz.grid(True, alpha=0.25)
-
-        if legend_mode != "none":
-            handles, labels = axz.get_legend_handles_labels()
-            if legend_outside and len(labels) > 0:
-                n_legend = len(labels)
-                right = 0.86 if n_legend <= 2 else (0.80 if n_legend <= 5 else 0.74)
-                figz.subplots_adjust(left=0.10, right=right, top=0.92, bottom=0.12)
-                figz.legend(
-                    handles, labels,
-                    loc="center right",
-                    bbox_to_anchor=(0.985, 0.5),
-                    bbox_transform=figz.transFigure,
-                    frameon=True,
-                    borderaxespad=0.0,
-                )
-            else:
-                axz.legend(loc="best")
-                figz.tight_layout()
-        else:
-            figz.tight_layout()
-
-        extra_figs["zoom"] = figz
-
-    return (fig, extra_figs) if return_extra_figs else fig
-
-
-def plot_dual_scale_nrmse_vs_r(
-    curves: Sequence[Dict[str, Any]],
-    *,
-    title: str = "Scale (left) + NRMSE (right) vs r",
-    xlabel: str = "r (number of modes)",
-    ylabel_left: str = "ℓ(r)  (smaller=finer)",
-    ylabel_right: str = "NRMSE(r)",
-    left_yscale: str = "log",
-    left_ymin: Optional[float] = None,
-    left_eps: float = 1e-12,
-    invert_left: bool = True,   # 默认更直观：越细越高
-    right_yscale: str = "log",
-    right_ymin: Optional[float] = None,
-    right_eps: float = 1e-12,
-    linewidth_left: float = 2.4,
-    linewidth_right: float = 2.0,
-    alpha_left: float = 0.9,
-    alpha_right: float = 0.75,
-    annotate_every: int = 20,
-    annotate_fontsize: int = 9,
-    annotate_digits: int = 0,
-    annotate_on: str = "right",   # "left"|"right"|"none"
-    legend_outside: bool = True,
-):
-    if curves is None or len(curves) == 0:
-        return None
-
-    fig, axL = plt.subplots(figsize=(11.2, 6.2))
-    axR = axL.twinx()
-
-    left_yscale = str(left_yscale).lower().strip()
-    if left_yscale not in ("linear", "log"):
-        left_yscale = "log"
-    right_yscale = str(right_yscale).lower().strip()
-    if right_yscale not in ("linear", "log"):
-        right_yscale = "log"
-
-    any_plotted = False
-
-    for c in curves:
-        label = str(c.get("label", ""))
-        x = _as_1d_float(c.get("x", None))
-        yl = _as_1d_float(c.get("y_left", None))
-        yr = _as_1d_float(c.get("y_right", None))
-        if x is None or yl is None or yr is None:
-            continue
-
-        n = min(len(x), len(yl), len(yr))
-        if n <= 1:
-            continue
-        x = x[:n]
-        yl = yl[:n]
-        yr = yr[:n]
-
-        m = np.isfinite(x) & np.isfinite(yl) & np.isfinite(yr)
-        x = x[m]
-        yl = yl[m]
-        yr = yr[m]
-        if len(x) <= 1:
-            continue
-
-        axL.plot(x, yl, linewidth=float(linewidth_left), alpha=float(alpha_left), label=f"{label} | scale")
-        axR.plot(x, yr, linewidth=float(linewidth_right), alpha=float(alpha_right), linestyle="--",
-                 label=f"{label} | nrmse")
-
-        if annotate_on == "left":
-            _annotate_r(axL, x, yl, every=int(annotate_every), fontsize=int(annotate_fontsize),
-                        prefix="r=", digits=int(annotate_digits))
-        elif annotate_on == "right":
-            _annotate_r(axR, x, yr, every=int(annotate_every), fontsize=int(annotate_fontsize),
-                        prefix="r=", digits=int(annotate_digits))
-
-        any_plotted = True
-
-    if not any_plotted:
-        plt.close(fig)
-        return None
-
-    if left_yscale == "log":
-        floor = float(left_eps if left_eps is not None else 1e-12)
-        if left_ymin is not None:
-            floor = max(floor, float(left_ymin))
-        axL.set_yscale("log")
-        axL.set_ylim(bottom=floor)
-    else:
-        if left_ymin is not None:
-            axL.set_ylim(bottom=float(left_ymin))
-
-    if invert_left:
-        axL.invert_yaxis()
-
-    if right_yscale == "log":
-        floor = float(right_eps if right_eps is not None else 1e-12)
-        if right_ymin is not None:
-            floor = max(floor, float(right_ymin))
-        axR.set_yscale("log")
-        axR.set_ylim(bottom=floor)
-    else:
-        if right_ymin is not None:
-            axR.set_ylim(bottom=float(right_ymin))
-
-    axL.set_title(title)
-    axL.set_xlabel(xlabel)
-    axL.set_ylabel(ylabel_left)
-    axR.set_ylabel(ylabel_right)
-
-    axL.grid(True, alpha=0.25, which="both" if (left_yscale == "log" or right_yscale == "log") else "major")
-
-    # legend combine
-    hL, lL = axL.get_legend_handles_labels()
-    hR, lR = axR.get_legend_handles_labels()
-    handles = hL + hR
-    labels = lL + lR
-
-    if legend_outside and len(labels) > 0:
-        n_legend = len(labels)
-        right = 0.86 if n_legend <= 4 else (0.80 if n_legend <= 8 else 0.74)
+    if legend_outside:
+        right = 0.78 if len(config_labels) > 6 else 0.82
         fig.subplots_adjust(left=0.10, right=right, top=0.92, bottom=0.12)
-        fig.legend(
-            handles, labels,
-            loc="center right",
-            bbox_to_anchor=(0.985, 0.5),
+
+        leg1 = fig.legend(
+            config_handles, config_labels,
+            loc="upper right",
+            bbox_to_anchor=(0.985, 0.92),
             bbox_transform=fig.transFigure,
             frameon=True,
             borderaxespad=0.0,
+            title="curves",
+        )
+        fig.add_artist(leg1)
+
+        fig.legend(
+            type_handles, type_labels,
+            loc="lower right",
+            bbox_to_anchor=(0.985, 0.08),
+            bbox_transform=fig.transFigure,
+            frameon=True,
+            borderaxespad=0.0,
+            title="nrmse kinds",
         )
     else:
-        axL.legend(handles, labels, loc="best")
+        handles = config_handles + type_handles
+        labels = config_labels + type_labels
+        ax.legend(handles, labels, loc="best")
         fig.tight_layout()
 
     return fig
 
 
-def render_save_nrmse_vs_r(
-    curves: Sequence[Dict[str, Any]],
-    *,
-    out_png: Path,
-    out_png_zoom: Optional[Path] = None,
-    dpi: int = 200,
-    **plot_kwargs: Any,
-) -> Dict[str, Optional[str]]:
-    fig, extra = plot_nrmse_vs_r_curves(curves, return_extra_figs=True, **plot_kwargs)
-    written = {"main": None, "zoom": None}
-    if fig is None:
-        return written
-
-    _save_close(fig, Path(out_png), dpi=int(dpi))
-    written["main"] = str(out_png)
-
-    if out_png_zoom is not None and extra and extra.get("zoom", None) is not None:
-        _save_close(extra["zoom"], Path(out_png_zoom), dpi=int(dpi))
-        written["zoom"] = str(out_png_zoom)
-
-    return written
-
-
-def render_save_dual_vs_r(
+def render_save_nrmse_family_vs_r(
     curves: Sequence[Dict[str, Any]],
     *,
     out_png: Path,
     dpi: int = 200,
     **plot_kwargs: Any,
 ) -> Optional[str]:
-    fig = plot_dual_scale_nrmse_vs_r(curves, **plot_kwargs)
+    fig = plot_nrmse_family_vs_r_curves(curves, **plot_kwargs)
     if fig is None:
         return None
     _save_close(fig, Path(out_png), dpi=int(dpi))
+    return str(out_png)
+
+
+def plot_dual_scale_nrmse_xy_vs_r(
+    *,
+    r_grid: np.ndarray,
+    ell_x: np.ndarray,
+    ell_y: np.ndarray,
+    curves_right: Sequence[Dict[str, Any]],
+    title: str,
+    xlabel: str = "r (number of modes)",
+    ylabel_left_x: str = "ℓ_x(r)",
+    ylabel_left_y: str = "ℓ_y(r)",
+    ylabel_right: str = "NRMSE(r)",
+    legend_outside: bool = True,
+):
+    """
+    单图双纵轴（x/y 尺度同图）：
+      - 左纵轴：ℓ_x, ℓ_y scatter（两种固定颜色，与配置无关）
+      - 右纵轴：NRMSE 实线（多配置，颜色区分）
+    约束：
+      - ℓ_* 仅画一组散点（不随配置变化）
+      - NRMSE 用彩色实线
+      - 常数坐标轴（linear）
+      - 共用一个 legend（放在底部）
+    """
+    fig, ax_l = plt.subplots(1, 1, figsize=(11.8, 6.2))
+    ax_r = ax_l.twinx()
+
+    # 固定使用颜色轮盘之外的颜色
+    color_ell_x = "#222222"   # 深灰（x 尺度）
+    color_ell_y = "#7A3E9D"   # 紫色（y 尺度）
+
+    # ---- 左轴：尺度 scatter ----
+    ax_l.scatter(
+        r_grid, ell_x,
+        s=12, c=color_ell_x, alpha=0.5, label="ell_x"
+    )
+    ax_l.scatter(
+        r_grid, ell_y,
+        s=12, c=color_ell_y, alpha=0.5, label="ell_y"
+    )
+    ax_l.set_xlabel(xlabel)
+    ax_l.set_ylabel("scale ℓ(r)")
+    ax_l.set_yscale("linear")
+    ax_l.grid(True, alpha=0.25)
+
+    # ---- 右轴：NRMSE 曲线 ----
+    for c in curves_right:
+        label_lower = c.get("label", "").lower()
+        if "mlp" in label_lower:
+            linestyle = "--"
+        else:
+            linestyle = "-"   # linear / 其它默认
+
+        ax_r.plot(
+            r_grid,
+            c["y"],
+            linewidth=2.2,
+            linestyle=linestyle,
+            color=c["color"],
+            label=c["label"],
+        )
+
+    ax_r.set_ylabel(ylabel_right)
+    ax_r.set_yscale("log")
+
+    fig.suptitle(title)
+
+    # ---- shared legend (bottom) ----
+    handles_scale = [
+        plt.Line2D([0], [0], marker="o", linestyle="None",
+                   color=color_ell_x, label="ell_x"),
+        plt.Line2D([0], [0], marker="o", linestyle="None",
+                   color=color_ell_y, label="ell_y"),
+    ]
+    handles_err = [
+        plt.Line2D([0], [0], color=c["color"], linewidth=2.2, label=c["label"])
+        for c in curves_right
+    ]
+    handles = handles_scale + handles_err
+    labels = [h.get_label() for h in handles]
+
+    if legend_outside:
+        fig.subplots_adjust(bottom=0.22, top=0.90, left=0.10, right=0.90)
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            ncol=min(5, len(labels)),
+            frameon=True,
+        )
+    else:
+        ax_l.legend(handles, labels, loc="best")
+
+    return fig
+
+
+def render_save_dual_xy_vs_r(
+    *,
+    r_grid: np.ndarray,
+    ell_x: np.ndarray,
+    ell_y: np.ndarray,
+    curves_right: Sequence[Dict[str, Any]],
+    out_png: Path,
+    dpi: int = 200,
+    **plot_kwargs: Any,
+) -> Optional[str]:
+    fig = plot_dual_scale_nrmse_xy_vs_r(
+        r_grid=r_grid,
+        ell_x=ell_x,
+        ell_y=ell_y,
+        curves_right=curves_right,
+        **plot_kwargs,
+    )
+    if fig is None:
+        return None
+    _save_close(fig, out_png, dpi=dpi)
     return str(out_png)
