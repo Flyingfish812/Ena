@@ -1,0 +1,61 @@
+data:
+  source: mat_sst
+  path: data/sst_weekly.mat
+  cache_dir: artifacts/preanalysis_cache
+
+  mat_key: sst
+  sst_fill_nan: per_frame_mean
+  sst_reshape: 360x180_rot90
+
+  # 注意：该值需和现有 L1(pod_meta.T)一致，否则 L2 会因 T 不匹配失败
+  sst_max_frames: 64
+
+pod:
+  r: 64
+  center: true
+  save_dir: artifacts/pod/sst_weekly
+
+  dx: 1.0
+  dy: 1.0
+
+  # cumulate 三个 L4 模组依赖 L1 的 scale_table.csv
+  scale_channel_reduce: l2
+  enable_scale_analysis: true
+  scale_analysis:
+    method: B_robust_energy_centroid
+    k_min: null
+    k_max: null
+    demean_line: true
+
+  # L2/L4(cumulate) 不依赖 basis_spectrum，保持关闭
+  enable_basis_spectrum: false
+  fft_basis:
+    demean: true
+    window: null
+    norm: null
+
+eval:
+  # 必须保持与 cylinder_exp_full 一致
+  mask_rates: [0.0001, 0.0005, 0.001, 0.002, 0.005]
+  noise_sigmas: [0, 0.001, 0.01, 0.1]
+
+  centered_pod: true
+
+  # 以下大多用于其它 L4 模组，当前仅保留注释模板，不参与解析
+  # save_dir: artifacts/eval
+  # pod_bands:
+  #   L1: [0, 16]
+  #   L2: [16, 32]
+  # fourier:
+  #   enabled: true
+  #   band_scheme: physical
+
+train:
+  # 保持与 cylinder_exp_full 一致
+  noise_sigma: 0.0
+  hidden_dims: [64, 64]
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 500
+  device: cuda
+  save_dir: artifacts/nn

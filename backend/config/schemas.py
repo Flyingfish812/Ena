@@ -16,9 +16,45 @@ class DataConfig:
     """
     原始数据集配置。
     """
-    nc_path: Path
+
+    # -----------------
+    # Source routing
+    # -----------------
+    # Supported:
+    #   - "netcdf"  : use nc_path/var_keys (legacy default)
+    #   - "h5_rdb"  : data/2D_rdb_NA_NA.h5
+    #   - "mat_sst" : data/sst_weekly.mat (MAT v7.3 / HDF5)
+    source: str = "netcdf"
+
+    # New generic path (preferred for new datasets). If omitted, fall back to nc_path.
+    path: Path | None = None
+
+    # Legacy field kept for backward compatibility.
+    nc_path: Path | None = None
+
+    # NetCDF only
     var_keys: Tuple[str, ...] = ("u", "v")
+
+    # Optional cache directory for loaders to store derived arrays (e.g. sampled memmaps)
     cache_dir: Path | None = None
+
+    # -----------------
+    # h5_rdb options
+    # -----------------
+    h5_rdb_dataset_key: str = "data"
+    h5_rdb_group_count: int = 50
+    h5_rdb_group_start: int = 0
+    h5_rdb_group_step: int = 1
+    h5_rdb_frames_per_group: int = 10
+    h5_rdb_frame_sampling: str = "linspace"  # "linspace" only for now
+
+    # -----------------
+    # mat_sst options
+    # -----------------
+    mat_key: str = "sst"
+    sst_fill_nan: str = "per_frame_mean"  # "per_frame_mean" | "global_mean" | "zero"
+    sst_reshape: str = "360x180_rot90"    # match scripts/analyze_new_datasets.py
+    sst_max_frames: int | None = None
 
 
 @dataclass

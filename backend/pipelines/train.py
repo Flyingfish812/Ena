@@ -1,5 +1,10 @@
-# backend/pipeline_train.py
-# v2.0 draft: training + reconstruction (Level-2 artifacts) pipeline entry for ipynb
+"""v2 pipelines: Level-2/3 producers used by notebooks.
+
+Status notes:
+- `compute_level2_rebuild` and `compute_level3_fft_from_level2` are the supported v2 entrypoints.
+- `compute_full_eval_results` is a *compat wrapper* kept for older notebook habits.
+    It is not used by the current console by default, but is kept working to avoid footguns.
+"""
 
 from __future__ import annotations
 
@@ -192,6 +197,14 @@ def compute_full_eval_results(
     run_pre_analysis: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
+    """LEGACY/COMPAT wrapper.
+
+    Prefer calling:
+    - `compute_level2_rebuild(...)` for L2
+    - `compute_level3_fft_from_level2(exp_dir=...)` for L3 (optional)
+
+    This wrapper exists only for the older "one function does everything" workflow.
+    """
     # Run Level-2 first
     l2_pack = compute_level2_rebuild(
         yaml_path=yaml_path,
@@ -204,9 +217,7 @@ def compute_full_eval_results(
     l3_pack = None
     if run_pre_analysis:
         l3_pack = compute_level3_fft_from_level2(
-            eval_cfg=l2_pack["eval_cfg"],
             exp_dir=l2_pack["exp_dir"],
-            l2_index=l2_pack["L2"],
             verbose=verbose,
         )
 

@@ -165,9 +165,18 @@ def mod_cumulate_nrmse_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
     entries = _load_nrmse_scales_pack_entries(ctx)
 
-    group_by = str(kwargs.get("group_by", "p")).lower().strip()  # "p"|"sigma"
-    if group_by not in ("p", "sigma"):
-        group_by = "p"
+    group_by = str(kwargs.get("group_by", "all")).lower().strip()
+
+    alias_map = {
+        "p": "mask_rate",
+        "mask_rate": "mask_rate",
+        "sigma": "noise_sigma",
+        "noise_sigma": "noise_sigma",
+        "model": "model_type",
+        "model_type": "model_type",
+        "all": "all",
+    }
+    group_by_norm = alias_map.get(group_by, "all")
 
     nrmse_kinds = kwargs.get("nrmse_kinds", ["nrmse_full", "nrmse_prefix", "nrmse_tail"])
     if isinstance(nrmse_kinds, str):
@@ -185,7 +194,11 @@ def mod_cumulate_nrmse_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
     def _group_key(e: Dict[str, Any]) -> str:
         meta = e.get("meta", {}) or {}
-        if group_by == "p":
+        if group_by_norm == "all":
+            return "all"
+        if group_by_norm == "model_type":
+            return f"model_type={meta.get('model_type', 'unknown')}"
+        if group_by_norm == "mask_rate":
             return f"p={meta.get('mask_rate', 'unknown')}"
         return f"sigma={meta.get('noise_sigma', 'unknown')}"
 
@@ -236,7 +249,7 @@ def mod_cumulate_nrmse_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         "mod": "cumulate.nrmse_vs_r_plot",
         "out_dir": str(out_dir),
         "fig_dir": str(fig_dir),
-        "group_by": group_by,
+        "group_by": group_by_norm,
         "nrmse_kinds": nrmse_kinds,
         "label_mode": label_mode,
         "legend_outside": legend_outside,
@@ -266,9 +279,17 @@ def mod_cumulate_dual_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """
     assert ctx.paths is not None
 
-    group_by = str(kwargs.get("group_by", "p")).lower().strip()
-    if group_by not in ("p", "sigma"):
-        group_by = "p"
+    group_by = str(kwargs.get("group_by", "all")).lower().strip()
+    alias_map = {
+        "p": "mask_rate",
+        "mask_rate": "mask_rate",
+        "sigma": "noise_sigma",
+        "noise_sigma": "noise_sigma",
+        "model": "model_type",
+        "model_type": "model_type",
+        "all": "all",
+    }
+    group_by_norm = alias_map.get(group_by, "all")
 
     dpi = int(kwargs.get("dpi", 200))
     legend_outside = bool(kwargs.get("legend_outside", True))
@@ -287,7 +308,11 @@ def mod_cumulate_dual_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
     def _group_key(e: Dict[str, Any]) -> str:
         meta = e.get("meta", {}) or {}
-        if group_by == "p":
+        if group_by_norm == "all":
+            return "all"
+        if group_by_norm == "model_type":
+            return f"model_type={meta.get('model_type', 'unknown')}"
+        if group_by_norm == "mask_rate":
             return f"p={meta.get('mask_rate', 'unknown')}"
         return f"sigma={meta.get('noise_sigma', 'unknown')}"
 
@@ -353,7 +378,7 @@ def mod_cumulate_dual_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "scale_family": scale_family,
                 "nrmse_kind": nrmse_kind,
-                "group_by": group_by,
+                "group_by": group_by_norm,
                 "fig_dir": str(fig_dir),
                 "written": written,
             },
@@ -362,7 +387,7 @@ def mod_cumulate_dual_vs_r_plot(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "mod": "cumulate.dual_vs_r_plot",
         "out_dir": str(base_out),
-        "group_by": group_by,
+        "group_by": group_by_norm,
         "categories": categories,
         "written": written,
     }

@@ -40,7 +40,7 @@ import numpy as np
 from ..config.schemas import DataConfig, PodConfig, EvalConfig, TrainConfig
 from ..pod.compute import build_pod
 from ..pod.project import project_to_pod
-from ..dataio.nc_loader import load_raw_nc
+from ..dataio.loader import load_raw, describe_source
 from ..dataio.io_utils import load_numpy, load_json, ensure_dir
 from ..sampling.masks import generate_random_mask_hw, flatten_mask
 from ..sampling.noise import add_gaussian_noise
@@ -149,9 +149,9 @@ def _prepare_snapshots(
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if verbose:
-        print(f"[rebuild] Loading full raw data from {data_cfg.nc_path} ...")
+        print(f"[rebuild] Loading full raw data from {describe_source(data_cfg)} ...")
 
-    X_thwc = load_raw_nc(data_cfg)  # [T,H,W,C]
+    X_thwc = load_raw(data_cfg)  # [T,H,W,C]
     T, H, W, C = X_thwc.shape
     D = H * W * C
 

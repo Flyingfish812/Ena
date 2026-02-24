@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 
 from backend.config.schemas import DataConfig, PodConfig
-from backend.dataio.nc_loader import load_raw_nc
+from backend.dataio.loader import load_raw, describe_source
 from backend.dataio.io_utils import ensure_dir, save_numpy, save_json
 from backend.pod.scaler import build_scale_table, build_basis_spectrum
 from pathlib import Path
@@ -275,11 +275,13 @@ def build_pod(
     """
     if verbose:
         print("=== [POD] Step 1: 读取原始数据 ===")
-        print(f"  - nc_path : {data_cfg.nc_path}")
-        print(f"  - var_keys: {data_cfg.var_keys}")
+        print(f"  - source  : {getattr(data_cfg, 'source', 'netcdf')}")
+        print(f"  - path    : {describe_source(data_cfg)}")
+        if str(getattr(data_cfg, 'source', 'netcdf')).lower().strip() in ("netcdf", "nc"):
+            print(f"  - var_keys: {data_cfg.var_keys}")
 
     # 1) 读取原始数据
-    X_thwc = load_raw_nc(data_cfg)   # [T,H,W,C]
+    X_thwc = load_raw(data_cfg)   # [T,H,W,C]
     T, H, W, C = X_thwc.shape
     N = T
     D = H * W * C

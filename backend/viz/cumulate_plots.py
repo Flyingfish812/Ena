@@ -289,13 +289,15 @@ def plot_dual_scale_nrmse_xy_vs_r(
     ax_l.set_yscale("linear")
     ax_l.grid(True, alpha=0.25)
 
+    def _curve_linestyle(label: str) -> str:
+        label_lower = str(label).lower()
+        if "mlp" in label_lower:
+            return "--"
+        return "-"   # linear / 其它默认
+
     # ---- 右轴：NRMSE 曲线 ----
     for c in curves_right:
-        label_lower = c.get("label", "").lower()
-        if "mlp" in label_lower:
-            linestyle = "--"
-        else:
-            linestyle = "-"   # linear / 其它默认
+        linestyle = _curve_linestyle(c.get("label", ""))
 
         ax_r.plot(
             r_grid,
@@ -319,7 +321,14 @@ def plot_dual_scale_nrmse_xy_vs_r(
                    color=color_ell_y, label="ell_y"),
     ]
     handles_err = [
-        plt.Line2D([0], [0], color=c["color"], linewidth=2.2, label=c["label"])
+        plt.Line2D(
+            [0],
+            [0],
+            color=c["color"],
+            linewidth=2.2,
+            linestyle=_curve_linestyle(c.get("label", "")),
+            label=c["label"],
+        )
         for c in curves_right
     ]
     handles = handles_scale + handles_err

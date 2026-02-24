@@ -1,7 +1,16 @@
 # backend/pipeline.py
 
-"""
-为 notebook / GUI 提供的高层“一键调用”接口。
+"""LEGACY high-level interface (kept, but not the primary v2 pipeline).
+
+This file contains older "one-click" orchestration helpers and plotting utilities.
+It is still useful for quick demos / legacy experiments, but the current v2
+artifacts workflow is:
+
+- Level-2 (train + rebuild): `backend.pipelines.train.compute_level2_rebuild`
+- Level-3 (FFT pre-analysis): `backend.pipelines.train.compute_level3_fft_from_level2`
+- Level-4 (modular plots/metrics): `backend.pipelines.eval.start.compute_level4_eval_mods`
+
+Kept for paper figure backfills and older experiment folders.
 """
 
 from pathlib import Path
@@ -11,7 +20,7 @@ from .config.schemas import DataConfig, PodConfig, TrainConfig, EvalConfig
 from .pod.compute import build_pod
 
 from .dataio.io_utils import load_numpy, load_json, ensure_dir
-from .dataio.nc_loader import load_raw_nc
+from .dataio.loader import load_raw, describe_source
 from .pod.project import project_to_pod, reconstruct_from_pod
 from .sampling.masks import generate_random_mask_hw, flatten_mask, apply_mask_flat
 from .sampling.noise import add_gaussian_noise
@@ -667,8 +676,8 @@ def run_train_mlp_pipeline(
 
     # 3) 加载全量数据，展平
     if verbose:
-        print(f"[train-pipeline] Loading full raw data from {data_cfg.nc_path} ...")
-    X_thwc = load_raw_nc(data_cfg)  # [T,H,W,C]
+        print(f"[train-pipeline] Loading full raw data from {describe_source(data_cfg)} ...")
+    X_thwc = load_raw(data_cfg)  # [T,H,W,C]
     T2, H2, W2, C2 = X_thwc.shape
     if (T2, H2, W2, C2) != (T, H, W, C):
         raise ValueError(
@@ -990,7 +999,7 @@ def quick_test_linear_baseline(
     if verbose:
         print(f"[quick_test] Loading raw data from {nc_path} ...")
 
-    X_thwc = load_raw_nc(data_cfg)
+    X_thwc = load_raw(data_cfg)
     x = X_thwc[frame_idx]      # [H,W,C]
     x_flat = x.reshape(-1)     # [D]
 
@@ -1242,7 +1251,7 @@ def quick_test_mlp_baseline(
     if verbose:
         print(f"[quick_test_mlp] Loading full raw data from {nc_path} ...")
 
-    X_thwc = load_raw_nc(data_cfg)          # [T,H,W,C]
+    X_thwc = load_raw(data_cfg)          # [T,H,W,C]
     if X_thwc.shape[0] != T:
         # 理论上不会出错，只是稳一下
         T = X_thwc.shape[0]

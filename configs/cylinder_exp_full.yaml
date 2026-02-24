@@ -6,7 +6,7 @@ data:
 pod:
   r: 128
   center: true
-  save_dir: artifacts/pod
+  save_dir: artifacts/pod/cylinder2d
 
   # 和 eval.fourier.grid_meta.dx/dy 对齐
   dx: 0.0125

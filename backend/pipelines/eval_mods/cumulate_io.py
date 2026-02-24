@@ -113,15 +113,27 @@ def load_scale_table_csv(path: Path) -> Dict[str, Any]:
         cols = list(reader.fieldnames or [])
         rows: List[Dict[str, Any]] = [r for r in reader]
 
+    def _try_float_or_nan(v: Any) -> Tuple[bool, float]:
+        if v is None:
+            return True, float("nan")
+        s = str(v).strip()
+        if s == "":
+            return True, float("nan")
+        try:
+            return True, float(s)
+        except Exception:
+            return False, float("nan")
+
     data: Dict[str, Any] = {}
     for c in cols:
         col_vals = [rows[i].get(c, "") for i in range(len(rows))]
         ok_num = True
         out_num: List[float] = []
         for v in col_vals:
-            try:
-                out_num.append(float(v))
-            except Exception:
+            ok, vv = _try_float_or_nan(v)
+            if ok:
+                out_num.append(vv)
+            else:
                 ok_num = False
                 break
         data[c] = np.asarray(out_num, dtype=float) if ok_num else np.asarray(col_vals, dtype=object)

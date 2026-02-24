@@ -1,0 +1,67 @@
+data:
+  source: h5_rdb
+  path: data/2D_rdb_NA_NA.h5
+  cache_dir: artifacts/preanalysis_cache
+
+  h5_rdb_dataset_key: data
+  h5_rdb_group_count: 50
+  h5_rdb_group_start: 0
+  h5_rdb_group_step: 1
+  h5_rdb_frames_per_group: 10
+  h5_rdb_frame_sampling: linspace
+
+pod:
+  r: 128
+  center: true
+  save_dir: artifacts/pod/rdb_h5
+
+  dx: 1.0
+  dy: 1.0
+
+  scale_channel_reduce: l2
+  enable_scale_analysis: false
+  scale_analysis:
+    method: B_robust_energy_centroid
+    k_min: null
+    k_max: null
+    demean_line: true
+
+  enable_basis_spectrum: false
+  fft_basis:
+    demean: true
+    window: null
+    norm: null
+
+eval:
+  mask_rates: [0.0004]
+  noise_sigmas: [0.0]
+
+  pod_bands:
+    L1: [0, 16]
+    L2: [16, 32]
+    M1: [32, 48]
+    M2: [48, 64]
+    M3: [64, 80]
+    H1: [80, 96]
+    H2: [96, 112]
+    H3: [112, 128]
+
+  centered_pod: true
+  save_dir: artifacts/eval
+
+  fourier:
+    enabled: true
+    band_scheme: physical
+    grid_meta:
+      dx: 1.0
+      dy: 1.0
+      angular: false
+    binning: log
+    num_bins: 64
+    k_min_eval: 0.25
+    sample_frames: 8
+    kstar_threshold: 1.0
+    mean_mode_true: global
+    save_curve: false
+    band_names: [L, M, H]
+    lambda_edges: [1.0, 0.25]

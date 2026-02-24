@@ -1,0 +1,52 @@
+data:
+  source: h5_rdb
+  path: data/2D_rdb_NA_NA.h5
+  cache_dir: artifacts/preanalysis_cache
+
+  h5_rdb_dataset_key: data
+  # mini 子采样：不生成新文件，直接从原始 H5 读取很小子集用于逻辑验证
+  h5_rdb_group_count: 1
+  h5_rdb_group_start: 0
+  h5_rdb_group_step: 1
+  h5_rdb_frames_per_group: 76
+  h5_rdb_frame_sampling: linspace
+
+pod:
+  r: 64
+  center: true
+  # mini 需单独 POD 目录，避免和 full L1(T=500)冲突
+  save_dir: artifacts/pod/rdb_h5_mini
+
+  dx: 1.0
+  dy: 1.0
+
+  scale_channel_reduce: l2
+  enable_scale_analysis: true
+  scale_analysis:
+    method: B_robust_energy_centroid
+    k_min: null
+    k_max: null
+    demean_line: true
+
+  enable_basis_spectrum: false
+  fft_basis:
+    demean: true
+    window: null
+    norm: null
+
+eval:
+  # 必须保持与 cylinder_exp_full 一致
+  mask_rates: [0.0001, 0.0005, 0.001, 0.002, 0.005]
+  noise_sigmas: [0, 0.001, 0.01, 0.1]
+
+  centered_pod: true
+
+train:
+  # 保持与 cylinder_exp_full 一致
+  noise_sigma: 0.0
+  hidden_dims: [64, 64]
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 500
+  device: cuda
+  save_dir: artifacts/nn

@@ -37,7 +37,7 @@ from backend.config.schemas import EvalConfig
 from backend.config.yaml_io import load_experiment_yaml
 from backend.dataio.io_utils import ensure_dir, load_json, save_json
 from backend.dataio.io_utils import load_numpy  # used by POD artifacts
-from backend.dataio.nc_loader import load_raw_nc
+from backend.dataio.loader import load_raw
 from backend.pod.project import reconstruct_from_pod
 from backend.fourier.filters import make_wavenumber_grid, fft2_field
 from backend.fourier.filters import radial_bin_spectrum
@@ -91,7 +91,7 @@ def run_pre_analysis_from_storage(
 
     # Load POD artifacts (Level-1) and raw data once.
     Ur, mean_flat, pod_meta = _load_pod_artifacts(pod_cfg.save_dir)
-    X_thwc = load_raw_nc(data_cfg)  # [T,H,W,C]
+    X_thwc = load_raw(data_cfg)  # [T,H,W,C]
     T, H, W, C = (int(X_thwc.shape[0]), int(X_thwc.shape[1]), int(X_thwc.shape[2]), int(X_thwc.shape[3]))
     D = H * W * C
     if Ur.shape[0] != D:

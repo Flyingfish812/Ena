@@ -1,5 +1,13 @@
-# backend/advance_analysis.py
-# v2.0 draft: compute Level-4 artifacts (final analysis products) using L1/L2/L3
+"""DRAFT / UNUSED (as of 2026-02).
+
+This module is a placeholder for a "final analysis" toolchain and still references
+an older artifact layout (e.g. `L2_rebuild/`) and a separate `L4_final/` folder.
+
+Current (supported) Level-4 entrypoint is the modular eval engine:
+- `backend.pipelines.eval.start.compute_level4_eval_mods`
+
+Kept for possible future paper-specific aggregation work.
+"""
 
 from __future__ import annotations
 

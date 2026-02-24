@@ -5,7 +5,7 @@ data:
 pod:
   r: 128
   center: true
-  save_dir: artifacts/pod
+  save_dir: artifacts/pod/cylinder2d
 eval:
   mask_rates: [0.0001, 0.0002, 0.0004, 0.0008, 0.0016]
   noise_sigmas: [0, 0.01, 0.04, 0.16]

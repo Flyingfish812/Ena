@@ -57,16 +57,43 @@ def load_experiment_yaml(
 
     # ---------- data ----------
     data_raw: Dict[str, Any] = config.get("data", {}) or {}
-    nc_path = Path(data_raw.get("nc_path", "data/cylinder2d.nc"))
+    source = str(data_raw.get("source", "netcdf"))
+
+    path_raw = data_raw.get("path", None)
+    path_v = Path(path_raw) if path_raw is not None else None
+
+    nc_path_raw = data_raw.get("nc_path", None)
+    if nc_path_raw is None and path_v is None:
+        # Backward-compatible default
+        nc_path_v = Path("data/cylinder2d.nc")
+    else:
+        nc_path_v = Path(nc_path_raw) if nc_path_raw is not None else None
+
     var_keys = tuple(data_raw.get("var_keys", ("u", "v")))
-    cache_dir = data_raw.get("cache_dir", None)
-    if cache_dir is not None:
-        cache_dir = Path(cache_dir)
+
+    cache_dir_raw = data_raw.get("cache_dir", None)
+    cache_dir = Path(cache_dir_raw) if cache_dir_raw is not None else None
 
     data_cfg = DataConfig(
-        nc_path=nc_path,
+        source=source,
+        path=path_v,
+        nc_path=nc_path_v,
         var_keys=var_keys,
         cache_dir=cache_dir,
+
+        # h5_rdb
+        h5_rdb_dataset_key=str(data_raw.get("h5_rdb_dataset_key", "data")),
+        h5_rdb_group_count=int(data_raw.get("h5_rdb_group_count", 50)),
+        h5_rdb_group_start=int(data_raw.get("h5_rdb_group_start", 0)),
+        h5_rdb_group_step=int(data_raw.get("h5_rdb_group_step", 1)),
+        h5_rdb_frames_per_group=int(data_raw.get("h5_rdb_frames_per_group", 10)),
+        h5_rdb_frame_sampling=str(data_raw.get("h5_rdb_frame_sampling", "linspace")),
+
+        # mat_sst
+        mat_key=str(data_raw.get("mat_key", "sst")),
+        sst_fill_nan=str(data_raw.get("sst_fill_nan", "per_frame_mean")),
+        sst_reshape=str(data_raw.get("sst_reshape", "360x180_rot90")),
+        sst_max_frames=(None if data_raw.get("sst_max_frames", None) is None else int(data_raw.get("sst_max_frames"))),
     )
 
     # ---------- pod ----------
@@ -76,7 +103,7 @@ def load_experiment_yaml(
     dx = float(pod_raw.get("dx", 1.0))
     dy = float(pod_raw.get("dy", 1.0))
 
-    scale_channel_reduce = str(pod_raw.get("scale_channel_reduce", "l2")),
+    scale_channel_reduce = str(pod_raw.get("scale_channel_reduce", "l2"))
     enable_scale_analysis = bool(pod_raw.get("enable_scale_analysis", False))
     scale_analysis = dict(pod_raw.get("scale_analysis", {}) or {})
 
