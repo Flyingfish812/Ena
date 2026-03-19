@@ -2,6 +2,8 @@ data:
   source: mat_sst
   path: data/sst_weekly.mat
   cache_dir: artifacts/preanalysis_cache
+  observation_mask_strategy: random
+  observation_mask_seed: 0
 
   mat_key: sst
   sst_fill_nan: per_frame_mean

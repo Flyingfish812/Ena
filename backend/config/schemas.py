@@ -39,6 +39,14 @@ class DataConfig:
     cache_dir: Path | None = None
 
     # -----------------
+    # sparse observation mask options
+    # -----------------
+    observation_mask_strategy: str = "random"  # "random" | "radial_spiral" | "cylinder_structure_aware"
+    observation_mask_seed: int = 0
+    observation_spiral_max_radius_frac: float = 0.875
+    observation_mask_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # -----------------
     # h5_rdb options
     # -----------------
     h5_rdb_dataset_key: str = "data"
@@ -107,9 +115,25 @@ class TrainConfig:
     noise_sigma: float
     hidden_dims: Tuple[int, ...]
     lr: float = 1e-3
+    weight_decay: float = 0.0
+    use_weighted_loss: bool = False
+    loss_weighting: str = "none"
+    loss_weight_power: float = 1.0
+    val_ratio: float = 0.1
     batch_size: int = 64
     max_epochs: int = 200
     device: str = "cuda"
+    eval_chunk_size: int = 2048
+    live_line: bool = True
+    live_every: int = 1
+    conv_window: int = 25
+    conv_slope_thresh: float = -1e-3
+    plot_loss: bool = False
+    plot_path: Path | None = None
+    early_stop: bool = True
+    early_patience: int = 20
+    early_min_delta: float = 0.0
+    early_warmup: int = 5
     save_dir: Path = Path("artifacts/nn")
 
 

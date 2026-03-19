@@ -79,6 +79,7 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
             x_pred = pack["x_pred"]
             x_true = pack["x_true"]
             mask_hw = pack["mask_hw"]
+            display_origin = str(pack.get("display_origin", "lower"))
 
             for i, t in enumerate(frames):
                 fig = plot_recon_triptych(
@@ -87,6 +88,7 @@ def mod_examples_triptych(ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
                     title=f"triptych | {mt} | p={float(p):.4g}, σ={float(s):.4g} | t={t}",
                     mask_hw=mask_hw,
                     show_mask=show_mask,
+                    display_origin=display_origin,
                 )
                 p_code = int(round(float(p) * 10000))
                 s_code = int(round(float(s) * 10000))
@@ -108,6 +110,7 @@ def mod_examples_fourier_band_decomp(ctx: Any, kwargs: Dict[str, Any]) -> Dict[s
     channel = int(kwargs.get("channel", 0))
     seed = int(kwargs.get("seed", 0))
     dpi = int(kwargs.get("dpi", 180))
+    separate_error_colorbar = bool(kwargs.get("separate_error_colorbar", True))
 
     fourier_cfg = getattr(ctx.eval_cfg, "fourier", None)
     if fourier_cfg is None:
@@ -147,6 +150,7 @@ def mod_examples_fourier_band_decomp(ctx: Any, kwargs: Dict[str, Any]) -> Dict[s
                     dx=dx,
                     dy=dy,
                     channel=0,
+                    separate_error_colorbar=separate_error_colorbar,
                 )
                 if fig is None:
                     continue

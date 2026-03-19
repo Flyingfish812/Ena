@@ -9,6 +9,7 @@ import numpy as np
 
 from backend.pipelines.eval.utils import read_json  # 你已有的工具
 from backend.dataio.io_utils import ensure_dir  # 你项目里已有
+from backend.viz.display import infer_display_origin
 
 
 @dataclass(frozen=True)
@@ -19,9 +20,10 @@ class PodBasis:
     W: int
     C: int
     D: int
+    display_origin: str
 
 
-def _infer_pod_meta(pod_dir: Path) -> Tuple[int, int, int, int]:
+def _infer_pod_meta(pod_dir: Path) -> Tuple[int, int, int, int, str]:
     """
     从 pod_dir/pod_meta.json 推断 (H, W, C, D)。
     这是 L4 系统的唯一 POD 元信息来源（不兼容旧字段）。
@@ -48,7 +50,8 @@ def _infer_pod_meta(pod_dir: Path) -> Tuple[int, int, int, int]:
             f"(H={H}, W={W}, C={C}) from {meta_path}"
         )
 
-    return H, W, C, D
+    display_origin = infer_display_origin(meta=meta)
+    return H, W, C, D, display_origin
 
 
 def _load_pod_basis(pod_dir: Path) -> PodBasis:
@@ -75,14 +78,14 @@ def _load_pod_basis(pod_dir: Path) -> PodBasis:
         raise ValueError(f"Ur must be 2D [D,r], got shape={Ur.shape} from {ur_path}")
     mean_flat = np.asarray(mean_flat).reshape(-1)
 
-    H, W, C, D = _infer_pod_meta(pod_dir)
+    H, W, C, D, display_origin = _infer_pod_meta(pod_dir)
 
     if Ur.shape[0] != D:
         raise ValueError(f"Ur shape mismatch: Ur.shape[0]={Ur.shape[0]} != D={D} from pod_meta.json")
     if mean_flat.shape[0] != D:
         raise ValueError(f"mean_flat mismatch: mean_flat.shape[0]={mean_flat.shape[0]} != D={D} from pod_meta.json")
 
-    return PodBasis(Ur=Ur, mean_flat=mean_flat, H=H, W=W, C=C, D=D)
+    return PodBasis(Ur=Ur, mean_flat=mean_flat, H=H, W=W, C=C, D=D, display_origin=display_origin)
 
 
 def _pick_frames(T: int, *, sample_frames: int, seed: int = 0) -> List[int]:
@@ -162,8 +165,11 @@ def reconstruct_fields_from_l2(
 
     if A_hat.ndim != 2 or A_true.ndim != 2:
         raise ValueError(f"A_hat/A_true must be [T,r]. got {A_hat.shape}, {A_true.shape}")
+    if A_hat.shape != A_true.shape:
+        raise ValueError(f"A_hat/A_true shape mismatch: {A_hat.shape} vs {A_true.shape}")
 
     T = int(A_hat.shape[0])
+    r_eff = int(A_hat.shape[1])
     frames = _pick_frames(T, sample_frames=sample_frames, seed=seed)
 
     # ---- reconstruct flat -> [N,H,W,C] ----
@@ -171,11 +177,17 @@ def reconstruct_fields_from_l2(
     mean = basis.mean_flat
     H, W, C, D = basis.H, basis.W, basis.C, basis.D
 
+    if Ur.shape[1] < r_eff:
+        raise ValueError(
+            f"POD basis has fewer modes than L2 coefficients require: Ur.shape={Ur.shape}, r_eff={r_eff}"
+        )
+    Ur_eff = Ur[:, :r_eff]
+
     A_hat_sel = A_hat[frames]
     A_true_sel = A_true[frames]
 
-    X_hat_flat = (Ur @ A_hat_sel.T).T + mean[None, :]
-    X_true_flat = (Ur @ A_true_sel.T).T + mean[None, :]
+    X_hat_flat = (Ur_eff @ A_hat_sel.T).T + mean[None, :]
+    X_true_flat = (Ur_eff @ A_true_sel.T).T + mean[None, :]
 
     X_hat_thwc = X_hat_flat.reshape(len(frames), H, W, C)
     X_true_thwc = X_true_flat.reshape(len(frames), H, W, C)
@@ -218,6 +230,7 @@ def reconstruct_fields_from_l2(
         "x_true": x_true,
         "x_err": x_err,
         "mask_hw": mask_hw,
+        "display_origin": basis.display_origin,
     }
 
 

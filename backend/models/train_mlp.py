@@ -1,4 +1,4 @@
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +10,71 @@ from ..dataio.observation_dataset import ObservationDataset
 from ..models.mlp import PodMLP
 
 
+def _resolve_torch_device(device: str | None) -> str:
+    if device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    requested = str(device).strip().lower()
+    if requested in ("", "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError(f"Requested device '{device}' but CUDA is not available.")
+    return str(device)
+
+
+class WeightedCoefficientMSELoss(nn.Module):
+    def __init__(self, coeff_weights: torch.Tensor) -> None:
+        super().__init__()
+        if coeff_weights.ndim != 1:
+            raise ValueError(f"coeff_weights must be 1D, got shape {tuple(coeff_weights.shape)}")
+        self.register_buffer("coeff_weights", coeff_weights)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if pred.shape != target.shape:
+            raise ValueError(f"pred/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+        if pred.shape[-1] != int(self.coeff_weights.shape[0]):
+            raise ValueError(
+                f"Last dim of pred/target must match coeff_weights: "
+                f"{tuple(pred.shape)} vs {tuple(self.coeff_weights.shape)}"
+            )
+        sq_err = (pred - target) ** 2
+        weighted_sq_err = sq_err * self.coeff_weights.view(1, -1)
+        return weighted_sq_err.sum(dim=-1).mean()
+
+
+def _build_coeff_loss_weights(
+    coeff_loss_weights: np.ndarray | None,
+    *,
+    r_eff: int,
+    loss_weighting: str,
+    loss_weight_power: float,
+) -> np.ndarray | None:
+    mode = str(loss_weighting or "none").strip().lower()
+    if mode in ("none", "uniform", "off"):
+        return None
+    if mode != "pod_energy":
+        raise ValueError(f"Unsupported loss_weighting='{loss_weighting}'.")
+    if coeff_loss_weights is None:
+        raise ValueError("coeff_loss_weights is required when loss_weighting='pod_energy'.")
+
+    weights = np.asarray(coeff_loss_weights, dtype=np.float32).reshape(-1)
+    if weights.shape[0] != int(r_eff):
+        raise ValueError(f"coeff_loss_weights length {weights.shape[0]} != r_eff={r_eff}")
+    if np.any(weights < 0.0):
+        raise ValueError("coeff_loss_weights must be nonnegative.")
+
+    power = float(loss_weight_power)
+    if power <= 0.0:
+        raise ValueError(f"loss_weight_power must be positive, got {loss_weight_power}")
+    if power != 1.0:
+        weights = np.power(weights, power).astype(np.float32, copy=False)
+
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("coeff_loss_weights sum must be positive.")
+    return weights.astype(np.float32, copy=False)
+
+
 def train_mlp_on_observations(
     X_flat_all: np.ndarray,
     Ur_eff: np.ndarray,
@@ -17,12 +82,17 @@ def train_mlp_on_observations(
     mask_flat: np.ndarray,
     noise_sigma: float = 0.0,
     *,
+    coeff_loss_weights: np.ndarray | None = None,
+    loss_weighting: str = "none",
+    loss_weight_power: float = 1.0,
+    hidden_dims: Sequence[int] = (256, 256),
     batch_size: int = 64,
     num_epochs: int = 50,
     lr: float = 1e-3,
     weight_decay: float = 0.0,
     val_ratio: float = 0.1,
     device: str | None = None,
+    centered_pod: bool = True,
     verbose: bool = True,
     # --- NEW: tiny monitoring helpers (opt-in, default keeps old behavior) ---
     live_line: bool = True,
@@ -45,8 +115,7 @@ def train_mlp_on_observations(
       - model: best val loss 权重
       - info: 训练曲线 + 收敛诊断
     """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_torch_device(device)
 
     dataset = ObservationDataset(
         X_flat_all=X_flat_all,
@@ -54,6 +123,7 @@ def train_mlp_on_observations(
         mean_flat=mean_flat,
         mask_flat=mask_flat,
         noise_sigma=noise_sigma,
+        centered_pod=centered_pod,
     )
 
     N = len(dataset)
@@ -64,6 +134,7 @@ def train_mlp_on_observations(
     if verbose:
         print(f"[train_mlp] Dataset size: N={N}, train={n_train}, val={n_val}")
         print(f"[train_mlp] Obs dim M={dataset.M}, coeff dim r={dataset.r_eff}, device={device}")
+        print(f"[train_mlp] loss_weighting={loss_weighting}, loss_weight_power={loss_weight_power}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
@@ -71,10 +142,20 @@ def train_mlp_on_observations(
     model = PodMLP(
         in_dim=dataset.M,
         out_dim=dataset.r_eff,
-        hidden_dims=(256, 256),
+        hidden_dims=tuple(int(v) for v in hidden_dims),
     ).to(device)
 
-    criterion = nn.MSELoss()
+    effective_coeff_weights = _build_coeff_loss_weights(
+        coeff_loss_weights,
+        r_eff=dataset.r_eff,
+        loss_weighting=loss_weighting,
+        loss_weight_power=loss_weight_power,
+    )
+    if effective_coeff_weights is None:
+        criterion = nn.MSELoss()
+    else:
+        weight_tensor = torch.from_numpy(effective_coeff_weights.astype(np.float32, copy=False)).to(device)
+        criterion = WeightedCoefficientMSELoss(weight_tensor)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_loss = float("inf")
@@ -235,8 +316,16 @@ def train_mlp_on_observations(
         "batch_size": int(batch_size),
         "lr": float(lr),
         "noise_sigma": float(noise_sigma),
+        "loss_weighting": str(loss_weighting),
+        "loss_weight_power": float(loss_weight_power),
+        "hidden_dims": [int(v) for v in hidden_dims],
+        "centered_pod": bool(centered_pod),
+        "device": str(device),
         "mask_obs_dim": int(dataset.M),
         "r_eff": int(dataset.r_eff),
+        "coeff_weight_sum": None if effective_coeff_weights is None else float(np.sum(effective_coeff_weights)),
+        "coeff_weight_min": None if effective_coeff_weights is None else float(np.min(effective_coeff_weights)),
+        "coeff_weight_max": None if effective_coeff_weights is None else float(np.max(effective_coeff_weights)),
         "conv_window": int(w) if slope_log10_val is not None else None,
         "slope_log10_val": slope_log10_val,
         "plateau_like": plateau_like,

@@ -42,7 +42,7 @@ from ..pod.compute import build_pod
 from ..pod.project import project_to_pod
 from ..dataio.loader import load_raw, describe_source
 from ..dataio.io_utils import load_numpy, load_json, ensure_dir
-from ..sampling.masks import generate_random_mask_hw, flatten_mask
+from ..sampling.masks import build_structure_importance_map, generate_observation_mask_hw, flatten_mask
 from ..sampling.noise import add_gaussian_noise
 from ..models.linear_baseline import solve_pod_coeffs_least_squares
 from ..models.train_mlp import train_mlp_on_observations
@@ -140,6 +140,29 @@ def _load_or_build_pod(
     return Ur, mean_flat, meta
 
 
+def _load_pod_mode_energy_weights(save_dir: Path, *, r_eff: int) -> np.ndarray:
+    mode_energy_path = Path(save_dir) / "mode_energy_ratio.npy"
+    singular_values_path = Path(save_dir) / "singular_values.npy"
+
+    if mode_energy_path.exists():
+        weights = np.asarray(load_numpy(mode_energy_path), dtype=np.float32).reshape(-1)
+    elif singular_values_path.exists():
+        singular_values = np.asarray(load_numpy(singular_values_path), dtype=np.float32).reshape(-1)
+        energy = singular_values ** 2
+        total_energy = float(energy.sum()) if energy.size > 0 else 0.0
+        if total_energy <= 0.0:
+            raise ValueError(f"Invalid singular_values in {singular_values_path}: total energy must be positive.")
+        weights = (energy / total_energy).astype(np.float32, copy=False)
+    else:
+        raise FileNotFoundError(
+            f"Cannot find POD energy weights under {save_dir}: expected mode_energy_ratio.npy or singular_values.npy"
+        )
+
+    if weights.shape[0] < int(r_eff):
+        raise ValueError(f"POD energy weights length {weights.shape[0]} < r_eff={r_eff}")
+    return weights[:r_eff].astype(np.float32, copy=False)
+
+
 def _prepare_snapshots(
     data_cfg: DataConfig,
     Ur: np.ndarray,
@@ -204,6 +227,88 @@ def _predict_mlp_coeffs_batch(model_mlp, Y_noisy: np.ndarray, *, device, chunk_s
             out.append(a_chunk)
 
     return np.concatenate(out, axis=0)
+
+
+def _mask_strategy_meta_from_data_cfg(data_cfg: DataConfig) -> Dict[str, Any]:
+    strategy = str(getattr(data_cfg, "observation_mask_strategy", "random") or "random")
+    kwargs = dict(getattr(data_cfg, "observation_mask_kwargs", {}) or {})
+    meta: Dict[str, Any] = {
+        "strategy": strategy,
+        "seed": int(getattr(data_cfg, "observation_mask_seed", 0)),
+    }
+
+    if strategy.strip().lower() in ("radial_spiral", "spiral"):
+        meta["spiral_max_radius_frac"] = float(getattr(data_cfg, "observation_spiral_max_radius_frac", 0.875))
+    if kwargs:
+        meta["kwargs"] = kwargs
+
+    return meta
+
+
+def _mask_strategy_from_data_cfg(
+    data_cfg: DataConfig,
+    *,
+    X_thwc: np.ndarray | None = None,
+    Ur_eff: np.ndarray | None = None,
+    H: int | None = None,
+    W: int | None = None,
+    C: int | None = None,
+    pod_cfg: PodConfig | None = None,
+) -> tuple[str, Dict[str, Any]]:
+    strategy = str(getattr(data_cfg, "observation_mask_strategy", "random") or "random")
+    kwargs: Dict[str, Any] = dict(getattr(data_cfg, "observation_mask_kwargs", {}) or {})
+
+    strategy_name = strategy.strip().lower()
+
+    if strategy_name in ("radial_spiral", "spiral"):
+        kwargs["max_radius_frac"] = float(getattr(data_cfg, "observation_spiral_max_radius_frac", 0.875))
+        return strategy, kwargs
+
+    if strategy_name in ("cylinder_structure_aware", "structure_aware", "region_importance"):
+        if X_thwc is None or Ur_eff is None or H is None or W is None or C is None:
+            raise ValueError("Structure-aware observation mask requires X_thwc, Ur_eff, H, W, C")
+
+        importance_source = str(kwargs.get("importance_source", "temporal_variance"))
+        channel_reduce = str(kwargs.get("importance_channel_reduce", "l2"))
+        pod_top_k = int(kwargs.get("importance_top_k", min(16, Ur_eff.shape[1])))
+
+        hotspot_cfg = dict(kwargs.get("hotspot", {}) or {})
+        hotspot_center_raw = hotspot_cfg.get("center", None)
+        hotspot_center = None if hotspot_center_raw is None else (
+            float(hotspot_center_raw[0]),
+            float(hotspot_center_raw[1]),
+        )
+        hotspot_sigma_raw = hotspot_cfg.get("sigma", None)
+        hotspot_sigma = None if hotspot_sigma_raw is None else (
+            float(hotspot_sigma_raw[0]),
+            float(hotspot_sigma_raw[1]),
+        )
+        hotspot_weight = float(hotspot_cfg.get("weight", 0.0))
+
+        mode_energy_weights = None
+        if importance_source.strip().lower() in ("pod_energy", "pod", "pod_modes"):
+            if pod_cfg is None:
+                raise ValueError("pod_cfg is required when importance_source=pod_energy")
+            mode_energy_weights = _load_pod_mode_energy_weights(pod_cfg.save_dir, r_eff=Ur_eff.shape[1])
+
+        kwargs["importance_map"] = build_structure_importance_map(
+            H=H,
+            W=W,
+            C=C,
+            data_thwc=X_thwc,
+            Ur=Ur_eff,
+            mode_energy_weights=mode_energy_weights,
+            source=importance_source,
+            channel_reduce=channel_reduce,
+            pod_top_k=pod_top_k,
+            gradient_mix=float(kwargs.get("importance_gradient_mix", 0.0)),
+            importance_power=float(kwargs.get("importance_power", 1.0)),
+            hotspot_center=hotspot_center,
+            hotspot_sigma=hotspot_sigma,
+            hotspot_weight=hotspot_weight,
+        )
+
+    return strategy, kwargs
 
 
 """
@@ -303,11 +408,22 @@ def run_rebuild_sweep(
             "noise_sigmas": [float(x) for x in getattr(eval_cfg, "noise_sigmas", [])],
             "centered_pod": bool(getattr(eval_cfg, "centered_pod", False)),
         },
+        "observation_mask": _mask_strategy_meta_from_data_cfg(data_cfg),
         "note": "Level-2 raw artifacts: predicted POD coeffs A_hat_all (+ minimal reconstruction dependencies).",
     }
     _save_json(l2_root / "meta.json", meta)
 
     entries_index: List[Dict[str, Any]] = []
+    mask_strategy, mask_strategy_kwargs_base = _mask_strategy_from_data_cfg(
+        data_cfg,
+        X_thwc=X_thwc,
+        Ur_eff=Ur_eff,
+        H=H,
+        W=W,
+        C=C,
+        pod_cfg=pod_cfg,
+    )
+    mask_seed = int(getattr(data_cfg, "observation_mask_seed", 0))
 
     for model_type in model_types:
         if verbose:
@@ -315,15 +431,29 @@ def run_rebuild_sweep(
 
         for mask_rate in getattr(eval_cfg, "mask_rates", []):
             mask_rate_f = float(mask_rate)
+            mask_strategy_kwargs = dict(mask_strategy_kwargs_base)
+            if mask_strategy.strip().lower() in ("cylinder_structure_aware", "structure_aware", "region_importance"):
+                template_count = max(1, int(mask_strategy_kwargs.get("num_templates", 1)))
+                mask_strategy_kwargs["template_index"] = int(mask_strategy_kwargs.get("template_index", _encode_rate(mask_rate_f) % template_count))
             if verbose:
                 print(f"[rebuild-{model_type}] mask_rate={mask_rate_f:.6g}")
 
-            mask_hw = generate_random_mask_hw(H, W, mask_rate=mask_rate_f, seed=0)
+            mask_hw = generate_observation_mask_hw(
+                H,
+                W,
+                mask_rate=mask_rate_f,
+                seed=mask_seed,
+                strategy=mask_strategy,
+                strategy_kwargs=mask_strategy_kwargs,
+            )
             mask_flat = flatten_mask(mask_hw, C=C)
             n_obs = int(mask_flat.sum())
 
             if verbose:
-                print(f"  -> n_obs={n_obs} (with C={C})")
+                extra = ""
+                if "template_index" in mask_strategy_kwargs:
+                    extra = f", template_index={int(mask_strategy_kwargs['template_index'])}"
+                print(f"  -> mask_strategy={mask_strategy}, n_obs={n_obs} (with C={C}){extra}")
 
             Y_true = _gather_observations_batch(X_flat_all, mask_flat)
             mean_masked = mean_flat[mask_flat]
@@ -334,6 +464,7 @@ def run_rebuild_sweep(
                 data_cfg=data_cfg,
                 pod_cfg=pod_cfg,
                 train_cfg=train_cfg,
+                centered_pod=bool(getattr(eval_cfg, "centered_pod", True)),
                 mask_rate=mask_rate_f,
                 noise_sigma=float(min(getattr(eval_cfg, "noise_sigmas", [0.0]))),
                 verbose=verbose,
@@ -408,6 +539,7 @@ def train_model_for_entry(
     data_cfg: DataConfig,
     pod_cfg: PodConfig,
     train_cfg: Optional[TrainConfig],
+    centered_pod: bool,
     mask_rate: float,
     noise_sigma: float,
     verbose: bool = True,
@@ -430,11 +562,25 @@ def train_model_for_entry(
         if train_cfg is None:
             raise ValueError("train_cfg is required for model_type='mlp'")
 
+        use_weighted_loss = bool(getattr(train_cfg, "use_weighted_loss", False))
+        effective_loss_weighting = (
+            str(getattr(train_cfg, "loss_weighting", "none")) if use_weighted_loss else "none"
+        )
+        coeff_loss_weights = None
+        if effective_loss_weighting.strip().lower() == "pod_energy":
+            coeff_loss_weights = _load_pod_mode_energy_weights(pod_cfg.save_dir, r_eff=int(Ur_eff.shape[1]))
+
         if verbose:
             print(
                 f"  -> training MLP: train_noise_sigma={float(train_cfg.noise_sigma):.4e}, "
                 f"batch_size={int(train_cfg.batch_size)}, max_epochs={int(train_cfg.max_epochs)}, lr={float(train_cfg.lr):.3g}"
             )
+            print(f"     use_weighted_loss: {use_weighted_loss}")
+            if effective_loss_weighting.strip().lower() == "pod_energy" and coeff_loss_weights is not None:
+                print(
+                    f"     loss weighting: pod_energy, first weights="
+                    f"{[float(x) for x in coeff_loss_weights[: min(5, coeff_loss_weights.shape[0])]]}"
+                )
 
         model_mlp, train_info = train_mlp_on_observations(
             X_flat_all=X_flat_all,
@@ -442,10 +588,28 @@ def train_model_for_entry(
             mean_flat=mean_flat,
             mask_flat=mask_flat,
             noise_sigma=float(train_cfg.noise_sigma),
+            coeff_loss_weights=coeff_loss_weights,
+            loss_weighting=effective_loss_weighting,
+            loss_weight_power=float(getattr(train_cfg, "loss_weight_power", 1.0)),
+            hidden_dims=tuple(int(v) for v in getattr(train_cfg, "hidden_dims", (256, 256))),
             batch_size=int(train_cfg.batch_size),
             num_epochs=int(train_cfg.max_epochs),
             lr=float(train_cfg.lr),
+            weight_decay=float(getattr(train_cfg, "weight_decay", 0.0)),
+            val_ratio=float(getattr(train_cfg, "val_ratio", 0.1)),
+            device=str(getattr(train_cfg, "device", "auto")),
+            centered_pod=bool(centered_pod),
             verbose=verbose,
+            live_line=bool(getattr(train_cfg, "live_line", True)),
+            live_every=int(getattr(train_cfg, "live_every", 1)),
+            conv_window=int(getattr(train_cfg, "conv_window", 25)),
+            conv_slope_thresh=float(getattr(train_cfg, "conv_slope_thresh", -1e-3)),
+            plot_loss=bool(getattr(train_cfg, "plot_loss", False)),
+            plot_path=getattr(train_cfg, "plot_path", None),
+            early_stop=bool(getattr(train_cfg, "early_stop", True)),
+            early_patience=int(getattr(train_cfg, "early_patience", 20)),
+            early_min_delta=float(getattr(train_cfg, "early_min_delta", 0.0)),
+            early_warmup=int(getattr(train_cfg, "early_warmup", 5)),
         )
 
         model_mlp.eval()
@@ -464,10 +628,26 @@ def train_model_for_entry(
                 "noise_sigma": float(getattr(train_cfg, "noise_sigma", 0.0)),
                 "hidden_dims": list(getattr(train_cfg, "hidden_dims", [])),
                 "lr": float(getattr(train_cfg, "lr", 0.0)),
+                "weight_decay": float(getattr(train_cfg, "weight_decay", 0.0)),
+                "use_weighted_loss": bool(use_weighted_loss),
+                "loss_weighting": str(effective_loss_weighting),
+                "loss_weight_power": float(getattr(train_cfg, "loss_weight_power", 1.0)),
+                "val_ratio": float(getattr(train_cfg, "val_ratio", 0.1)),
                 "batch_size": int(getattr(train_cfg, "batch_size", 0)),
                 "max_epochs": int(getattr(train_cfg, "max_epochs", 0)),
                 "device": str(getattr(train_cfg, "device", "")),
                 "eval_chunk_size": int(eval_chunk_size),
+                "centered_pod": bool(centered_pod),
+                "live_line": bool(getattr(train_cfg, "live_line", True)),
+                "live_every": int(getattr(train_cfg, "live_every", 1)),
+                "conv_window": int(getattr(train_cfg, "conv_window", 25)),
+                "conv_slope_thresh": float(getattr(train_cfg, "conv_slope_thresh", -1e-3)),
+                "plot_loss": bool(getattr(train_cfg, "plot_loss", False)),
+                "plot_path": getattr(train_cfg, "plot_path", None),
+                "early_stop": bool(getattr(train_cfg, "early_stop", True)),
+                "early_patience": int(getattr(train_cfg, "early_patience", 20)),
+                "early_min_delta": float(getattr(train_cfg, "early_min_delta", 0.0)),
+                "early_warmup": int(getattr(train_cfg, "early_warmup", 5)),
             },
         }
 

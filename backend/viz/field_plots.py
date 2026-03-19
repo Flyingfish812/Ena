@@ -7,6 +7,8 @@ from pathlib import Path
 from ..dataio.io_utils import ensure_dir
 from typing import Dict
 
+from .display import infer_display_origin
+
 def _to_2d(field: np.ndarray) -> np.ndarray:
     """
     将 [H,W] 或 [H,W,C] 的场裁剪为 [H,W]，默认取第 0 个通道。
@@ -115,6 +117,7 @@ def plot_recon_quadruple(
     mask_hw: np.ndarray | None = None,
     title: str | None = None,
     cmap: str = "RdBu_r",
+    display_origin: str = "lower",
 ) -> plt.Figure:
     """
     绘制 input / output / target / error 的四联图，并在 input 上标采样点。
@@ -168,11 +171,12 @@ def plot_recon_quadruple(
     fig.subplots_adjust(left=0.04, right=0.99, top=0.78, bottom=0.32, wspace=0.25)
 
     ims = []
+    display_origin = infer_display_origin(source=display_origin)
     for ax, (name, field) in zip(axes, fields, strict=False):
         if name.startswith("Error"):
             im = ax.imshow(
                 field,
-                origin="lower",
+                origin=display_origin,
                 cmap=cmap,
                 vmin=vmin_err,
                 vmax=vmax_err,
@@ -180,7 +184,7 @@ def plot_recon_quadruple(
         else:
             im = ax.imshow(
                 field,
-                origin="lower",
+                origin=display_origin,
                 cmap=cmap,
                 vmin=vmin_main,
                 vmax=vmax_main,
@@ -314,6 +318,7 @@ def plot_recon_triptych(
     mask_hw: np.ndarray | None = None,
     show_mask: bool = True,
     cmap: str = "RdBu_r",
+    display_origin: str = "lower",
     main_q: float = 99.5,      # 主场稳健分位数
     err_scale: float = 1.0,    # 误差色标相对主场的缩放（默认同尺度）
 ) -> plt.Figure:
@@ -356,22 +361,23 @@ def plot_recon_triptych(
         max_abs_err = 1.0
     vmin_err, vmax_err = -max_abs_err, max_abs_err
 
-    # ---------- 三联图布局：对齐 quadruple 的“扁平风格” ----------
+    # ---------- 三联图布局：固定 colorbar 厚度与间距，避免不同纵横比下失真 ----------
     fig, axes = plt.subplots(1, 3, figsize=(10.0, 2.4))
-    fig.subplots_adjust(left=0.04, right=0.99, top=0.78, bottom=0.32, wspace=0.25)
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.80, bottom=0.20, wspace=0.25)
+    display_origin = infer_display_origin(source=display_origin)
 
     im0 = axes[0].imshow(
-        x_pred_c, origin="lower", cmap=cmap, vmin=vmin_main, vmax=vmax_main
+        x_pred_c, origin=display_origin, cmap=cmap, vmin=vmin_main, vmax=vmax_main
     )
     axes[0].set_title("Output (reconstructed)", fontsize=9)
 
     im1 = axes[1].imshow(
-        x_true_c, origin="lower", cmap=cmap, vmin=vmin_main, vmax=vmax_main
+        x_true_c, origin=display_origin, cmap=cmap, vmin=vmin_main, vmax=vmax_main
     )
     axes[1].set_title("Target (reference)", fontsize=9)
 
     im2 = axes[2].imshow(
-        x_err, origin="lower", cmap=cmap, vmin=vmin_err, vmax=vmax_err
+        x_err, origin=display_origin, cmap=cmap, vmin=vmin_err, vmax=vmax_err
     )
     axes[2].set_title("Error (output - target)", fontsize=9)
 
@@ -399,7 +405,7 @@ def plot_recon_triptych(
                 zorder=2,
             )
 
-    # 主场 colorbar：放在第 1、2 张之间的下方
+    # 主场 colorbar：固定厚度 + 固定与图的间距，不再随图像轴高度缩放
     pos0 = axes[0].get_position()
     pos1 = axes[1].get_position()
     left = pos0.x0
@@ -407,9 +413,10 @@ def plot_recon_triptych(
     width = right - left
 
     cbar_width = width * 0.6        # 比两张图略窄，显得“轻”
-    cbar_height = pos0.height * 0.25
+    cbar_height = 0.028
+    cbar_gap = 0.020
     cbar_left = left + (width - cbar_width) / 2
-    cbar_bottom = pos0.y0 - 0.75 * pos0.height
+    cbar_bottom = max(0.045, pos0.y0 - cbar_gap - cbar_height)
 
     cax_main = fig.add_axes([
         cbar_left,
@@ -417,17 +424,19 @@ def plot_recon_triptych(
         cbar_width,
         cbar_height,
     ])
-    fig.colorbar(im1, cax=cax_main, orientation="horizontal")
+    cbar_main = fig.colorbar(im1, cax=cax_main, orientation="horizontal")
+    cbar_main.ax.tick_params(labelsize=8, pad=1)
 
     # 误差 colorbar：挂在第 3 个子图下面（axes[2]）
     pos_err = axes[2].get_position()
     cbar_width_err = pos_err.width * 0.75
-    cbar_height_err = pos_err.height * 0.25
+    cbar_height_err = cbar_height
     cbar_left_err = pos_err.x0 + (pos_err.width - cbar_width_err) / 2
-    cbar_bottom_err = pos_err.y0 - 0.75 * pos_err.height
+    cbar_bottom_err = max(0.045, pos_err.y0 - cbar_gap - cbar_height_err)
 
     cax_err = fig.add_axes([cbar_left_err, cbar_bottom_err, cbar_width_err, cbar_height_err])
-    fig.colorbar(im2, cax=cax_err, orientation="horizontal")
+    cbar_err = fig.colorbar(im2, cax=cax_err, orientation="horizontal")
+    cbar_err.ax.tick_params(labelsize=8, pad=1)
 
     if title:
         fig.suptitle(title, fontsize=12, y=0.96)

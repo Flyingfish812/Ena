@@ -39,6 +39,7 @@ class ObservationDataset(Dataset):
         mean_flat: np.ndarray,
         mask_flat: np.ndarray,
         noise_sigma: float = 0.0,
+        centered_pod: bool = True,
     ) -> None:
         super().__init__()
 
@@ -68,6 +69,8 @@ class ObservationDataset(Dataset):
         self.mean_flat = mean_flat            # [D]
         self.mask_flat = mask_flat            # [D]
         self.noise_sigma = float(noise_sigma)
+        self.centered_pod = bool(centered_pod)
+        self.mean_masked = mean_flat[mask_flat].astype(np.float32, copy=False)
 
         # 预先计算所有 snapshot 的 POD 真系数 a_true_all: [N,r]
         self.a_true_all = project_to_pod(
@@ -93,6 +96,9 @@ class ObservationDataset(Dataset):
 
         # 加噪
         y_noisy = add_gaussian_noise(y, sigma=self.noise_sigma)
+
+        if self.centered_pod:
+            y_noisy = y_noisy - self.mean_masked
 
         # 转 torch tensor
         y_tensor = torch.from_numpy(y_noisy.astype(np.float32))

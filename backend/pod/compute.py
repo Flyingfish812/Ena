@@ -4,15 +4,114 @@
 构建 POD 基底：从原始数据计算 SVD / POD，保存截断基底与元数据。
 """
 
+from dataclasses import asdict
 from typing import Dict, Any, Optional
 
 import numpy as np
 
 from backend.config.schemas import DataConfig, PodConfig
 from backend.dataio.loader import load_raw, describe_source
-from backend.dataio.io_utils import ensure_dir, save_numpy, save_json
+from backend.dataio.io_utils import ensure_dir, save_numpy, save_json, load_json, load_numpy
+from backend.metrics.metrics import field_nmse
+from backend.pod.project import reconstruct_from_pod
 from backend.pod.scaler import build_scale_table, build_basis_spectrum
+from backend.viz.display import infer_display_origin
 from pathlib import Path
+
+
+def _to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
+
+def _serialize_data_cfg(data_cfg: DataConfig) -> Dict[str, Any]:
+    return _to_jsonable(asdict(data_cfg))
+
+
+def _restore_data_cfg(data: Any) -> Optional[DataConfig]:
+    if not isinstance(data, dict):
+        return None
+
+    cfg = dict(data)
+    for key in ("path", "nc_path", "cache_dir"):
+        if cfg.get(key) is not None:
+            cfg[key] = Path(cfg[key])
+    if cfg.get("var_keys") is not None:
+        cfg["var_keys"] = tuple(cfg["var_keys"])
+    return DataConfig(**cfg)
+
+
+def _sample_frame_indices(n_frames: int, *, step: int = 100, max_samples: int = 16) -> np.ndarray:
+    if n_frames <= 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    if n_frames == 1:
+        return np.array([0], dtype=np.int64)
+
+    if step <= 0:
+        step = max(1, n_frames // max(max_samples - 1, 1))
+
+    frame_indices = list(range(0, n_frames, step))
+    if frame_indices[-1] != n_frames - 1:
+        frame_indices.append(n_frames - 1)
+
+    if max_samples == 1:
+        return np.array([0], dtype=np.int64)
+
+    if max_samples > 1 and len(frame_indices) > max_samples:
+        trimmed = frame_indices[: max_samples - 1]
+        if trimmed[-1] != n_frames - 1:
+            trimmed.append(n_frames - 1)
+        frame_indices = trimmed
+
+    return np.asarray(sorted(set(frame_indices)), dtype=np.int64)
+
+
+def _extract_display_field(x_flat: np.ndarray, *, H: int, W: int, C: int, channel: int = 0) -> np.ndarray:
+    field = np.asarray(x_flat).reshape(H, W, C)
+    if C == 1:
+        return field[..., 0]
+    channel = int(np.clip(channel, 0, C - 1))
+    return field[..., channel]
+
+
+def _robust_signed_limit(arrays: list[np.ndarray], percentile: float) -> float:
+    finite_values = []
+    for arr in arrays:
+        values = np.asarray(arr, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if values.size > 0:
+            finite_values.append(np.abs(values.reshape(-1)))
+
+    if not finite_values:
+        return 1.0
+
+    vmax = float(np.percentile(np.concatenate(finite_values, axis=0), percentile))
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        return 1.0
+    return vmax
+
+
+def _robust_centered_limit(arrays: list[np.ndarray], center: float, percentile: float) -> float:
+    finite_values = []
+    for arr in arrays:
+        values = np.asarray(arr, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if values.size > 0:
+            finite_values.append(np.abs(values.reshape(-1) - center))
+
+    if not finite_values:
+        return 1.0
+
+    vmax = float(np.percentile(np.concatenate(finite_values, axis=0), percentile))
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        return 1.0
+    return vmax
 
 
 def _build_phi_groups(r_used: int, group_size: int = 16):
@@ -41,6 +140,151 @@ def _build_phi_groups(r_used: int, group_size: int = 16):
         k_start = k_end + 1
     return groups
 
+
+def plot_pod_reconstruction_gallery(
+    *,
+    save_dir: Path,
+    data_cfg: Optional[DataConfig] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    Ur: Optional[np.ndarray] = None,
+    mean_flat: Optional[np.ndarray] = None,
+    A_true: Optional[np.ndarray] = None,
+    X_true_flat: Optional[np.ndarray] = None,
+    frame_step: int = 100,
+    max_samples: int = 16,
+    channel: int = 0,
+    dpi: int = 180,
+    robust_percentile: float = 99.5,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    fig_paths: list[str] = []
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import TwoSlopeNorm
+    except Exception as e:
+        if verbose:
+            print(f"[plot_pod_reconstruction_gallery] matplotlib 不可用：{e}")
+        return out
+
+    save_dir = Path(save_dir)
+
+    if meta is None:
+        meta_path = save_dir / "pod_meta.json"
+        if not meta_path.exists():
+            if verbose:
+                print(f"[plot_pod_reconstruction_gallery] 缺少 pod_meta.json：{meta_path}")
+            return out
+        meta = load_json(meta_path)
+
+    if data_cfg is None:
+        data_cfg = _restore_data_cfg(meta.get("data_cfg"))
+        if data_cfg is None:
+            if verbose:
+                print("[plot_pod_reconstruction_gallery] pod_meta.json 缺少 data_cfg，跳过重建检查图")
+            return out
+
+    if Ur is None:
+        Ur = load_numpy(save_dir / "Ur.npy")
+    if mean_flat is None:
+        mean_flat = load_numpy(save_dir / "mean_flat.npy")
+    if A_true is None:
+        A_true = load_numpy(save_dir / "A_true.npy")
+
+    Ur = np.asarray(Ur)
+    mean_flat = np.asarray(mean_flat).reshape(-1)
+    A_true = np.asarray(A_true)
+
+    H = int(meta["H"])
+    W = int(meta["W"])
+    C = int(meta["C"])
+    T = int(meta["T"])
+    r_used = int(meta.get("r_used", Ur.shape[1]))
+
+    if X_true_flat is None:
+        X_true_flat = load_raw(data_cfg).reshape(T, -1)
+    else:
+        X_true_flat = np.asarray(X_true_flat)
+
+    frame_indices = _sample_frame_indices(T, step=frame_step, max_samples=max_samples)
+    if frame_indices.size == 0:
+        return out
+
+    visualize_dir = save_dir / "visualize"
+    ensure_dir(visualize_dir)
+
+    records = []
+    display_channel = 0 if C == 1 else int(np.clip(channel, 0, C - 1))
+    display_origin = infer_display_origin(data_cfg=data_cfg, meta=meta)
+
+    for frame_idx in frame_indices.tolist():
+        x_true = np.asarray(X_true_flat[frame_idx], dtype=np.float64)
+        x_head = np.asarray(reconstruct_from_pod(A_true[frame_idx], Ur, mean_flat), dtype=np.float64)
+        x_tail = x_true - x_head
+        nmse_val = float(field_nmse(x_head, x_true, reduction="mean"))
+
+        true_field = _extract_display_field(x_true, H=H, W=W, C=C, channel=display_channel)
+        head_field = _extract_display_field(x_head, H=H, W=W, C=C, channel=display_channel)
+        tail_field = _extract_display_field(x_tail, H=H, W=W, C=C, channel=display_channel)
+
+        main_center = float(np.mean(np.concatenate([true_field.reshape(-1), head_field.reshape(-1)])))
+        main_vspan = _robust_centered_limit([true_field, head_field], center=main_center, percentile=robust_percentile)
+        tail_vmax = _robust_signed_limit([tail_field], robust_percentile)
+        main_norm = TwoSlopeNorm(vmin=main_center - main_vspan, vcenter=main_center, vmax=main_center + main_vspan)
+        tail_norm = TwoSlopeNorm(vmin=-tail_vmax, vcenter=0.0, vmax=tail_vmax)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.6), constrained_layout=True)
+
+        im0 = axes[0].imshow(true_field, origin=display_origin, cmap="RdBu_r", norm=main_norm)
+        im1 = axes[1].imshow(head_field, origin=display_origin, cmap="RdBu_r", norm=main_norm)
+        im2 = axes[2].imshow(tail_field, origin=display_origin, cmap="RdBu_r", norm=tail_norm)
+
+        axes[0].set_title("Target")
+        axes[1].set_title(f"Top-{r_used} reconstruction\nNMSE={nmse_val * 100.0:.3f}%")
+        axes[2].set_title("Residual = target - reconstruction")
+
+        for ax in axes:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        fig.colorbar(im1, ax=axes[:2], shrink=0.86, fraction=0.035, pad=0.03)
+        fig.colorbar(im2, ax=axes[2], shrink=0.86, fraction=0.046, pad=0.03)
+
+        title = f"POD reconstruction check | frame={frame_idx}"
+        if C > 1:
+            title += f" | channel={display_channel}"
+        fig.suptitle(title, fontsize=12)
+
+        png_path = visualize_dir / f"pod_recon_frame_{frame_idx:04d}.png"
+        fig.savefig(png_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+        fig_paths.append(str(png_path))
+        records.append(
+            {
+                "frame_idx": int(frame_idx),
+                "nmse": nmse_val,
+                "nmse_percent": nmse_val * 100.0,
+                "path": str(png_path),
+            }
+        )
+
+    summary = {
+        "frame_indices": [int(v) for v in frame_indices.tolist()],
+        "frame_step": int(frame_step),
+        "max_samples": int(max_samples),
+        "r_used": r_used,
+        "display_channel": int(display_channel),
+        "frames": records,
+    }
+    save_json(visualize_dir / "pod_reconstruction_summary.json", summary)
+
+    out["fig_paths"] = fig_paths
+    out["recon_gallery"] = summary
+    out["visualize_dir"] = str(visualize_dir)
+    return out
+
 def plot_pod_outputs(
     *,
     save_dir: Path,
@@ -50,6 +294,15 @@ def plot_pod_outputs(
     singular_values: Optional[np.ndarray] = None,
     cum_energy: Optional[np.ndarray] = None,
     df_scale: Any = None,
+    data_cfg: Optional[DataConfig] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    Ur: Optional[np.ndarray] = None,
+    mean_flat: Optional[np.ndarray] = None,
+    A_true: Optional[np.ndarray] = None,
+    X_true_flat: Optional[np.ndarray] = None,
+    recon_frame_step: int = 100,
+    recon_max_samples: int = 16,
+    recon_channel: int = 0,
     dpi: int = 180,
 ) -> Dict[str, Any]:
     """
@@ -96,6 +349,11 @@ def plot_pod_outputs(
         cum_energy = np.cumsum(energy_frac)
 
     cum = np.asarray(cum_energy)
+
+    if meta is None:
+        meta_path = save_dir / "pod_meta.json"
+        if meta_path.exists():
+            meta = load_json(meta_path)
 
     # ------------------------
     # 图 1：奇异值谱 + 剩余能量
@@ -246,6 +504,28 @@ def plot_pod_outputs(
         out["fig_scale_med"] = fig2a
         out["fig_scale_prefix"] = fig2b
         out["fig_scale_tail"] = fig2c
+
+    try:
+        recon_out = plot_pod_reconstruction_gallery(
+            save_dir=save_dir,
+            data_cfg=data_cfg,
+            meta=meta,
+            Ur=Ur,
+            mean_flat=mean_flat,
+            A_true=A_true,
+            X_true_flat=X_true_flat,
+            frame_step=recon_frame_step,
+            max_samples=recon_max_samples,
+            channel=recon_channel,
+            dpi=dpi,
+            verbose=verbose,
+        )
+        fig_paths.extend(recon_out.get("fig_paths", []))
+        if recon_out:
+            out.update({k: v for k, v in recon_out.items() if k != "fig_paths"})
+    except Exception as e:
+        if verbose:
+            print(f"[plot_pod_outputs] POD 重建检查图失败：{e}")
 
     out["fig_paths"] = fig_paths
     return out
@@ -475,8 +755,8 @@ def build_pod(
         if verbose:
             print("  -> 跳过 basis_spectrum（enable_basis_spectrum = False）")
 
-    # 释放大数组（除了 Vr / mean_flat32 / A_true 这些后续要用的）
-    del U_svd, Vh, X_flat, Xc
+    # 释放大数组（保留 X_flat 以便可选生成重建检查图）
+    del U_svd, Vh, Xc
 
     # 6) 保存
     save_dir = pod_cfg.save_dir
@@ -486,6 +766,7 @@ def build_pod(
         print("=== [POD] Step 5: 保存结果 ===")
         print(f"  -> save_dir = {save_dir}")
         print("  -> 保存 Ur.npy, mean_flat.npy, singular_values.npy,")
+        print("          mode_energy_ratio.npy, cumulative_energy_ratio.npy,")
         print("          A_true.npy, eigenvalues.npy, pod_meta.json, phi_groups.json")
 
     # 空间基底与均值场
@@ -493,6 +774,8 @@ def build_pod(
     save_numpy(save_dir / "mean_flat.npy", mean_flat32)   # [D]
     # 全部奇异值（r0 阶）
     save_numpy(save_dir / "singular_values.npy", S)       # [r0]
+    save_numpy(save_dir / "mode_energy_ratio.npy", energy_frac.astype(np.float32, copy=False))
+    save_numpy(save_dir / "cumulative_energy_ratio.npy", cum_energy.astype(np.float32, copy=False))
 
     # 新增：真实 POD 系数矩阵（仅前 r_used 阶）
     save_numpy(save_dir / "A_true.npy", A_true)           # [N,r]
@@ -511,8 +794,14 @@ def build_pod(
         "r_used": r,
         "center": pod_cfg.center,
         "total_energy": float(total_energy),
+        "mode_energy_ratio_path": "mode_energy_ratio.npy",
+        "cumulative_energy_ratio_path": "cumulative_energy_ratio.npy",
         "phi_group_size": 16,
         "phi_group_count": len(phi_groups),
+        "source": str(getattr(data_cfg, "source", "netcdf") or "netcdf"),
+        "source_desc": describe_source(data_cfg),
+        "display_origin": infer_display_origin(data_cfg=data_cfg),
+        "data_cfg": _serialize_data_cfg(data_cfg),
     }
     save_json(save_dir / "pod_meta.json", meta)
 
@@ -543,6 +832,12 @@ def build_pod(
                 singular_values=S,
                 cum_energy=cum_energy,
                 df_scale=df_scale,
+                data_cfg=data_cfg,
+                meta=meta,
+                Ur=Vr,
+                mean_flat=mean_flat32,
+                A_true=A_true,
+                X_true_flat=X_flat,
                 dpi=int(getattr(pod_cfg, "plot_dpi", 180)),
             )
             # 合并回 result，保持原先 build_pod 的返回习惯
@@ -550,6 +845,8 @@ def build_pod(
         except Exception as e:
             if verbose:
                 print(f"[POD] 绘图失败（可忽略）：{e}")
+
+    del X_flat
 
 
     if verbose:

@@ -80,6 +80,10 @@ def load_experiment_yaml(
         nc_path=nc_path_v,
         var_keys=var_keys,
         cache_dir=cache_dir,
+        observation_mask_strategy=str(data_raw.get("observation_mask_strategy", "random")),
+        observation_mask_seed=int(data_raw.get("observation_mask_seed", 0)),
+        observation_spiral_max_radius_frac=float(data_raw.get("observation_spiral_max_radius_frac", 0.875)),
+        observation_mask_kwargs=dict(data_raw.get("observation_mask_kwargs", {}) or {}),
 
         # h5_rdb
         h5_rdb_dataset_key=str(data_raw.get("h5_rdb_dataset_key", "data")),
@@ -213,14 +217,36 @@ def load_experiment_yaml(
     else:
         train_save_dir = Path(train_raw.get("save_dir", "artifacts/nn"))
         hidden_dims = tuple(train_raw.get("hidden_dims", (256, 256)))
+        plot_path_raw = train_raw.get("plot_path", None)
+        plot_path = Path(plot_path_raw) if plot_path_raw is not None else None
+        loss_weighting = str(train_raw.get("loss_weighting", "none"))
+        use_weighted_loss = bool(
+            train_raw.get("use_weighted_loss", loss_weighting.strip().lower() not in ("none", "uniform", "off"))
+        )
         train_cfg = TrainConfig(
             mask_rate=float(train_raw.get("mask_rate", 0.02)),
             noise_sigma=float(train_raw.get("noise_sigma", 0.01)),
             hidden_dims=hidden_dims,
             lr=float(train_raw.get("lr", 1e-3)),
+            weight_decay=float(train_raw.get("weight_decay", 0.0)),
+            use_weighted_loss=use_weighted_loss,
+            loss_weighting=loss_weighting,
+            loss_weight_power=float(train_raw.get("loss_weight_power", 1.0)),
+            val_ratio=float(train_raw.get("val_ratio", 0.1)),
             batch_size=int(train_raw.get("batch_size", 64)),
             max_epochs=int(train_raw.get("max_epochs", 50)),
             device=str(train_raw.get("device", "cuda")),
+            eval_chunk_size=int(train_raw.get("eval_chunk_size", 2048)),
+            live_line=bool(train_raw.get("live_line", True)),
+            live_every=int(train_raw.get("live_every", 1)),
+            conv_window=int(train_raw.get("conv_window", 25)),
+            conv_slope_thresh=float(train_raw.get("conv_slope_thresh", -1e-3)),
+            plot_loss=bool(train_raw.get("plot_loss", False)),
+            plot_path=plot_path,
+            early_stop=bool(train_raw.get("early_stop", True)),
+            early_patience=int(train_raw.get("early_patience", 20)),
+            early_min_delta=float(train_raw.get("early_min_delta", 0.0)),
+            early_warmup=int(train_raw.get("early_warmup", 5)),
             save_dir=train_save_dir,
         )
 

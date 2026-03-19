@@ -2,6 +2,9 @@ data:
   source: h5_rdb
   path: data/2D_rdb_NA_NA.h5
   cache_dir: artifacts/preanalysis_cache
+  observation_mask_strategy: radial_spiral
+  observation_mask_seed: 0
+  observation_spiral_max_radius_frac: 0.875
 
   h5_rdb_dataset_key: data
   # mini 子采样：不生成新文件，直接从原始 H5 读取很小子集用于逻辑验证
@@ -46,6 +49,9 @@ train:
   noise_sigma: 0.0
   hidden_dims: [64, 64]
   lr: 0.001
+  use_weighted_loss: true
+  loss_weighting: pod_energy
+  loss_weight_power: 1.0
   batch_size: 64
   max_epochs: 500
   device: cuda

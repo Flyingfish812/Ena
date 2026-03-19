@@ -2,6 +2,46 @@ data:
   nc_path: data/cylinder2d.nc
   var_keys: ["u", "v"]
   cache_dir: null
+  observation_mask_strategy: cylinder_structure_aware
+  observation_mask_seed: 0
+  observation_mask_kwargs:
+    # Width partition in pure index space: [0, 0.15W], [0.15W, 0.5W], [0.5W, W]
+    region_bounds_frac: [0.15, 0.5]
+    region_ratios:
+      left: 0.35
+      middle: 0.35
+      right: 0.20
+      global_random: 0.10
+
+    # Keep a center preference, but explicitly push part of the mass to the two flanks
+    # of the vortex street instead of collapsing onto the center trajectory.
+    center_bias_strength: 1.2
+    center_bias_sigma_frac: 0.16
+    flank_weight: 0.42
+    flank_offset_frac: 0.11
+    flank_sigma_frac: 0.07
+
+    # Use temporal variance, but mix in spatial gradients and flatten sharp peaks so the
+    # sampler also covers energetic edges instead of only the ridge centerline.
+    importance_source: temporal_variance
+    importance_channel_reduce: l2
+    importance_mix: 0.5
+    importance_gradient_mix: 0.38
+    importance_power: 0.72
+
+    # Keep some emphasis near the onset region, but make it wider and weaker.
+    hotspot:
+      center: [40, 40]
+      sigma: [9, 30]
+      weight: 0.18
+
+    # Deterministic skeleton points distributed on 3 horizontal lines.
+    skeleton_points: 12
+    skeleton_line_offsets_frac: [0.0, -0.1, 0.1]
+
+    # Pre-generate several templates; L2 deterministically selects one per mask_rate and reuses it across time.
+    num_templates: 4
+    min_distance: 3
 
 pod:
   r: 128

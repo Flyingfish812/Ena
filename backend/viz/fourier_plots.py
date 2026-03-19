@@ -825,6 +825,7 @@ def plot_spatial_fourier_band_decomposition(
     center_mode: str = "target_mean",   # "none" | "target_mean"
     robust_q: float = 99.5,             # for vlim
     max_cols: int = 5,                  # wrap columns when bands are many
+    separate_error_colorbar: bool = True,
 ) -> Optional[plt.Figure]:
     """
     空间域“多尺度解释图”：
@@ -832,7 +833,7 @@ def plot_spatial_fourier_band_decomposition(
     列：Full + 各 band（按 k_edges 划分）
     - 支持零中心化：减去 target 的空间均值（仅用于可视化）
     - 支持 band 多时自动换行（wrap），避免图过长/过宽
-    - 上方为 value colorbar（标题下方），下方为 error colorbar，互不重叠
+    - 可选：target/pred/error 三者共享 colorbar，或让 error 单独使用第二条 colorbar
     - 通过 set_box_aspect(H/W) 让每个子图轴本身呈现条带比例，从根源压缩留白
     """
     xT = _ensure_hw(x_true_hw, channel=channel)
@@ -888,15 +889,18 @@ def plot_spatial_fourier_band_decomposition(
             max_abs_main = 1.0
     vmin_main, vmax_main = -max_abs_main, max_abs_main
 
-    # err：只用 Full 的 error 来定标
-    err0 = np.asarray(err_comps[0], dtype=float).ravel()
-    err0 = err0[np.isfinite(err0)]
-    if err0.size == 0:
-        max_abs_err = max_abs_main
-    else:
-        max_abs_err = float(np.nanpercentile(np.abs(err0), robust_q))
-        if not np.isfinite(max_abs_err) or max_abs_err == 0.0:
+    # err：可与主场共享色标，也可单独定标
+    if separate_error_colorbar:
+        err0 = np.asarray(err_comps[0], dtype=float).ravel()
+        err0 = err0[np.isfinite(err0)]
+        if err0.size == 0:
             max_abs_err = max_abs_main
+        else:
+            max_abs_err = float(np.nanpercentile(np.abs(err0), robust_q))
+            if not np.isfinite(max_abs_err) or max_abs_err == 0.0:
+                max_abs_err = max_abs_main
+    else:
+        max_abs_err = max_abs_main
     vmin_err, vmax_err = -max_abs_err, max_abs_err
 
     # ---- layout with wrapping ----
@@ -1027,8 +1031,8 @@ def plot_spatial_fourier_band_decomposition(
         cb1.ax.xaxis.set_label_position("top")
         cb1.ax.xaxis.set_ticks_position("bottom")
 
-    # 下方 error colorbar：放在 GRID_BOTTOM 之下
-    if first_err_im is not None:
+    # 下方 error colorbar：仅在 error 单独定标时显示
+    if separate_error_colorbar and first_err_im is not None:
         cax2 = fig.add_axes([cbar_left, GRID_BOTTOM - 0.08, cbar_w, cbar_h])
         cb2 = fig.colorbar(first_err_im, cax=cax2, orientation="horizontal")
         cb2.set_label("error (Pred - True)", labelpad=4)
@@ -1050,6 +1054,7 @@ def plot_spatial_fourier_band_decomposition_examples(
     frame_indices: Sequence[int] | None = None,
     title_prefix: str = "Fourier bands spatial view",
     max_cols: int = 5,
+    separate_error_colorbar: bool = True,
 ) -> Dict[int, Optional[plt.Figure]]:
     """
     多帧版本：对若干 frame 生成傅里叶 band 空间分解图。
@@ -1102,6 +1107,7 @@ def plot_spatial_fourier_band_decomposition_examples(
             max_cols=max_cols,
             center_mode="target_mean",
             robust_q=99.5,
+            separate_error_colorbar=separate_error_colorbar,
         )
     return figs
 
