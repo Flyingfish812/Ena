@@ -56,10 +56,15 @@ def default_train_config(mask_rate: float, noise_sigma: float) -> TrainConfig:
         mask_rate=mask_rate,
         noise_sigma=noise_sigma,
         hidden_dims=(256, 256),
+        model_types=("linear", "mlp"),
+        model_configs={},
         lr=1e-3,
+        seed=0,
         batch_size=64,
         max_epochs=100,
         device="cuda",
+        min_lr=0.0,
+        warmup_epochs=0,
         save_dir=save_dir,
     )
 

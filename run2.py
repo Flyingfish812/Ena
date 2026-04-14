@@ -1,30 +1,43 @@
+from __future__ import annotations
+
+import subprocess
+import sys
 from pathlib import Path
 
-from backend.config.schemas import normalize_model_types, resolve_model_dataset_specs, resolve_model_types_from_train_cfg
+from backend.config.schemas import normalize_model_types, resolve_model_types_from_train_cfg
 from backend.config.yaml_io import load_experiment_yaml, save_experiment_yaml
 from backend.pipelines.train import compute_level2_rebuild
 from backend.pod.compute import build_pod
 
 
-SAVE_ROOT = "artifacts/experiments"
+SAVE_ROOT = Path("artifacts/experiments")
 RUN_L1 = False
 RUN_L2 = True
-RUN_MODEL_TYPES = ("vitae",)
+RUN_COMPARE = True
 
-# JOBS = [
-#     {
-#         "name": "cylinder2d",
-#         "yaml_path": "configs/cylinder_exp_full.yaml",
-#         "experiment_name": "cylinder_exp_full_3",
-#     },
-# ]
+# Keep this as mlp + pmrh for baseline/improved comparison.
+RUN_MODEL_TYPES = ("mlp", "pmrh")
+
+# One experiment folder per run.
+EXPERIMENT_NAME = "cylinder_mlp_pmrh_20260331"
+
 JOBS = [
     {
         "name": "cylinder2d",
         "yaml_path": "configs/cylinder_exp_full.yaml",
-        "experiment_name": "cylinder_exp_full_4",
+        "experiment_name": EXPERIMENT_NAME,
     },
 ]
+
+# Compare script settings.
+COMPARE_MASK_RATE = 0.0005
+COMPARE_NOISE_SIGMAS = "0,0.001,0.01"
+COMPARE_DEVICE = "cpu"  # set to "cuda" when GPU is available
+COMPARE_TIMING_REPEATS = 10
+COMPARE_TIMING_MAX_FRAMES = 256
+COMPARE_OVERRIDE_MAX_EPOCHS: int | None = None
+COMPARE_MAX_TRAIN_BATCHES: int | None = None
+COMPARE_MAX_VAL_BATCHES: int | None = None
 
 
 def run_level1_from_yaml(yaml_path: str | Path, *, verbose: bool = True) -> dict:
@@ -56,38 +69,20 @@ def validate_job_config(yaml_path: str | Path) -> None:
     if len(model_types) == 0:
         raise ValueError(f"No train.model_types resolved from yaml: {yaml_path}")
 
-    dataset_specs = resolve_model_dataset_specs(data_cfg)
-    missing_specs = [mt for mt in model_types if mt not in dataset_specs]
-    if missing_specs:
-        raise ValueError(f"Missing data.model_dataset_specs for models {missing_specs} in {yaml_path}")
-
-    source = str(getattr(data_cfg, "source", "netcdf"))
-    raw_path = getattr(data_cfg, "path", None) or getattr(data_cfg, "nc_path", None)
     pod_ready = (pod_cfg.save_dir / "Ur.npy").exists() and (pod_cfg.save_dir / "pod_meta.json").exists()
     if not RUN_L1 and not pod_ready:
         raise ValueError(
-            f"RUN_L1 is False but existing L1 artifacts are missing for {yaml_path}: expected Ur.npy and pod_meta.json under {pod_cfg.save_dir}"
+            f"RUN_L1 is False but existing L1 artifacts are missing for {yaml_path}: "
+            f"expected Ur.npy and pod_meta.json under {pod_cfg.save_dir}"
         )
 
     print("config check:")
-    print("  data.source      :", source)
-    print("  data.path        :", raw_path)
-    print("  pod.save_dir     :", pod_cfg.save_dir)
-    print("  pod.ready        :", pod_ready)
-    print("  pod.center      :", pod_cfg.center)
-    print("  eval.centered_pod:", eval_cfg.centered_pod)
-    print("  train.model_types:", model_types)
-    print("  train.hidden_dims:", train_cfg.hidden_dims)
-    print("  train.device    :", train_cfg.device)
-    print("  train.noise_sigma:", train_cfg.noise_sigma)
-    print("  train.use_weighted_loss:", getattr(train_cfg, "use_weighted_loss", False))
-    print("  train.loss_weighting:", getattr(train_cfg, "loss_weighting", "none"))
-    print("  train.loss_weight_power:", getattr(train_cfg, "loss_weight_power", 1.0))
-    for model_type in model_types:
-        print(f"  spec[{model_type}]        :", dataset_specs[model_type])
-        model_cfg = dict(getattr(train_cfg, "model_configs", {}) or {}).get(model_type, {}) or {}
-        if model_cfg:
-            print(f"  model_cfg[{model_type}]   :", model_cfg)
+    print("  pod.save_dir      :", pod_cfg.save_dir)
+    print("  pod.ready         :", pod_ready)
+    print("  pod.center        :", pod_cfg.center)
+    print("  eval.centered_pod :", eval_cfg.centered_pod)
+    print("  train.model_types :", model_types)
+    print("  train.device      :", train_cfg.device)
 
 
 def prepare_effective_yaml(
@@ -105,11 +100,17 @@ def prepare_effective_yaml(
         raise ValueError(f"RUN_MODEL_TYPES resolves to empty selection: {RUN_MODEL_TYPES}")
 
     train_cfg.model_types = requested
-    train_cfg.model_configs = {
+
+    # Keep selected model configs; ensure pmrh entry exists.
+    original_model_configs = dict(getattr(train_cfg, "model_configs", {}) or {})
+    filtered = {
         str(model_type): dict(cfg or {})
-        for model_type, cfg in dict(getattr(train_cfg, "model_configs", {}) or {}).items()
+        for model_type, cfg in original_model_configs.items()
         if str(model_type).strip().lower() in requested
     }
+    if "pmrh" in requested and "pmrh" not in filtered:
+        filtered["pmrh"] = {"task_type": "pod_coeff_regression"}
+    train_cfg.model_configs = filtered
 
     run_cfg_dir = Path(save_root) / "_run_configs"
     run_cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -124,9 +125,51 @@ def prepare_effective_yaml(
     return out_yaml
 
 
+def run_compare(
+    *,
+    effective_yaml_path: Path,
+    exp_dir: Path,
+    tag: str,
+) -> None:
+    output_csv = exp_dir / "mlp_vs_pmrh_compare.csv"
+
+    cmd: list[str] = [
+        sys.executable,
+        "scripts/compare_mlp_pmrh_cylinder.py",
+        "--config",
+        str(effective_yaml_path),
+        "--mask-rate",
+        str(float(COMPARE_MASK_RATE)),
+        "--noise-sigmas",
+        str(COMPARE_NOISE_SIGMAS),
+        "--device",
+        str(COMPARE_DEVICE),
+        "--timing-repeats",
+        str(int(COMPARE_TIMING_REPEATS)),
+        "--timing-max-frames",
+        str(int(COMPARE_TIMING_MAX_FRAMES)),
+        "--output-csv",
+        str(output_csv),
+        "--tag",
+        str(tag),
+    ]
+
+    if COMPARE_OVERRIDE_MAX_EPOCHS is not None:
+        cmd.extend(["--override-max-epochs", str(int(COMPARE_OVERRIDE_MAX_EPOCHS))])
+    if COMPARE_MAX_TRAIN_BATCHES is not None:
+        cmd.extend(["--max-train-batches", str(int(COMPARE_MAX_TRAIN_BATCHES))])
+    if COMPARE_MAX_VAL_BATCHES is not None:
+        cmd.extend(["--max-val-batches", str(int(COMPARE_MAX_VAL_BATCHES))])
+
+    print("\n=== Compare MLP vs PMRH ===")
+    print("command:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    print("compare_csv:", output_csv)
+
+
 def main() -> None:
-    pod_runs = {}
-    l2_runs = {}
+    pod_runs: dict[str, dict] = {}
+    l2_runs: dict[str, dict] = {}
 
     for job in JOBS:
         name = str(job["name"])
@@ -148,6 +191,7 @@ def main() -> None:
             print("r_used:", pod_res.get("r_used"))
             print("save_dir:", pod_res.get("save_dir"))
 
+        exp_dir = SAVE_ROOT / exp_name
         if RUN_L2:
             print(f"\n=== Level-2 rebuild: {name} ===")
             l2_res = compute_level2_rebuild(
@@ -157,17 +201,25 @@ def main() -> None:
                 verbose=True,
             )
             l2_runs[name] = l2_res
-            print("exp_dir:", l2_res["exp_dir"])
+            exp_dir = Path(l2_res["exp_dir"])
+            print("exp_dir:", exp_dir)
             print("trained model_types:", l2_res["L2"].get("model_types", ()))
             print("L2 entry count:", len(l2_res["L2"].get("entries", [])))
 
+        if RUN_COMPARE:
+            run_compare(
+                effective_yaml_path=Path(effective_yaml_path),
+                exp_dir=exp_dir,
+                tag=exp_name,
+            )
+
     if RUN_L1:
         print("\n=== L1 POD build done ===")
-        print({k: v.get("save_dir") for k, v in pod_runs.items()})
+        print({key: value.get("save_dir") for key, value in pod_runs.items()})
 
     if RUN_L2:
         print("\n=== L2 rebuild all done ===")
-        print({k: v["exp_dir"] for k, v in l2_runs.items()})
+        print({key: value["exp_dir"] for key, value in l2_runs.items()})
 
 
 if __name__ == "__main__":

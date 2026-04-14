@@ -24,8 +24,9 @@
 #           train.json            (optional, only if train_info exists)
 #
 # Notes:
-#   - Level-2 "raw" output is A_hat_all (predicted POD coefficients), not full field X_hat_thwc.
-#     X_hat is linearly reproducible from A_hat_all + (Ur, mean_flat), so we keep L2 compact.
+#   - Level-2 "raw" output is A_hat_all (predicted POD coefficients).
+#   - Spatial models may also persist X_pred_flat_all so L4 examples can use the native
+#     full-field prediction instead of the POD-projected surrogate.
 #   - All multi-line commentary stays outside function bodies.
 
 from __future__ import annotations
@@ -37,7 +38,15 @@ from typing import Any, Dict, Optional, Sequence, Tuple, List
 import json
 import numpy as np
 
-from ..config.schemas import DataConfig, PodConfig, EvalConfig, TrainConfig
+from ..config.schemas import (
+    SPATIAL_FIELD_MODEL_TYPES,
+    DataConfig,
+    PodConfig,
+    EvalConfig,
+    TrainConfig,
+    resolve_model_dataset_specs,
+    resolve_model_types_from_train_cfg,
+)
 from ..pod.compute import build_pod
 from ..pod.project import project_to_pod
 from ..dataio.loader import load_raw, describe_source
@@ -45,7 +54,12 @@ from ..dataio.io_utils import load_numpy, load_json, ensure_dir
 from ..sampling.masks import build_structure_importance_map, generate_observation_mask_hw, flatten_mask
 from ..sampling.noise import add_gaussian_noise
 from ..models.linear_baseline import solve_pod_coeffs_least_squares
-from ..models.train_mlp import train_mlp_on_observations
+from ..models.train import (
+    predict_field_model_batch,
+    train_field_model_on_observations,
+    train_mlp_on_observations,
+    train_pmrh_on_observations,
+)
 
 
 # ------------------------------
@@ -72,6 +86,7 @@ def _save_npz(path: Path, **arrays: Any) -> None:
 L2_NPZ_KEYS: Tuple[str, ...] = (
     "A_hat_all",         # float32, [T, r_eff] or [T, ...]
     "A_true_all",        # float32, optional, same shape family as A_hat_all
+    "X_pred_flat_all",   # float32, optional, [T, D] native full-field prediction for spatial models
     "mask_flat",         # bool, [D] or [H*W*C]
     "mask_rate",         # float32 scalar (0-d array)
     "noise_sigma",       # float32 scalar (0-d array)
@@ -79,6 +94,8 @@ L2_NPZ_KEYS: Tuple[str, ...] = (
     "model_type",        # str scalar (0-d array or 1-element)
     "train_info_json",   # str scalar, optional (MLP only)
     "train_cfg_json",    # str scalar, optional (MLP only)
+    "projection_residual_nmse",  # float32 scalar, optional (for full-field models projected back to POD)
+    "prediction_target", # str scalar, optional
 )
 
 
@@ -88,7 +105,7 @@ L2_NPZ_KEYS: Tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class RebuildEntryKey:
-    model_type: str   # "linear" | "mlp"
+    model_type: str   # "linear" | "mlp" | "pmrh" | spatial models
     mask_rate: float
     noise_sigma: float
 
@@ -212,21 +229,104 @@ def _make_noisy_observations_batch(
     return Y_noisy
 
 
-def _predict_mlp_coeffs_batch(model_mlp, Y_noisy: np.ndarray, *, device, chunk_size: int = 2048) -> np.ndarray:
+def _predict_coeff_model_batch(
+    model_coeff,
+    Y_noisy: np.ndarray,
+    *,
+    device,
+    chunk_size: int = 2048,
+    predict_stage: str = "full",
+) -> np.ndarray:
     import torch
 
     T = int(Y_noisy.shape[0])
     out: List[np.ndarray] = []
-    model_mlp.eval()
+    model_coeff.eval()
+    stage_name = str(predict_stage).strip().lower()
 
     with torch.no_grad():
         for i in range(0, T, int(chunk_size)):
             y_chunk = Y_noisy[i : i + int(chunk_size)]
             y_tensor = torch.from_numpy(y_chunk.astype(np.float32)).to(device)
-            a_chunk = model_mlp(y_tensor).detach().cpu().numpy()
+            if stage_name in ("", "full", "stage3"):
+                try:
+                    a_chunk = model_coeff(y_tensor).detach().cpu().numpy()
+                except TypeError:
+                    a_chunk = model_coeff(y_tensor, stage="full").detach().cpu().numpy()
+            else:
+                a_chunk = model_coeff(y_tensor, stage=stage_name).detach().cpu().numpy()
             out.append(a_chunk)
 
     return np.concatenate(out, axis=0)
+
+
+def _project_field_prediction_to_pod(
+    X_pred_flat: np.ndarray,
+    *,
+    Ur_eff: np.ndarray,
+    mean_flat: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    X_pred_flat = np.asarray(X_pred_flat, dtype=np.float32)
+    if X_pred_flat.ndim != 2:
+        raise ValueError(f"Projected spatial prediction must be [T,D], got {X_pred_flat.shape}")
+
+    A_hat_all = project_to_pod(X_pred_flat, Ur_eff, mean_flat).astype(np.float32, copy=False)
+    X_proj_flat = (A_hat_all @ Ur_eff.T) + mean_flat[None, :]
+
+    diff = np.asarray(X_pred_flat, dtype=np.float64) - np.asarray(X_proj_flat, dtype=np.float64)
+    denom = np.sum(np.asarray(X_pred_flat, dtype=np.float64) ** 2, axis=1)
+    denom = np.maximum(denom, 1e-12)
+    residual_nmse = np.mean(np.sum(diff ** 2, axis=1) / denom)
+    return A_hat_all, float(residual_nmse)
+
+
+def _resolve_branch_train_config(
+    train_cfg: Optional[TrainConfig],
+    *,
+    model_type: str,
+    mask_rate: float,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {
+        "mask_rate": float(mask_rate),
+    }
+    if train_cfg is None:
+        return merged
+
+    merged.update(
+        {
+            "noise_sigma": float(getattr(train_cfg, "noise_sigma", 0.0)),
+            "hidden_dims": tuple(int(v) for v in getattr(train_cfg, "hidden_dims", (256, 256))),
+            "lr": float(getattr(train_cfg, "lr", 1e-3)),
+            "weight_decay": float(getattr(train_cfg, "weight_decay", 0.0)),
+            "use_weighted_loss": bool(getattr(train_cfg, "use_weighted_loss", False)),
+            "loss_weighting": str(getattr(train_cfg, "loss_weighting", "none")),
+            "loss_weight_power": float(getattr(train_cfg, "loss_weight_power", 1.0)),
+            "seed": int(getattr(train_cfg, "seed", 0)),
+            "val_ratio": float(getattr(train_cfg, "val_ratio", 0.1)),
+            "batch_size": int(getattr(train_cfg, "batch_size", 64)),
+            "max_epochs": int(getattr(train_cfg, "max_epochs", 50)),
+            "device": str(getattr(train_cfg, "device", "auto")),
+            "min_lr": float(getattr(train_cfg, "min_lr", 0.0)),
+            "warmup_epochs": int(getattr(train_cfg, "warmup_epochs", 0)),
+            "eval_chunk_size": int(getattr(train_cfg, "eval_chunk_size", 2048)),
+            "live_line": bool(getattr(train_cfg, "live_line", True)),
+            "live_every": int(getattr(train_cfg, "live_every", 1)),
+            "conv_window": int(getattr(train_cfg, "conv_window", 25)),
+            "conv_slope_thresh": float(getattr(train_cfg, "conv_slope_thresh", -1e-3)),
+            "plot_loss": bool(getattr(train_cfg, "plot_loss", False)),
+            "plot_path": getattr(train_cfg, "plot_path", None),
+            "early_stop": bool(getattr(train_cfg, "early_stop", True)),
+            "early_patience": int(getattr(train_cfg, "early_patience", 20)),
+            "early_min_delta": float(getattr(train_cfg, "early_min_delta", 0.0)),
+            "early_warmup": int(getattr(train_cfg, "early_warmup", 5)),
+        }
+    )
+
+    model_overrides = dict(getattr(train_cfg, "model_configs", {}) or {}).get(str(model_type), {}) or {}
+    merged.update(dict(model_overrides))
+    if "hidden_dims" in merged and merged["hidden_dims"] is not None:
+        merged["hidden_dims"] = tuple(int(v) for v in merged["hidden_dims"])
+    return merged
 
 
 def _mask_strategy_meta_from_data_cfg(data_cfg: DataConfig) -> Dict[str, Any]:
@@ -339,7 +439,7 @@ def run_rebuild_sweep(
     l2_root = Path(exp_dir) / "L2"
     ensure_dir(l2_root)
 
-    model_types: Tuple[str, ...] = ("linear",) if train_cfg is None else ("linear", "mlp")
+    model_types: Tuple[str, ...] = resolve_model_types_from_train_cfg(train_cfg)
 
     # POD + snapshots
     Ur, mean_flat, pod_meta = _load_or_build_pod(data_cfg, pod_cfg, verbose=verbose)
@@ -348,6 +448,7 @@ def run_rebuild_sweep(
     r_used = int(pod_meta["r_used"])
     r_eff = int(min(int(pod_cfg.r), r_used))
     Ur_eff = Ur[:, :r_eff]
+    model_dataset_specs = resolve_model_dataset_specs(data_cfg, num_channels=C)
 
     if verbose:
         print(f"[rebuild] meta: T={T}, H={H}, W={W}, C={C}, r_used={r_used}, r_eff={r_eff}")
@@ -383,13 +484,15 @@ def run_rebuild_sweep(
             ],
             "optional_keys": [
                 "A_true_all",
+                "X_pred_flat_all",
                 "train_info_json",
                 "train_cfg_json",
             ],
             "notes": {
                 "mask_flat": "boolean vector aligned with flattened field dimension (H*W*C).",
-                "A_hat_all": "predicted POD coefficients (raw model output).",
+                "A_hat_all": "predicted POD coefficients (raw model output, or POD projection of raw spatial prediction).",
                 "A_true_all": "optional ground-truth POD coefficients for convenience.",
+                "X_pred_flat_all": "optional raw full-field prediction [T,D] for spatial models; examples modules should prefer it when present.",
                 "train_info_json": "optional; JSON-encoded training info for MLP.",
             },
         },
@@ -408,8 +511,9 @@ def run_rebuild_sweep(
             "noise_sigmas": [float(x) for x in getattr(eval_cfg, "noise_sigmas", [])],
             "centered_pod": bool(getattr(eval_cfg, "centered_pod", False)),
         },
+        "model_dataset_specs": model_dataset_specs,
         "observation_mask": _mask_strategy_meta_from_data_cfg(data_cfg),
-        "note": "Level-2 raw artifacts: predicted POD coeffs A_hat_all (+ minimal reconstruction dependencies).",
+        "note": "Level-2 raw artifacts: POD coeffs for coeff-regression models, or POD projection of full-field models plus optional raw X_pred_flat_all for examples and projection_residual_nmse for diagnostics.",
     }
     _save_json(l2_root / "meta.json", meta)
 
@@ -426,8 +530,10 @@ def run_rebuild_sweep(
     mask_seed = int(getattr(data_cfg, "observation_mask_seed", 0))
 
     for model_type in model_types:
+        model_dataset_spec = dict(model_dataset_specs.get(str(model_type), {}))
         if verbose:
             print(f"\n=== [rebuild-{model_type}] start ===")
+            print(f"[rebuild-{model_type}] dataset_spec={model_dataset_spec}")
 
         for mask_rate in getattr(eval_cfg, "mask_rates", []):
             mask_rate_f = float(mask_rate)
@@ -468,6 +574,9 @@ def run_rebuild_sweep(
                 mask_rate=mask_rate_f,
                 noise_sigma=float(min(getattr(eval_cfg, "noise_sigmas", [0.0]))),
                 verbose=verbose,
+                model_dataset_spec=model_dataset_spec,
+                mask_hw=mask_hw,
+                spatial_shape=(H, W, C),
                 mask_flat=mask_flat,
                 Ur_eff=Ur_eff,
                 X_flat_all=X_flat_all,
@@ -493,6 +602,8 @@ def run_rebuild_sweep(
                     A_true=A_true,
                     mask_hw=mask_hw,
                     mask_flat=mask_flat,
+                    Ur_eff=Ur_eff,
+                    mean_flat=mean_flat,
                 )
 
                 key = RebuildEntryKey(model_type=str(model_type), mask_rate=mask_rate_f, noise_sigma=noise_sigma_f)
@@ -543,18 +654,26 @@ def train_model_for_entry(
     mask_rate: float,
     noise_sigma: float,
     verbose: bool = True,
+    model_dataset_spec: Dict[str, Any] | None,
+    mask_hw: np.ndarray | None,
+    spatial_shape: tuple[int, int, int] | None,
     mask_flat: np.ndarray,
     Ur_eff: np.ndarray,
     X_flat_all: np.ndarray,
     mean_flat: np.ndarray,
 ) -> Dict[str, Any]:
+    branch_cfg = _resolve_branch_train_config(train_cfg, model_type=model_type, mask_rate=mask_rate)
+
     # linear: cache Ur_masked for least squares
     if str(model_type) == "linear":
         Ur_masked = Ur_eff[mask_flat, :]  # [n_obs, r_eff]
         return {
             "model_type": "linear",
+            "model_dataset_spec": dict(model_dataset_spec or {}),
+            "model_task": "pod_coeff_regression",
             "Ur_masked": Ur_masked,
             "train_info": None,
+            "train_cfg": branch_cfg,
         }
 
     # mlp: train one model per mask_rate (same logic as reconstruction backend)
@@ -562,9 +681,9 @@ def train_model_for_entry(
         if train_cfg is None:
             raise ValueError("train_cfg is required for model_type='mlp'")
 
-        use_weighted_loss = bool(getattr(train_cfg, "use_weighted_loss", False))
+        use_weighted_loss = bool(branch_cfg.get("use_weighted_loss", False))
         effective_loss_weighting = (
-            str(getattr(train_cfg, "loss_weighting", "none")) if use_weighted_loss else "none"
+            str(branch_cfg.get("loss_weighting", "none")) if use_weighted_loss else "none"
         )
         coeff_loss_weights = None
         if effective_loss_weighting.strip().lower() == "pod_energy":
@@ -572,8 +691,8 @@ def train_model_for_entry(
 
         if verbose:
             print(
-                f"  -> training MLP: train_noise_sigma={float(train_cfg.noise_sigma):.4e}, "
-                f"batch_size={int(train_cfg.batch_size)}, max_epochs={int(train_cfg.max_epochs)}, lr={float(train_cfg.lr):.3g}"
+                f"  -> training MLP: train_noise_sigma={float(branch_cfg.get('noise_sigma', 0.0)):.4e}, "
+                f"batch_size={int(branch_cfg.get('batch_size', 64))}, max_epochs={int(branch_cfg.get('max_epochs', 50))}, lr={float(branch_cfg.get('lr', 1e-3)):.3g}"
             )
             print(f"     use_weighted_loss: {use_weighted_loss}")
             if effective_loss_weighting.strip().lower() == "pod_energy" and coeff_loss_weights is not None:
@@ -587,67 +706,257 @@ def train_model_for_entry(
             Ur_eff=Ur_eff,
             mean_flat=mean_flat,
             mask_flat=mask_flat,
-            noise_sigma=float(train_cfg.noise_sigma),
+            noise_sigma=float(branch_cfg.get("noise_sigma", 0.0)),
             coeff_loss_weights=coeff_loss_weights,
             loss_weighting=effective_loss_weighting,
-            loss_weight_power=float(getattr(train_cfg, "loss_weight_power", 1.0)),
-            hidden_dims=tuple(int(v) for v in getattr(train_cfg, "hidden_dims", (256, 256))),
-            batch_size=int(train_cfg.batch_size),
-            num_epochs=int(train_cfg.max_epochs),
-            lr=float(train_cfg.lr),
-            weight_decay=float(getattr(train_cfg, "weight_decay", 0.0)),
-            val_ratio=float(getattr(train_cfg, "val_ratio", 0.1)),
-            device=str(getattr(train_cfg, "device", "auto")),
+            loss_weight_power=float(branch_cfg.get("loss_weight_power", 1.0)),
+            hidden_dims=tuple(int(v) for v in branch_cfg.get("hidden_dims", (256, 256))),
+            batch_size=int(branch_cfg.get("batch_size", 64)),
+            num_epochs=int(branch_cfg.get("max_epochs", 50)),
+            lr=float(branch_cfg.get("lr", 1e-3)),
+            weight_decay=float(branch_cfg.get("weight_decay", 0.0)),
+            val_ratio=float(branch_cfg.get("val_ratio", 0.1)),
+            device=str(branch_cfg.get("device", "auto")),
             centered_pod=bool(centered_pod),
             verbose=verbose,
-            live_line=bool(getattr(train_cfg, "live_line", True)),
-            live_every=int(getattr(train_cfg, "live_every", 1)),
-            conv_window=int(getattr(train_cfg, "conv_window", 25)),
-            conv_slope_thresh=float(getattr(train_cfg, "conv_slope_thresh", -1e-3)),
-            plot_loss=bool(getattr(train_cfg, "plot_loss", False)),
-            plot_path=getattr(train_cfg, "plot_path", None),
-            early_stop=bool(getattr(train_cfg, "early_stop", True)),
-            early_patience=int(getattr(train_cfg, "early_patience", 20)),
-            early_min_delta=float(getattr(train_cfg, "early_min_delta", 0.0)),
-            early_warmup=int(getattr(train_cfg, "early_warmup", 5)),
+            live_line=bool(branch_cfg.get("live_line", True)),
+            live_every=int(branch_cfg.get("live_every", 1)),
+            conv_window=int(branch_cfg.get("conv_window", 25)),
+            conv_slope_thresh=float(branch_cfg.get("conv_slope_thresh", -1e-3)),
+            plot_loss=bool(branch_cfg.get("plot_loss", False)),
+            plot_path=branch_cfg.get("plot_path", None),
+            early_stop=bool(branch_cfg.get("early_stop", True)),
+            early_patience=int(branch_cfg.get("early_patience", 20)),
+            early_min_delta=float(branch_cfg.get("early_min_delta", 0.0)),
+            early_warmup=int(branch_cfg.get("early_warmup", 5)),
+            seed=int(branch_cfg.get("seed", 0)),
+            max_train_batches=(None if branch_cfg.get("max_train_batches", None) is None else int(branch_cfg.get("max_train_batches"))),
+            max_val_batches=(None if branch_cfg.get("max_val_batches", None) is None else int(branch_cfg.get("max_val_batches"))),
         )
 
         model_mlp.eval()
         device = next(model_mlp.parameters()).device
 
-        eval_chunk_size = int(getattr(train_cfg, "eval_chunk_size", 2048))
+        eval_chunk_size = int(branch_cfg.get("eval_chunk_size", 2048))
 
         return {
             "model_type": "mlp",
+            "model_dataset_spec": dict(model_dataset_spec or {}),
+            "model_task": "pod_coeff_regression",
             "model_mlp": model_mlp,
             "device": device,
             "eval_chunk_size": eval_chunk_size,
             "train_info": train_info,
             "train_cfg": {
-                "mask_rate": float(getattr(train_cfg, "mask_rate", mask_rate)),
-                "noise_sigma": float(getattr(train_cfg, "noise_sigma", 0.0)),
-                "hidden_dims": list(getattr(train_cfg, "hidden_dims", [])),
-                "lr": float(getattr(train_cfg, "lr", 0.0)),
-                "weight_decay": float(getattr(train_cfg, "weight_decay", 0.0)),
+                **branch_cfg,
+                "mask_rate": float(branch_cfg.get("mask_rate", mask_rate)),
+                "hidden_dims": [int(v) for v in branch_cfg.get("hidden_dims", ())],
                 "use_weighted_loss": bool(use_weighted_loss),
                 "loss_weighting": str(effective_loss_weighting),
-                "loss_weight_power": float(getattr(train_cfg, "loss_weight_power", 1.0)),
-                "val_ratio": float(getattr(train_cfg, "val_ratio", 0.1)),
-                "batch_size": int(getattr(train_cfg, "batch_size", 0)),
-                "max_epochs": int(getattr(train_cfg, "max_epochs", 0)),
-                "device": str(getattr(train_cfg, "device", "")),
                 "eval_chunk_size": int(eval_chunk_size),
                 "centered_pod": bool(centered_pod),
-                "live_line": bool(getattr(train_cfg, "live_line", True)),
-                "live_every": int(getattr(train_cfg, "live_every", 1)),
-                "conv_window": int(getattr(train_cfg, "conv_window", 25)),
-                "conv_slope_thresh": float(getattr(train_cfg, "conv_slope_thresh", -1e-3)),
-                "plot_loss": bool(getattr(train_cfg, "plot_loss", False)),
-                "plot_path": getattr(train_cfg, "plot_path", None),
-                "early_stop": bool(getattr(train_cfg, "early_stop", True)),
-                "early_patience": int(getattr(train_cfg, "early_patience", 20)),
-                "early_min_delta": float(getattr(train_cfg, "early_min_delta", 0.0)),
-                "early_warmup": int(getattr(train_cfg, "early_warmup", 5)),
+            },
+        }
+
+    if str(model_type) == "pmrh":
+        if train_cfg is None:
+            raise ValueError("train_cfg is required for model_type='pmrh'")
+
+        total_epochs = int(branch_cfg.get("max_epochs", 200))
+        phase1_epochs = branch_cfg.get("phase1_epochs", None)
+        phase2_epochs = branch_cfg.get("phase2_epochs", None)
+        phase3_epochs = branch_cfg.get("phase3_epochs", None)
+        finetune_epochs = branch_cfg.get("finetune_epochs", None)
+        if phase1_epochs is None and phase2_epochs is None and phase3_epochs is None and finetune_epochs is None:
+            phase1_epochs = max(1, int(round(total_epochs * 0.2)))
+            phase2_epochs = max(1, int(round(total_epochs * 0.2)))
+            phase3_epochs = max(1, int(round(total_epochs * 0.4)))
+            finetune_epochs = max(1, total_epochs - int(phase1_epochs) - int(phase2_epochs) - int(phase3_epochs))
+        else:
+            phase1_epochs = int(0 if phase1_epochs is None else phase1_epochs)
+            phase2_epochs = int(0 if phase2_epochs is None else phase2_epochs)
+            phase3_epochs = int(0 if phase3_epochs is None else phase3_epochs)
+            finetune_epochs = int(0 if finetune_epochs is None else finetune_epochs)
+
+        if verbose:
+            print(
+                f"  -> training PMRH: train_noise_sigma={float(branch_cfg.get('noise_sigma', 0.0)):.4e}, "
+                f"batch_size={int(branch_cfg.get('batch_size', 64))}, lr={float(branch_cfg.get('lr', 1e-3)):.3g}, "
+                f"phase_epochs=({int(phase1_epochs)}, {int(phase2_epochs)}, {int(phase3_epochs)}, {int(finetune_epochs)})"
+            )
+
+        model_pmrh, train_info = train_pmrh_on_observations(
+            X_flat_all=X_flat_all,
+            Ur_eff=Ur_eff,
+            mean_flat=mean_flat,
+            mask_flat=mask_flat,
+            noise_sigma=float(branch_cfg.get("noise_sigma", 0.0)),
+            coarse_hidden_dims=tuple(int(v) for v in branch_cfg.get("coarse_hidden_dims", branch_cfg.get("trunk_hidden_dims", (64, 64)))),
+            stage2_feature_dim=int(branch_cfg.get("stage2_feature_dim", branch_cfg.get("stage2_hidden_dim", 96))),
+            stage2_head_hidden_dim=int(branch_cfg.get("stage2_head_hidden_dim", branch_cfg.get("stage2_hidden_dim", 96))),
+            stage3_feature_dim=int(branch_cfg.get("stage3_feature_dim", branch_cfg.get("stage3_hidden_dim", 128))),
+            stage3_head_hidden_dim=int(branch_cfg.get("stage3_head_hidden_dim", branch_cfg.get("stage3_hidden_dim", 128))),
+            group_ratios=tuple(int(v) for v in branch_cfg.get("group_ratios", (1, 2, 5))),
+            stage1_low_rank=(None if branch_cfg.get("stage1_low_rank", None) is None else int(branch_cfg.get("stage1_low_rank"))),
+            stage_loss_weights=tuple(float(v) for v in branch_cfg.get("stage_loss_weights", (1.0, 1.0, 1.0))),
+            consistency_weight=float(branch_cfg.get("consistency_weight", 0.05)),
+            budget_weight=float(branch_cfg.get("budget_weight", 1e-4)),
+            phase1_epochs=int(phase1_epochs),
+            phase2_epochs=int(phase2_epochs),
+            phase3_epochs=int(phase3_epochs),
+            finetune_epochs=int(finetune_epochs),
+            stage2_freeze_epochs=int(branch_cfg.get("stage2_freeze_epochs", 3)),
+            stage3_freeze_epochs=int(branch_cfg.get("stage3_freeze_epochs", 3)),
+            batch_size=int(branch_cfg.get("batch_size", 64)),
+            lr=float(branch_cfg.get("lr", 1e-3)),
+            weight_decay=float(branch_cfg.get("weight_decay", 0.0)),
+            val_ratio=float(branch_cfg.get("val_ratio", 0.1)),
+            device=str(branch_cfg.get("device", "auto")),
+            centered_pod=bool(centered_pod),
+            verbose=verbose,
+            live_line=bool(branch_cfg.get("live_line", True)),
+            live_every=int(branch_cfg.get("live_every", 1)),
+            conv_window=int(branch_cfg.get("conv_window", 25)),
+            conv_slope_thresh=float(branch_cfg.get("conv_slope_thresh", -1e-3)),
+            plot_loss=bool(branch_cfg.get("plot_loss", False)),
+            plot_path=branch_cfg.get("plot_path", None),
+            seed=int(branch_cfg.get("seed", 0)),
+            max_train_batches=(None if branch_cfg.get("max_train_batches", None) is None else int(branch_cfg.get("max_train_batches"))),
+            max_val_batches=(None if branch_cfg.get("max_val_batches", None) is None else int(branch_cfg.get("max_val_batches"))),
+        )
+
+        model_pmrh.eval()
+        device = next(model_pmrh.parameters()).device
+        eval_chunk_size = int(branch_cfg.get("eval_chunk_size", 2048))
+
+        return {
+            "model_type": "pmrh",
+            "model_dataset_spec": dict(model_dataset_spec or {}),
+            "model_task": "pod_coeff_regression",
+            "model_pmrh": model_pmrh,
+            "device": device,
+            "eval_chunk_size": eval_chunk_size,
+            "predict_stage": str(branch_cfg.get("predict_stage", "full")),
+            "train_info": train_info,
+            "train_cfg": {
+                **branch_cfg,
+                "mask_rate": float(branch_cfg.get("mask_rate", mask_rate)),
+                "coarse_hidden_dims": [int(v) for v in branch_cfg.get("coarse_hidden_dims", branch_cfg.get("trunk_hidden_dims", (64, 64)))],
+                "stage2_feature_dim": int(branch_cfg.get("stage2_feature_dim", branch_cfg.get("stage2_hidden_dim", 96))),
+                "stage2_head_hidden_dim": int(branch_cfg.get("stage2_head_hidden_dim", branch_cfg.get("stage2_hidden_dim", 96))),
+                "stage3_feature_dim": int(branch_cfg.get("stage3_feature_dim", branch_cfg.get("stage3_hidden_dim", 128))),
+                "stage3_head_hidden_dim": int(branch_cfg.get("stage3_head_hidden_dim", branch_cfg.get("stage3_hidden_dim", 128))),
+                "stage1_low_rank": (None if branch_cfg.get("stage1_low_rank", None) is None else int(branch_cfg.get("stage1_low_rank"))),
+                "group_ratios": [int(v) for v in branch_cfg.get("group_ratios", (1, 2, 5))],
+                "stage_loss_weights": [float(v) for v in branch_cfg.get("stage_loss_weights", (1.0, 1.0, 1.0))],
+                "consistency_weight": float(branch_cfg.get("consistency_weight", 0.05)),
+                "budget_weight": float(branch_cfg.get("budget_weight", 1e-4)),
+                "phase1_epochs": int(phase1_epochs),
+                "phase2_epochs": int(phase2_epochs),
+                "phase3_epochs": int(phase3_epochs),
+                "finetune_epochs": int(finetune_epochs),
+                "stage2_freeze_epochs": int(branch_cfg.get("stage2_freeze_epochs", 3)),
+                "stage3_freeze_epochs": int(branch_cfg.get("stage3_freeze_epochs", 3)),
+                "eval_chunk_size": int(eval_chunk_size),
+                "centered_pod": bool(centered_pod),
+            },
+        }
+
+    if str(model_type) in SPATIAL_FIELD_MODEL_TYPES:
+        if train_cfg is None:
+            raise ValueError(f"train_cfg is required for model_type='{model_type}'")
+        if mask_hw is None:
+            raise ValueError(f"Spatial model '{model_type}' requires mask_hw.")
+        if spatial_shape is None:
+            raise ValueError(f"Spatial model '{model_type}' requires spatial_shape=(H,W,C).")
+
+        if verbose:
+            print(
+                f"  -> training {model_type}: train_noise_sigma={float(branch_cfg.get('noise_sigma', 0.0)):.4e}, "
+                f"batch_size={int(branch_cfg.get('batch_size', 16))}, max_epochs={int(branch_cfg.get('max_epochs', 20))}, lr={float(branch_cfg.get('lr', 1e-3)):.3g}"
+            )
+
+        n_frames = int(X_flat_all.shape[0])
+        D_full = int(X_flat_all.shape[1])
+        H, W, C = [int(v) for v in spatial_shape]
+        if H * W * C != D_full:
+            raise ValueError(f"Invalid spatial_shape={spatial_shape}: H*W*C={H*W*C} != D={D_full}")
+        X_thwc_local = X_flat_all.reshape(n_frames, H, W, C)
+
+        model_spatial, train_info, spatial_artifacts = train_field_model_on_observations(
+            model_type=str(model_type),
+            X_thwc=X_thwc_local,
+            mask_hw=np.asarray(mask_hw, dtype=bool),
+            noise_sigma=float(branch_cfg.get("noise_sigma", 0.0)),
+            model_dataset_spec=dict(model_dataset_spec or {}),
+            model_cfg=branch_cfg,
+            batch_size=int(branch_cfg.get("batch_size", 16)),
+            num_epochs=int(branch_cfg.get("max_epochs", 20)),
+            lr=float(branch_cfg.get("lr", 1e-3)),
+            weight_decay=float(branch_cfg.get("weight_decay", 0.0)),
+            val_ratio=float(branch_cfg.get("val_ratio", 0.1)),
+            device=str(branch_cfg.get("device", "auto")),
+            verbose=verbose,
+            live_line=bool(branch_cfg.get("live_line", True)),
+            live_every=int(branch_cfg.get("live_every", 1)),
+            conv_window=int(branch_cfg.get("conv_window", 25)),
+            conv_slope_thresh=float(branch_cfg.get("conv_slope_thresh", -1e-3)),
+            plot_loss=bool(branch_cfg.get("plot_loss", False)),
+            plot_path=branch_cfg.get("plot_path", None),
+            early_stop=bool(branch_cfg.get("early_stop", True)),
+            early_patience=int(branch_cfg.get("early_patience", 20)),
+            early_min_delta=float(branch_cfg.get("early_min_delta", 0.0)),
+            early_warmup=int(branch_cfg.get("early_warmup", 5)),
+            min_lr=float(branch_cfg.get("min_lr", 0.0)),
+            warmup_epochs=int(branch_cfg.get("warmup_epochs", 10)),
+            use_cosine_schedule=bool(branch_cfg.get("use_cosine_schedule", True)),
+            seed=int(branch_cfg.get("seed", 0)),
+            max_train_batches=(None if branch_cfg.get("max_train_batches", None) is None else int(branch_cfg.get("max_train_batches"))),
+            max_val_batches=(None if branch_cfg.get("max_val_batches", None) is None else int(branch_cfg.get("max_val_batches"))),
+        )
+
+        device_name = str(branch_cfg.get("device", "auto"))
+        eval_batch_size = int(branch_cfg.get("eval_batch_size", branch_cfg.get("batch_size", 16)))
+
+        def _predict_field_batch_fn(*, noise_sigma: float, mask_hw: np.ndarray, mask_flat: np.ndarray, centered_pod: bool) -> np.ndarray:
+            _ = mask_flat, centered_pod
+            return predict_field_model_batch(
+                model_type=str(model_type),
+                model=model_spatial,
+                X_thwc=X_thwc_local,
+                mask_hw=np.asarray(mask_hw, dtype=bool),
+                nearest_idx_hw=spatial_artifacts["nearest_idx_hw"],
+                representation=str(spatial_artifacts["representation"]),
+                include_mask_channel=bool(spatial_artifacts["include_mask_channel"]),
+                pad_hw=spatial_artifacts["pad_hw"],
+                noise_sigma=float(noise_sigma),
+                device=device_name,
+                batch_size=eval_batch_size,
+                norm_mean_c=spatial_artifacts.get("norm_mean_c", None),
+                norm_std_c=spatial_artifacts.get("norm_std_c", None),
+            )
+
+        return {
+            "model_type": str(model_type),
+            "model_task": "spatial_field_reconstruction",
+            "model_dataset_spec": dict(model_dataset_spec or {}),
+            "model_spatial": model_spatial,
+            "predict_field_batch_fn": _predict_field_batch_fn,
+            "device": device_name,
+            "train_info": train_info,
+            "train_cfg": {
+                **branch_cfg,
+                "mask_rate": float(branch_cfg.get("mask_rate", mask_rate)),
+                "spatial_shape": [H, W, C],
+                "eval_batch_size": int(eval_batch_size),
+                "input_representation": str(spatial_artifacts["representation"]),
+                "include_mask_channel": bool(spatial_artifacts["include_mask_channel"]),
+                "patch_size": int(spatial_artifacts["patch_size"]),
+                "in_channels": int(spatial_artifacts["in_channels"]),
+                "out_channels": int(spatial_artifacts["out_channels"]),
+                "normalize_mean_std": bool(branch_cfg.get("normalize_mean_std", True)),
+                "optimizer": str(branch_cfg.get("optimizer", "adamw")),
+                "use_cosine_schedule": bool(branch_cfg.get("use_cosine_schedule", True)),
             },
         }
 
@@ -676,6 +985,8 @@ def predict_coeffs_for_entry(
     A_true: np.ndarray,
     mask_hw: np.ndarray,
     mask_flat: np.ndarray,
+    Ur_eff: np.ndarray,
+    mean_flat: np.ndarray,
 ) -> Dict[str, Any]:
     centered_pod = bool(getattr(eval_cfg, "centered_pod", False))
 
@@ -693,18 +1004,56 @@ def predict_coeffs_for_entry(
             raise ValueError("linear predict requires train_artifacts['Ur_masked']")
         Ur_masked = train_artifacts["Ur_masked"]
         A_hat_all = solve_pod_coeffs_least_squares(Y_noisy, Ur_masked)  # [T, r_eff]
+        projection_residual_nmse = 0.0
     elif str(model_type) == "mlp":
         if train_artifacts is None or "model_mlp" not in train_artifacts:
             raise ValueError("mlp predict requires train_artifacts['model_mlp']")
         model_mlp = train_artifacts["model_mlp"]
         device = train_artifacts["device"]
         chunk_size = int(train_artifacts.get("eval_chunk_size", 2048))
-        A_hat_all = _predict_mlp_coeffs_batch(model_mlp, Y_noisy, device=device, chunk_size=chunk_size)
+        A_hat_all = _predict_coeff_model_batch(model_mlp, Y_noisy, device=device, chunk_size=chunk_size)
+        projection_residual_nmse = 0.0
+    elif str(model_type) == "pmrh":
+        if train_artifacts is None or "model_pmrh" not in train_artifacts:
+            raise ValueError("pmrh predict requires train_artifacts['model_pmrh']")
+        model_pmrh = train_artifacts["model_pmrh"]
+        device = train_artifacts["device"]
+        chunk_size = int(train_artifacts.get("eval_chunk_size", 2048))
+        predict_stage = str(train_artifacts.get("predict_stage", "full"))
+        A_hat_all = _predict_coeff_model_batch(
+            model_pmrh,
+            Y_noisy,
+            device=device,
+            chunk_size=chunk_size,
+            predict_stage=predict_stage,
+        )
+        projection_residual_nmse = 0.0
+    elif str(model_type) in SPATIAL_FIELD_MODEL_TYPES:
+        if train_artifacts is None or train_artifacts.get("predict_field_batch_fn", None) is None:
+            raise NotImplementedError(
+                f"Spatial model '{model_type}' requires train_artifacts['predict_field_batch_fn'] to return predicted fields."
+            )
+        field_predict_fn = train_artifacts["predict_field_batch_fn"]
+        X_pred = field_predict_fn(
+            noise_sigma=float(noise_sigma),
+            mask_hw=np.asarray(mask_hw, dtype=bool),
+            mask_flat=np.asarray(mask_flat, dtype=bool),
+            centered_pod=bool(centered_pod),
+        )
+        X_pred = np.asarray(X_pred, dtype=np.float32)
+        if X_pred.ndim == 4:
+            X_pred = X_pred.reshape(X_pred.shape[0], -1)
+        A_hat_all, projection_residual_nmse = _project_field_prediction_to_pod(
+            X_pred,
+            Ur_eff=Ur_eff,
+            mean_flat=mean_flat,
+        )
+        X_pred_flat_all = np.asarray(X_pred, dtype=np.float32)
     else:
         raise ValueError(f"Unsupported model_type='{model_type}'")
 
     # pack outputs (keep compact)
-    return {
+    payload = {
         "model_type": str(model_type),
         "mask_rate": float(mask_rate),
         "noise_sigma": float(noise_sigma),
@@ -713,7 +1062,14 @@ def predict_coeffs_for_entry(
         "A_true_all": np.asarray(A_true, dtype=np.float32),
         "mask_hw": np.asarray(mask_hw, dtype=bool),
         "mask_flat": np.asarray(mask_flat, dtype=bool),
+        "prediction_target": str(
+            "full_field_projected_to_pod" if str(model_type) in SPATIAL_FIELD_MODEL_TYPES else "pod_coefficients"
+        ),
+        "projection_residual_nmse": float(projection_residual_nmse),
     }
+    if str(model_type) in SPATIAL_FIELD_MODEL_TYPES:
+        payload["X_pred_flat_all"] = X_pred_flat_all
+    return payload
 
 
 """
@@ -746,12 +1102,28 @@ def save_level2_entry(
     noise_sigma = np.asarray(float(pred.get("noise_sigma", 0.0)), dtype=np.float32)
     centered_pod_arr = np.asarray(centered_pod, dtype=bool)
 
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.floating, np.integer, np.bool_)):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        return value
+
     # optional: train_info as json string
     train_info_json = None
     train_cfg_json = None
     if train_artifacts is not None and train_artifacts.get("train_info", None) is not None:
-        train_info_json = json.dumps(train_artifacts["train_info"], ensure_ascii=False)
-        train_cfg_json = json.dumps(train_artifacts.get("train_cfg", None), ensure_ascii=False)
+        train_info_json = json.dumps(_json_safe(train_artifacts["train_info"]), ensure_ascii=False)
+        train_cfg_json = json.dumps(_json_safe(train_artifacts.get("train_cfg", None)), ensure_ascii=False)
+
+    projection_residual_nmse = pred.get("projection_residual_nmse", None)
+    prediction_target = pred.get("prediction_target", None)
 
     # write one npz
     payload = {
@@ -764,10 +1136,16 @@ def save_level2_entry(
     }
     if A_true_all is not None:
         payload["A_true_all"] = A_true_all
+    if pred.get("X_pred_flat_all", None) is not None:
+        payload["X_pred_flat_all"] = np.asarray(pred["X_pred_flat_all"], dtype=np.float32)
     if train_info_json is not None:
         payload["train_info_json"] = np.asarray(train_info_json)
     if train_cfg_json is not None:
         payload["train_cfg_json"] = np.asarray(train_cfg_json)
+    if projection_residual_nmse is not None:
+        payload["projection_residual_nmse"] = np.asarray(float(projection_residual_nmse), dtype=np.float32)
+    if prediction_target is not None:
+        payload["prediction_target"] = np.asarray(str(prediction_target))
 
     np.savez_compressed(out_path, **payload)
 

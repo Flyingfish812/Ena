@@ -120,6 +120,8 @@ def mod_cumulate_nrmse_scales_pack(ctx, kwargs: Dict[str, Any]) -> Dict[str, Any
                         "R_total": int(meta.get("R", A_true.shape[1])),
                         "R_used": int(R_used),
                         "centered_pod": meta.get("centered_pod", None),
+                        "prediction_target": meta.get("prediction_target", None),
+                        "projection_residual_nmse": meta.get("projection_residual_nmse", None),
                     },
                     "merged": merged,
                 }

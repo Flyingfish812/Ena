@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from backend.config.schemas import resolve_model_types_from_train_cfg
 from backend.config.yaml_io import load_experiment_yaml
 
 from backend.pipelines.eval.utils import (
@@ -87,7 +88,7 @@ class EvalContext:
                 except Exception:
                     mt = None
             if mt is None:
-                self.model_types = ("linear", "mlp") if (self.train_cfg is not None) else ("linear",)
+                self.model_types = resolve_model_types_from_train_cfg(self.train_cfg)
             else:
                 self.model_types = tuple(str(x) for x in mt)
 

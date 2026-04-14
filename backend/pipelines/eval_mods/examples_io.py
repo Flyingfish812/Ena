@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from backend.dataio.loader import load_raw
 from backend.pipelines.eval.utils import read_json  # 你已有的工具
 from backend.dataio.io_utils import ensure_dir  # 你项目里已有
 from backend.viz.display import infer_display_origin
@@ -108,6 +109,22 @@ def _pick_frames(T: int, *, sample_frames: int, seed: int = 0) -> List[int]:
     return base[:sample_frames]
 
 
+def _load_raw_snapshots(ctx: Any) -> np.ndarray:
+    if not hasattr(ctx, "caches") or getattr(ctx, "caches") is None:
+        setattr(ctx, "caches", {})
+    caches: Dict[Any, Any] = getattr(ctx, "caches")
+
+    cache_key = (
+        "raw_snapshots",
+        str(getattr(ctx.data_cfg, "source", None)),
+        str(getattr(ctx.data_cfg, "path", None)),
+        str(getattr(ctx.data_cfg, "nc_path", None)),
+    )
+    if cache_key not in caches:
+        caches[cache_key] = np.asarray(load_raw(ctx.data_cfg), dtype=np.float32)
+    return np.asarray(caches[cache_key], dtype=np.float32)
+
+
 def reconstruct_fields_from_l2(
     ctx: Any,
     *,
@@ -156,6 +173,8 @@ def reconstruct_fields_from_l2(
     z = ctx.load_l2(str(model_type), float(mask_rate), float(noise_sigma))
     A_hat = z.get("A_hat_all", z.get("A_hat", None))
     A_true = z.get("A_true_all", z.get("A_true", None))
+    X_pred_flat = z.get("X_pred_flat_all", None)
+    prediction_target = str(z.get("prediction_target", "pod_coefficients") or "pod_coefficients")
 
     if A_hat is None or A_true is None:
         raise KeyError(f"L2 npz missing A_hat/A_true for {(model_type, mask_rate, noise_sigma)}")
@@ -183,14 +202,35 @@ def reconstruct_fields_from_l2(
         )
     Ur_eff = Ur[:, :r_eff]
 
-    A_hat_sel = A_hat[frames]
-    A_true_sel = A_true[frames]
+    use_raw_field_prediction = X_pred_flat is not None and prediction_target == "full_field_projected_to_pod"
+    if use_raw_field_prediction:
+        X_pred_flat = np.asarray(X_pred_flat, dtype=np.float32)
+        if X_pred_flat.ndim != 2 or X_pred_flat.shape[1] != D:
+            raise ValueError(f"X_pred_flat_all must be [T,D], got {X_pred_flat.shape} with D={D}")
+        if X_pred_flat.shape[0] != T:
+            raise ValueError(f"X_pred_flat_all length {X_pred_flat.shape[0]} != coeff length {T}")
 
-    X_hat_flat = (Ur_eff @ A_hat_sel.T).T + mean[None, :]
-    X_true_flat = (Ur_eff @ A_true_sel.T).T + mean[None, :]
+        X_hat_thwc = X_pred_flat[frames].reshape(len(frames), H, W, C)
 
-    X_hat_thwc = X_hat_flat.reshape(len(frames), H, W, C)
-    X_true_thwc = X_true_flat.reshape(len(frames), H, W, C)
+        X_true_all = _load_raw_snapshots(ctx)
+        if X_true_all.ndim != 4:
+            raise ValueError(f"Raw snapshots must be [T,H,W,C], got {X_true_all.shape}")
+        if tuple(X_true_all.shape[1:]) != (H, W, C):
+            raise ValueError(
+                f"Raw snapshot shape mismatch: {X_true_all.shape[1:]} != {(H, W, C)} from POD basis"
+            )
+        if int(X_true_all.shape[0]) != T:
+            raise ValueError(f"Raw snapshot length {X_true_all.shape[0]} != coeff length {T}")
+        X_true_thwc = X_true_all[frames]
+    else:
+        A_hat_sel = A_hat[frames]
+        A_true_sel = A_true[frames]
+
+        X_hat_flat = (Ur_eff @ A_hat_sel.T).T + mean[None, :]
+        X_true_flat = (Ur_eff @ A_true_sel.T).T + mean[None, :]
+
+        X_hat_thwc = X_hat_flat.reshape(len(frames), H, W, C)
+        X_true_thwc = X_true_flat.reshape(len(frames), H, W, C)
 
     if not (0 <= channel < C):
         raise ValueError(f"channel out of range: {channel} (C={C})")
@@ -205,7 +245,6 @@ def reconstruct_fields_from_l2(
         mf = np.asarray(mf).reshape(-1)
         expected_hw = H * W
         expected_hwc = H * W * C
-        print(f"[reconstruct] mask_flat size: {mf.size}, expected hw: {expected_hw}, expected hwc: {expected_hwc}")
 
         if mf.size == expected_hw:
             mask_hw = mf.reshape(H, W).astype(bool)
@@ -217,7 +256,6 @@ def reconstruct_fields_from_l2(
             mask_hw = np.any(mask_hwc, axis=2)
 
         else:
-            print(f"[warn] Unrecognized mask_flat size {mf.size}; cannot convert to HxW mask.")
             mask_hw = None
 
     return {
@@ -231,6 +269,8 @@ def reconstruct_fields_from_l2(
         "x_err": x_err,
         "mask_hw": mask_hw,
         "display_origin": basis.display_origin,
+        "prediction_target": prediction_target,
+        "used_raw_field_prediction": bool(use_raw_field_prediction),
     }
 
 

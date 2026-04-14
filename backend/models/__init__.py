@@ -1,13 +1,17 @@
 # backend/models/__init__.py
 
-"""
-线性基线与 MLP 模型相关模块。
-"""
+"""Model package exports for coefficient and spatial reconstruction models."""
 
 from .linear_baseline import solve_pod_coeffs_least_squares
-from .train_mlp import train_mlp_on_observations
+from .train import train_field_model_on_observations, train_mlp_on_observations, train_pmrh_on_observations
+from .vcnn import VCNN
+from .vitae import ViTAutoEncoder
 
 __all__ = [
     "solve_pod_coeffs_least_squares",
     "train_mlp_on_observations",
+    "train_pmrh_on_observations",
+    "train_field_model_on_observations",
+    "VCNN",
+    "ViTAutoEncoder",
 ]

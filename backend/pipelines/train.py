@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from backend.config.schemas import resolve_model_types_from_train_cfg
 from backend.config.yaml_io import load_experiment_yaml, save_experiment_yaml
 from backend.dataio.io_utils import ensure_dir
 
@@ -159,8 +160,7 @@ def compute_level3_fft_from_level2(
                 break
 
         if mt is None:
-            # Fall back: if train_cfg exists, assume linear+mlp, else linear only
-            model_types = ("linear", "mlp") if train_cfg is not None else ("linear",)
+            model_types = resolve_model_types_from_train_cfg(train_cfg)
         else:
             model_types = tuple(str(x) for x in mt)
 
@@ -262,7 +262,7 @@ def check_level123_artifacts_ready(
 
     # Decide model_types (prefer caller override, else infer from train_cfg)
     if model_types is None:
-        model_types = ("linear", "mlp") if train_cfg is not None else ("linear",)
+        model_types = resolve_model_types_from_train_cfg(train_cfg)
     model_types = tuple(str(x) for x in model_types)
 
     report: Dict[str, Any] = {

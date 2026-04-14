@@ -8,7 +8,14 @@ from typing import Any, Dict, Tuple
 
 import yaml
 
-from .schemas import DataConfig, PodConfig, EvalConfig, FourierConfig, TrainConfig
+from .schemas import (
+    DataConfig,
+    PodConfig,
+    EvalConfig,
+    FourierConfig,
+    TrainConfig,
+    normalize_model_types,
+)
 
 
 def _to_serializable(obj: Any) -> Any:
@@ -80,6 +87,9 @@ def load_experiment_yaml(
         nc_path=nc_path_v,
         var_keys=var_keys,
         cache_dir=cache_dir,
+        model_dataset_specs={
+            str(k): dict(v or {}) for k, v in dict(data_raw.get("model_dataset_specs", {}) or {}).items()
+        },
         observation_mask_strategy=str(data_raw.get("observation_mask_strategy", "random")),
         observation_mask_seed=int(data_raw.get("observation_mask_seed", 0)),
         observation_spiral_max_radius_frac=float(data_raw.get("observation_spiral_max_radius_frac", 0.875)),
@@ -217,6 +227,11 @@ def load_experiment_yaml(
     else:
         train_save_dir = Path(train_raw.get("save_dir", "artifacts/nn"))
         hidden_dims = tuple(train_raw.get("hidden_dims", (256, 256)))
+        model_types = normalize_model_types(train_raw.get("model_types", ("linear", "mlp")))
+        model_configs = {
+            str(k).strip().lower(): dict(v or {})
+            for k, v in dict(train_raw.get("model_configs", {}) or {}).items()
+        }
         plot_path_raw = train_raw.get("plot_path", None)
         plot_path = Path(plot_path_raw) if plot_path_raw is not None else None
         loss_weighting = str(train_raw.get("loss_weighting", "none"))
@@ -227,15 +242,20 @@ def load_experiment_yaml(
             mask_rate=float(train_raw.get("mask_rate", 0.02)),
             noise_sigma=float(train_raw.get("noise_sigma", 0.01)),
             hidden_dims=hidden_dims,
+            model_types=model_types,
+            model_configs=model_configs,
             lr=float(train_raw.get("lr", 1e-3)),
             weight_decay=float(train_raw.get("weight_decay", 0.0)),
             use_weighted_loss=use_weighted_loss,
             loss_weighting=loss_weighting,
             loss_weight_power=float(train_raw.get("loss_weight_power", 1.0)),
+            seed=int(train_raw.get("seed", 0)),
             val_ratio=float(train_raw.get("val_ratio", 0.1)),
             batch_size=int(train_raw.get("batch_size", 64)),
             max_epochs=int(train_raw.get("max_epochs", 50)),
             device=str(train_raw.get("device", "cuda")),
+            min_lr=float(train_raw.get("min_lr", 0.0)),
+            warmup_epochs=int(train_raw.get("warmup_epochs", 0)),
             eval_chunk_size=int(train_raw.get("eval_chunk_size", 2048)),
             live_line=bool(train_raw.get("live_line", True)),
             live_every=int(train_raw.get("live_every", 1)),

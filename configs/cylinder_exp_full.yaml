@@ -2,6 +2,37 @@ data:
   nc_path: data/cylinder2d.nc
   var_keys: ["u", "v"]
   cache_dir: null
+  model_dataset_specs:
+    linear:
+      task_type: pod_coeff_regression
+      input_space: vector
+      input_representation: masked_sparse_observation_vector
+      output_representation: pod_coefficients
+      field_channels: 2
+    mlp:
+      task_type: pod_coeff_regression
+      input_space: vector
+      input_representation: masked_sparse_observation_vector
+      output_representation: pod_coefficients
+      field_channels: 2
+    vcnn:
+      task_type: spatial_field_reconstruction
+      input_space: image
+      feature_builder: per_channel_voronoi_plus_mask
+      input_representation: voronoi_per_channel_plus_mask
+      output_representation: full_field
+      field_channels: 2
+      feature_channels: 3
+      include_mask_channel: true
+    vitae:
+      task_type: spatial_field_reconstruction
+      input_space: image
+      feature_builder: per_channel_voronoi_plus_mask
+      input_representation: voronoi_per_channel_plus_mask
+      output_representation: full_field
+      field_channels: 2
+      feature_channels: 3
+      include_mask_channel: true
   observation_mask_strategy: cylinder_structure_aware
   observation_mask_seed: 0
   observation_mask_kwargs:
@@ -135,10 +166,58 @@ eval:
     fft2_2d_stats_sample_frames: null
 
 train:
+  model_types: [linear, mlp, vcnn, vitae]
+  model_configs:
+    linear:
+      task_type: pod_coeff_regression
+    mlp:
+      task_type: pod_coeff_regression
+      hidden_dims: [128, 128]
+      max_epochs: 400
+    vcnn:
+      task_type: spatial_field_reconstruction
+      input_representation: voronoi_per_channel_plus_mask
+      normalize_mean_std: true
+      optimizer: adamw
+      hidden_channels: 32
+      num_layers: 6
+      kernel_size: 7
+      loss_type: mae
+      obs_weight: 1.0
+      weight_decay: 0.05
+      warmup_epochs: 10
+      min_lr: 0.0
+      use_cosine_schedule: true
+      batch_size: 12
+      eval_batch_size: 12
+      max_epochs: 25
+      val_ratio: 0.1
+    vitae:
+      task_type: spatial_field_reconstruction
+      input_representation: voronoi_per_channel_plus_mask
+      normalize_mean_std: true
+      optimizer: adamw
+      variant: lite
+      patch_size: 8
+      loss_type: mae
+      obs_weight: 1.0
+      aux_loss_weight: 0.2
+      weight_decay: 0.05
+      warmup_epochs: 10
+      min_lr: 0.0
+      use_cosine_schedule: true
+      batch_size: 8
+      eval_batch_size: 8
+      max_epochs: 25
+      val_ratio: 0.1
   # 对照基线，不设置任何噪声，确认所有流程正确
   noise_sigma: 0.0
   hidden_dims: [64, 64]
   lr: 0.001
+  seed: 0
+  use_weighted_loss: false
+  loss_weighting: pod_energy
+  loss_weight_power: 1.0
   batch_size: 64
   max_epochs: 500
   device: cuda

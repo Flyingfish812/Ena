@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 
-from backend.config.schemas import DataConfig, PodConfig
+from backend.config.schemas import DataConfig, PodConfig, resolve_model_dataset_specs
 from backend.dataio.loader import load_raw, describe_source
 from backend.dataio.io_utils import ensure_dir, save_numpy, save_json, load_json, load_numpy
 from backend.metrics.metrics import field_nmse
@@ -802,6 +802,7 @@ def build_pod(
         "source_desc": describe_source(data_cfg),
         "display_origin": infer_display_origin(data_cfg=data_cfg),
         "data_cfg": _serialize_data_cfg(data_cfg),
+        "model_dataset_specs": resolve_model_dataset_specs(data_cfg, num_channels=C),
     }
     save_json(save_dir / "pod_meta.json", meta)
 

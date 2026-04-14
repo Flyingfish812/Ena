@@ -2,6 +2,37 @@ data:
   source: h5_rdb
   path: data/2D_rdb_NA_NA.h5
   cache_dir: artifacts/preanalysis_cache
+  model_dataset_specs:
+    linear:
+      task_type: pod_coeff_regression
+      input_space: vector
+      input_representation: masked_sparse_observation_vector
+      output_representation: pod_coefficients
+      field_channels: 2
+    mlp:
+      task_type: pod_coeff_regression
+      input_space: vector
+      input_representation: masked_sparse_observation_vector
+      output_representation: pod_coefficients
+      field_channels: 2
+    vcnn:
+      task_type: spatial_field_reconstruction
+      input_space: image
+      feature_builder: per_channel_voronoi_plus_mask
+      input_representation: voronoi_per_channel_plus_mask
+      output_representation: full_field
+      field_channels: 2
+      feature_channels: 3
+      include_mask_channel: true
+    vitae:
+      task_type: spatial_field_reconstruction
+      input_space: image
+      feature_builder: per_channel_voronoi_plus_mask
+      input_representation: voronoi_per_channel_plus_mask
+      output_representation: full_field
+      field_channels: 2
+      feature_channels: 3
+      include_mask_channel: true
   observation_mask_strategy: radial_spiral
   observation_mask_seed: 0
   observation_spiral_max_radius_frac: 0.875
@@ -54,6 +85,19 @@ eval:
   #   band_scheme: physical
 
 train:
+  model_types: [linear, mlp]
+  model_configs:
+    linear:
+      task_type: pod_coeff_regression
+    mlp:
+      task_type: pod_coeff_regression
+      hidden_dims: [64, 64]
+    vcnn:
+      task_type: spatial_field_reconstruction
+      input_representation: voronoi_per_channel_plus_mask
+    vitae:
+      task_type: spatial_field_reconstruction
+      input_representation: voronoi_per_channel_plus_mask
   # 保持与 cylinder_exp_full 一致
   noise_sigma: 0.0
   hidden_dims: [64, 64]

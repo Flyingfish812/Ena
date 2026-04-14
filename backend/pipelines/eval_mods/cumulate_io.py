@@ -329,6 +329,8 @@ def load_coeff_pair_from_l2(z: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, 
         "noise_sigma": z.get("noise_sigma", None),
         "model_type": z.get("model_type", None),
         "centered_pod": z.get("centered_pod", None),
+        "prediction_target": z.get("prediction_target", None),
+        "projection_residual_nmse": z.get("projection_residual_nmse", None),
     }
     return A_hat, A_true, meta
 

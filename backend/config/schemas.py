@@ -11,6 +11,30 @@ from pathlib import Path
 from typing import Tuple, Sequence, Dict, Any
 
 
+SUPPORTED_MODEL_TYPES: Tuple[str, ...] = ("linear", "mlp", "pmrh", "vcnn", "vitae")
+COEFF_REGRESSION_MODEL_TYPES: Tuple[str, ...] = ("linear", "mlp", "pmrh")
+SPATIAL_FIELD_MODEL_TYPES: Tuple[str, ...] = ("vcnn", "vitae")
+
+
+def normalize_model_types(model_types: Sequence[str] | None) -> Tuple[str, ...]:
+    if model_types is None:
+        return tuple()
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in model_types:
+        name = str(item).strip().lower()
+        if not name:
+            continue
+        if name not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(f"Unsupported model type: {item!r}. Supported: {list(SUPPORTED_MODEL_TYPES)}")
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
 @dataclass
 class DataConfig:
     """
@@ -37,6 +61,13 @@ class DataConfig:
 
     # Optional cache directory for loaders to store derived arrays (e.g. sampled memmaps)
     cache_dir: Path | None = None
+
+    # -----------------
+    # model-specific dataset preparation description
+    # -----------------
+    # Explicitly describes how each model family should consume observations.
+    # This metadata is persisted into L1 POD artifacts for downstream L2/L4 use.
+    model_dataset_specs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # -----------------
     # sparse observation mask options
@@ -109,20 +140,25 @@ class PodConfig:
 @dataclass
 class TrainConfig:
     """
-    MLP 训练配置。
+    重建模型训练配置。
     """
     mask_rate: float
     noise_sigma: float
     hidden_dims: Tuple[int, ...]
+    model_types: Tuple[str, ...] = ("linear", "mlp")
+    model_configs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     lr: float = 1e-3
     weight_decay: float = 0.0
     use_weighted_loss: bool = False
     loss_weighting: str = "none"
     loss_weight_power: float = 1.0
+    seed: int = 0
     val_ratio: float = 0.1
     batch_size: int = 64
     max_epochs: int = 200
     device: str = "cuda"
+    min_lr: float = 0.0
+    warmup_epochs: int = 0
     eval_chunk_size: int = 2048
     live_line: bool = True
     live_every: int = 1
@@ -178,3 +214,87 @@ class EvalConfig:
     centered_pod: bool = True
     save_dir: Path = Path("artifacts/eval")
     fourier: FourierConfig = field(default_factory=FourierConfig)
+
+
+def default_model_dataset_specs(*, num_channels: int | None = None) -> Dict[str, Dict[str, Any]]:
+    field_channels = max(1, int(num_channels or 1))
+    spatial_feature_channels = field_channels + 1
+    return {
+        "linear": {
+            "task_type": "pod_coeff_regression",
+            "input_space": "vector",
+            "input_representation": "masked_sparse_observation_vector",
+            "output_representation": "pod_coefficients",
+            "field_channels": field_channels,
+        },
+        "mlp": {
+            "task_type": "pod_coeff_regression",
+            "input_space": "vector",
+            "input_representation": "masked_sparse_observation_vector",
+            "output_representation": "pod_coefficients",
+            "field_channels": field_channels,
+        },
+        "pmrh": {
+            "task_type": "pod_coeff_regression",
+            "input_space": "vector",
+            "input_representation": "masked_sparse_observation_vector",
+            "output_representation": "pod_coefficients",
+            "field_channels": field_channels,
+        },
+        "vcnn": {
+            "task_type": "spatial_field_reconstruction",
+            "input_space": "image",
+            "feature_builder": "per_channel_voronoi_plus_mask",
+            "input_representation": "voronoi_per_channel_plus_mask",
+            "output_representation": "full_field",
+            "field_channels": field_channels,
+            "feature_channels": spatial_feature_channels,
+            "include_mask_channel": True,
+        },
+        "vitae": {
+            "task_type": "spatial_field_reconstruction",
+            "input_space": "image",
+            "feature_builder": "per_channel_voronoi_plus_mask",
+            "input_representation": "voronoi_per_channel_plus_mask",
+            "output_representation": "full_field",
+            "field_channels": field_channels,
+            "feature_channels": spatial_feature_channels,
+            "include_mask_channel": True,
+        },
+    }
+
+
+def resolve_model_dataset_specs(
+    data_cfg: DataConfig,
+    *,
+    num_channels: int | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    resolved = default_model_dataset_specs(num_channels=num_channels)
+    raw = dict(getattr(data_cfg, "model_dataset_specs", {}) or {})
+    for key, override in raw.items():
+        name = str(key).strip().lower()
+        if name not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported data.model_dataset_specs key: {key!r}. Supported: {list(SUPPORTED_MODEL_TYPES)}"
+            )
+        merged = dict(resolved.get(name, {}))
+        merged.update(dict(override or {}))
+        merged["field_channels"] = int(merged.get("field_channels", max(1, int(num_channels or 1))))
+        if name in SPATIAL_FIELD_MODEL_TYPES:
+            include_mask = bool(merged.get("include_mask_channel", True))
+            merged["feature_channels"] = int(
+                merged.get("feature_channels", merged["field_channels"] + (1 if include_mask else 0))
+            )
+        resolved[name] = merged
+    return resolved
+
+
+def resolve_model_types_from_train_cfg(train_cfg: TrainConfig | None) -> Tuple[str, ...]:
+    if train_cfg is None:
+        return ("linear",)
+
+    raw = getattr(train_cfg, "model_types", None)
+    normalized = normalize_model_types(raw)
+    if normalized:
+        return normalized
+    return ("linear", "mlp")
