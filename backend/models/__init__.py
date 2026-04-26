@@ -4,7 +4,8 @@
 
 from .linear_baseline import solve_pod_coeffs_least_squares
 from .train import train_field_model_on_observations, train_mlp_on_observations, train_pmrh_on_observations
-from .vcnn import VCNN
+from .vcnn import VCNN, VCNNMultiScale
+from .vcnn_multiscale import train_vcnn_multiscale_on_observations
 from .vitae import ViTAutoEncoder
 
 __all__ = [
@@ -13,5 +14,7 @@ __all__ = [
     "train_pmrh_on_observations",
     "train_field_model_on_observations",
     "VCNN",
+    "VCNNMultiScale",
+    "train_vcnn_multiscale_on_observations",
     "ViTAutoEncoder",
 ]

@@ -176,6 +176,7 @@ train:
       max_epochs: 400
     vcnn:
       task_type: spatial_field_reconstruction
+      multiscale_output_mode: coeff
       input_representation: voronoi_per_channel_plus_mask
       normalize_mean_std: true
       optimizer: adamw
@@ -190,8 +191,12 @@ train:
       use_cosine_schedule: true
       batch_size: 12
       eval_batch_size: 12
-      max_epochs: 25
+      max_epochs: 50
       val_ratio: 0.1
+      coeff_loss_weights: [1.0, 1.0, 1.0]
+      band_loss_weights: [1.0, 6.0, 36.0]
+      recon_loss_weights: [0.0, 6.0, 36.0]
+      ortho_loss_weight: 0.25
     vitae:
       task_type: spatial_field_reconstruction
       input_representation: voronoi_per_channel_plus_mask
